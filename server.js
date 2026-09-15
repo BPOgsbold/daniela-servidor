@@ -196,6 +196,16 @@ function detectarIntencion(mensaje, sesion) {
   return null;
 }
 
+// Detecta si el mensaje es una duda/pregunta en vez de la respuesta directa
+// al dato que se le está pidiendo. No basta con mirar si termina en "?": el
+// asesor muchas veces escribe la duda sin signo de interrogación (ej. "el
+// cliente me pregunta por la ley cual es").
+const REGEX_PARECE_DUDA = /\?|pregunt|\bduda\b|no s[eé] qu[eé]|no s[eé] c[oó]mo|^(qu[eé]|c[oó]mo|cu[aá]l(es)?|cu[aá]ndo|d[oó]nde|por qu[eé]|cu[aá]nto|qui[eé]n)\b/i;
+
+function pareceDuda(mensaje) {
+  return REGEX_PARECE_DUDA.test(mensaje.trim());
+}
+
 function campoActualDe(sesion) {
   if (sesion.pendienteEscalamiento) {
     const campos = CAMPOS.escalamiento_juridico;
@@ -299,8 +309,8 @@ app.post('/api/chat', async (req, res) => {
       const campos = CAMPOS.escalamiento_juridico;
       const campo = campos[esc.stepIndex];
 
-      const pareceDuda = message.trim().endsWith('?');
-      if (pareceDuda) {
+      const esDuda = pareceDuda(message);
+      if (esDuda) {
         const conocimiento = await obtenerConocimientoTexto();
         const respuesta = await responderAyuda(
           SOP_TEXT,
@@ -395,8 +405,8 @@ app.post('/api/chat', async (req, res) => {
       const campos = CAMPOS.caso_nuevo;
       const campo = campos[sesion.stepIndex];
 
-      const pareceDuda = message.trim().endsWith('?');
-      if (pareceDuda) {
+      const esDuda = pareceDuda(message);
+      if (esDuda) {
         const conocimiento = await obtenerConocimientoTexto();
         const respuesta = await responderAyuda(
           SOP_TEXT,
@@ -453,8 +463,8 @@ app.post('/api/chat', async (req, res) => {
       const campos = CAMPOS[sesion.tipo];
       const campo = campos[sesion.stepIndex];
 
-      const pareceDuda = message.trim().endsWith('?');
-      if (pareceDuda) {
+      const esDuda = pareceDuda(message);
+      if (esDuda) {
         const conocimiento = await obtenerConocimientoTexto();
         const respuesta = await responderAyuda(
           SOP_TEXT,

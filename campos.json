@@ -1,0 +1,95 @@
+{
+  "caso_nuevo": [
+    {
+      "id": "nombre_cliente",
+      "label": "Nombre del cliente",
+      "prompt": "¡Buenísimo, un caso nuevo! 🙌 Para ir dejando todo listo, ¿cuál es el nombre completo del cliente?",
+      "regex": "^.{3,}$",
+      "errorMessage": "Escribe el nombre completo del cliente (mínimo 3 caracteres)."
+    },
+    {
+      "id": "telefono",
+      "label": "Teléfono de contacto",
+      "prompt": "¿Cuál es el número de contacto del cliente?",
+      "regex": "^[0-9]{7,10}$",
+      "errorMessage": "Escribe un número de 7 a 10 dígitos, solo números."
+    },
+    {
+      "id": "tipo_persona",
+      "label": "Tipo de persona",
+      "prompt": "¿El carro quedó facturado a nombre de una persona natural o de una empresa (persona jurídica)?",
+      "regex": "^.{3,}$",
+      "errorMessage": "Cuéntame si es persona natural o persona jurídica (empresa)."
+    },
+    {
+      "id": "vehiculo",
+      "label": "Vehículo",
+      "prompt": "¿Qué carro compró? Dime marca y línea (ej. Toyota Corolla Cross Hybrid, Tesla Model Y).",
+      "regex": "^.{3,}$",
+      "errorMessage": "Escribe marca y línea del vehículo."
+    },
+    {
+      "id": "valor_sin_iva",
+      "label": "Valor del carro sin IVA",
+      "prompt": "¿Cuál es el valor del carro SIN IVA (la base gravable que aparece en la factura)?",
+      "regex": "^[0-9.,$ ]{3,}$",
+      "errorMessage": "Escribe el valor en números (ej. 115.000.000)."
+    },
+    {
+      "id": "tiene_certificado_upme",
+      "label": "Ya tiene certificado UPME",
+      "tipo": "si_no",
+      "prompt": "Una última antes de seguir: ¿el cliente ya tiene el certificado de la UPME, o hay que tramitarlo desde cero?",
+      "regex": "^(s[ií]|no)$",
+      "errorMessage": "Cuéntame si el cliente ya tiene el certificado UPME o todavía no."
+    }
+  ],
+  "radicado": [
+    {
+      "id": "numero_radicado_dian",
+      "label": "Número de radicado DIAN",
+      "prompt": "¡Excelente! Cuéntame, ¿cuál quedó el número de radicado que dio la DIAN?",
+      "regex": "^.{2,}$",
+      "errorMessage": "Escribe el número de radicado tal como llegó en el acuse."
+    },
+    {
+      "id": "seccional",
+      "label": "Seccional DIAN",
+      "prompt": "¿En qué seccional de la DIAN se radicó? (ej. Bogotá, Medellín, Cali...)",
+      "regex": "^.{2,}$",
+      "errorMessage": "Escribe el nombre de la seccional."
+    },
+    {
+      "id": "observaciones",
+      "label": "Observaciones",
+      "prompt": "Ya casi terminamos. ¿Alguna observación adicional del caso? (si no hay, escribe \"ninguna\")",
+      "regex": "^.{1,}$",
+      "errorMessage": "Escribe una observación o \"ninguna\"."
+    }
+  ],
+  "no_aplica": [
+    {
+      "id": "motivo_no_aplica",
+      "label": "Motivo de no aplicación",
+      "prompt": "Entendido. ¿Cuál fue el motivo principal por el que el caso no siguió? (ej. carro usado, mild hybrid, factura vencida, no fue el comprador, otro)",
+      "regex": "^.{2,}$",
+      "errorMessage": "Describe el motivo principal en pocas palabras."
+    },
+    {
+      "id": "observaciones",
+      "label": "Observaciones",
+      "prompt": "¿Alguna observación adicional? (si no hay, escribe \"ninguna\")",
+      "regex": "^.{1,}$",
+      "errorMessage": "Escribe una observación o \"ninguna\"."
+    }
+  ],
+  "escalamiento_juridico": [
+    {
+      "id": "motivo_escalamiento",
+      "label": "Motivo de la consulta a jurídico",
+      "prompt": "Sin problema, escalemos a jurídico ⚖️. Cuéntame en pocas palabras cuál es el caso o la duda que hay que revisar.",
+      "regex": "^.{5,}$",
+      "errorMessage": "Cuéntame brevemente cuál es la situación que hay que escalar (mínimo 5 caracteres)."
+    }
+  ]
+}

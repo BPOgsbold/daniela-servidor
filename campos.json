@@ -15,6 +15,41 @@
       "errorMessage": "Escribe un número de 7 a 10 dígitos, solo números."
     },
     {
+      "id": "canal",
+      "label": "Canal",
+      "prompt": "¿Por qué canal llegó este cliente? (ej. WhatsApp, referido, Instagram, campaña, sala de ventas, otro)",
+      "regex": "^.{2,}$",
+      "errorMessage": "Cuéntame por qué canal llegó el cliente (ej. WhatsApp, referido, redes, sala de ventas)."
+    },
+    {
+      "id": "tipo_identificacion",
+      "label": "Tipo de identificación",
+      "prompt": "¿Qué tipo de identificación tiene el cliente: CC, CE, NIT u otro?",
+      "regex": "^.{2,}$",
+      "errorMessage": "Dime el tipo de identificación (CC, CE, NIT, Pasaporte, etc.)."
+    },
+    {
+      "id": "numero_identificacion",
+      "label": "Número de identificación",
+      "prompt": "¿Cuál es el número de identificación?",
+      "regex": "^[0-9]{5,15}$",
+      "errorMessage": "Escribe el número de identificación, solo dígitos (5 a 15 números)."
+    },
+    {
+      "id": "ciudad",
+      "label": "Ciudad",
+      "prompt": "¿En qué ciudad está el cliente?",
+      "regex": "^.{2,}$",
+      "errorMessage": "Escribe el nombre de la ciudad."
+    },
+    {
+      "id": "departamento",
+      "label": "Departamento",
+      "prompt": "¿Y en qué departamento queda esa ciudad?",
+      "regex": "^.{2,}$",
+      "errorMessage": "Escribe el nombre del departamento."
+    },
+    {
       "id": "tipo_persona",
       "label": "Tipo de persona",
       "prompt": "¿El carro quedó facturado a nombre de una persona natural o de una empresa (persona jurídica)?",
@@ -27,6 +62,27 @@
       "prompt": "¿Qué carro compró? Dime marca y línea (ej. Toyota Corolla Cross Hybrid, Tesla Model Y).",
       "regex": "^.{3,}$",
       "errorMessage": "Escribe marca y línea del vehículo."
+    },
+    {
+      "id": "tecnologia",
+      "label": "Tecnología",
+      "prompt": "¿Qué tecnología es el vehículo: eléctrico, híbrido o híbrido enchufable?",
+      "regex": "^.{2,}$",
+      "errorMessage": "Cuéntame si es eléctrico, híbrido o híbrido enchufable."
+    },
+    {
+      "id": "placa",
+      "label": "Placa",
+      "prompt": "¿Cuál es la placa del vehículo?",
+      "regex": "^[A-Za-z0-9\\-\\s]{5,8}$",
+      "errorMessage": "Escribe la placa tal como aparece en el vehículo (ej. ABC123)."
+    },
+    {
+      "id": "fecha_compra",
+      "label": "Fecha de compra",
+      "prompt": "¿Cuál fue la fecha de compra (la que aparece en la factura)?",
+      "regex": "^[0-9]{1,2}[\\/\\-][0-9]{1,2}[\\/\\-][0-9]{2,4}$",
+      "errorMessage": "Escribe la fecha en formato dd/mm/aaaa (ej. 15/03/2026)."
     },
     {
       "id": "valor_sin_iva",

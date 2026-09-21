@@ -102,10 +102,60 @@ const TIPO_PERSONA_MAP = {
   compañía: 'Persona jurídica',
 };
 
+const TECNOLOGIA_MAP = {
+  electrico: 'Eléctrico',
+  eléctrico: 'Eléctrico',
+  electrica: 'Eléctrico',
+  eléctrica: 'Eléctrico',
+  ev: 'Eléctrico',
+  hibrido: 'Híbrido',
+  híbrido: 'Híbrido',
+  hibrida: 'Híbrido',
+  híbrida: 'Híbrido',
+  hybrid: 'Híbrido',
+  'hibrido enchufable': 'Híbrido enchufable',
+  'híbrido enchufable': 'Híbrido enchufable',
+  'hibrida enchufable': 'Híbrido enchufable',
+  'híbrida enchufable': 'Híbrido enchufable',
+  enchufable: 'Híbrido enchufable',
+  phev: 'Híbrido enchufable',
+  'plug-in': 'Híbrido enchufable',
+  'plug in': 'Híbrido enchufable',
+};
+
+const TIPO_IDENTIFICACION_MAP = {
+  cc: 'CC',
+  'c.c': 'CC',
+  'c.c.': 'CC',
+  cedula: 'CC',
+  cédula: 'CC',
+  'cedula de ciudadania': 'CC',
+  'cédula de ciudadanía': 'CC',
+  ce: 'CE',
+  'c.e': 'CE',
+  'c.e.': 'CE',
+  'cedula de extranjeria': 'CE',
+  'cédula de extranjería': 'CE',
+  nit: 'NIT',
+  ti: 'TI',
+  'tarjeta de identidad': 'TI',
+  pasaporte: 'Pasaporte',
+  passport: 'Pasaporte',
+};
+
 function normalizarValorCampo(campoId, valorCrudo) {
   const valor = valorCrudo.trim();
   if (campoId === 'tipo_persona') {
     return TIPO_PERSONA_MAP[valor.toLowerCase()] || valor;
+  }
+  if (campoId === 'tecnologia') {
+    return TECNOLOGIA_MAP[valor.toLowerCase()] || valor;
+  }
+  if (campoId === 'tipo_identificacion') {
+    return TIPO_IDENTIFICACION_MAP[valor.toLowerCase()] || valor;
+  }
+  if (campoId === 'placa') {
+    return valor.toUpperCase().replace(/[\s-]+/g, '');
   }
   return valor;
 }

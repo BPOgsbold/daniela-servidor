@@ -24,8 +24,16 @@ async function crearCaso(sessionId, asesor, datos) {
     asesor: asesor || null,
     nombre_cliente: datos.nombre_cliente || null,
     telefono: datos.telefono || null,
+    canal: datos.canal || null,
+    tipo_identificacion: datos.tipo_identificacion || null,
+    numero_identificacion: datos.numero_identificacion || null,
+    ciudad: datos.ciudad || null,
+    departamento: datos.departamento || null,
     tipo_persona: datos.tipo_persona || null,
     vehiculo: datos.vehiculo || null,
+    tecnologia: datos.tecnologia || null,
+    placa: datos.placa || null,
+    fecha_compra: datos.fecha_compra || null,
     valor_sin_iva: datos.valor_sin_iva || null,
     tiene_certificado_upme: datos.tiene_certificado_upme || null,
     datos,
@@ -106,10 +114,44 @@ async function obtenerConocimientoReciente(limite = 30) {
   return data || [];
 }
 
+/**
+ * Busca casos ya registrados por nombre (parcial), número de identificación
+ * (exacto) o placa (exacta), para que el asesor pueda confirmar si un
+ * cliente ya fue atendido antes de crear un caso duplicado. Devuelve los
+ * más recientemente actualizados primero.
+ */
+async function buscarCasoPorTermino(termino, limite = 5) {
+  const supabase = getClient();
+  const term = (termino || '').trim();
+  if (!term) return [];
+
+  // El operador .or() de Supabase usa comas y paréntesis como separadores de
+  // filtros, así que los quitamos del término para no romper la consulta.
+  const termLimpio = term.replace(/[%,()]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!termLimpio) return [];
+  const termPlaca = termLimpio.toUpperCase().replace(/[\s-]+/g, '');
+
+  const filtros = [
+    `nombre_cliente.ilike.%${termLimpio}%`,
+    `numero_identificacion.eq.${termLimpio}`,
+    `placa.eq.${termPlaca}`,
+  ].join(',');
+
+  const { data, error } = await supabase
+    .from('casos')
+    .select('*')
+    .or(filtros)
+    .order('updated_at', { ascending: false, nullsFirst: false })
+    .limit(limite);
+  if (error) throw error;
+  return data || [];
+}
+
 module.exports = {
   crearCaso,
   actualizarCaso,
   guardarEscalamientoJuridico,
   guardarConocimiento,
   obtenerConocimientoReciente,
+  buscarCasoPorTermino,
 };

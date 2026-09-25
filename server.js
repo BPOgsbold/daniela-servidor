@@ -11,11 +11,16 @@ const {
   guardarEscalamientoJuridico,
   guardarConocimiento,
   obtenerConocimientoReciente,
+  buscarCasoPorTermino,
 } = require('./supabase');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Límite subido de 100kb (default de Express) a 2mb: una entrada de
+// conocimiento larga (ej. un Excel convertido a texto) puede pesar más de
+// 100kb y Express la rechazaría con un error 413 antes de llegar a la
+// validación de MAX_TEXTO_CONOCIMIENTO de abajo.
+app.use(express.json({ limit: '2mb' }));
 
 const PORT = process.env.PORT || 3000;
 
@@ -73,7 +78,51 @@ function nuevaSesion() {
     data: {},
     casoId: null,
     pendienteEscalamiento: null,
+    pendienteBusqueda: false,
   };
+}
+
+// Arma una respuesta legible con los casos que ya existen en Supabase para
+// un cliente, para que el asesor pueda confirmar rápido si ya fue atendido
+// antes en vez de crear un caso duplicado.
+function formatearResultadosBusqueda(casos, termino) {
+  if (!casos || casos.length === 0) {
+    return `No encontré ningún caso ya registrado que coincida con "${termino}". Puede ser un cliente nuevo, o el dato no coincide exactamente (revisa que el nombre, la cédula/NIT o la placa estén bien escritos). Si es nuevo, dime "tengo un cliente nuevo" y arrancamos.`;
+  }
+
+  const bloques = casos.map((c) => {
+    const fecha = c.updated_at || c.created_at;
+    const fechaTexto = fecha
+      ? new Date(fecha).toLocaleDateString('es-CO', { year: 'numeric', month: 'long', day: 'numeric' })
+      : 'fecha no registrada';
+
+    let estadoTexto = 'en gestión, todavía sin resultado final';
+    if (c.resultado === 'radicado') {
+      const detalleRadicado = [
+        c.numero_radicado_dian ? `radicado ${c.numero_radicado_dian}` : null,
+        c.seccional ? `seccional ${c.seccional}` : null,
+      ]
+        .filter(Boolean)
+        .join(', ');
+      estadoTexto = `ya quedó radicado${detalleRadicado ? ` (${detalleRadicado})` : ''}`;
+    } else if (c.resultado === 'no_aplica') {
+      estadoTexto = `no aplicó${c.motivo_no_aplica ? ` (motivo: ${c.motivo_no_aplica})` : ''}`;
+    }
+
+    return (
+      `• ${c.nombre_cliente || 'Sin nombre'} — ${c.tipo_identificacion || 'ID'} ${c.numero_identificacion || '—'}, ` +
+      `placa ${c.placa || '—'}, vehículo ${c.vehiculo || '—'}.\n` +
+      `  Última comunicación: ${fechaTexto}. Estado: ${estadoTexto}.` +
+      (c.observaciones ? ` Observaciones: ${c.observaciones}.` : '')
+    );
+  });
+
+  const intro =
+    casos.length === 1
+      ? `Sí, encontré un caso ya registrado con "${termino}":`
+      : `Encontré ${casos.length} casos que coinciden con "${termino}" (el más reciente primero):`;
+
+  return `${intro}\n\n${bloques.join('\n\n')}\n\nAsí evitamos duplicar: si es el mismo trámite, sigue gestionando ese caso en vez de crear uno nuevo.`;
 }
 
 function siguienteIndicePendiente(campos, data) {
@@ -223,12 +272,21 @@ const FRASES_NUEVO_CASO = [
   'nueva gestión', 'nueva gestion', 'otro interesado', 'nuevo interesado',
 ];
 
+// Frases para detectar cuando el asesor quiere revisar si un cliente ya fue
+// atendido antes (y traer su último caso), en vez de crear uno nuevo y
+// duplicar información. Es más específico que FRASES_NUEVO_CASO a propósito
+// (ej. exige "ya" + "atendido/gestionado/etc." o "duplicar"/"repetido") para
+// que "tengo un cliente nuevo" siga cayendo en __nuevo_caso__.
+const REGEX_BUSCAR_CLIENTE = /(ya\s+(fue|lo|la|hab[ií]amos|est[aá]|estuvo)\s+(atendid|gestionad|contactad|llamad)|cliente\s+(repetid|duplicad)|ya\s+(ten[ií]a|tiene|hab[ií]a)\s+caso|ya\s+existe\s+(ese|el|la|este)?\s*cliente|buscar\s+(el\s+|la\s+)?cliente|buscar\s+(este|ese)\s+cliente|consultar\s+(el\s+|la\s+)?cliente|revisar\s+si\s+ya\s+(existe|est[aá]|lo\s+(tenemos|ten[ií]amos))|no\s+(quiero|queremos)\s+duplicar|ya\s+lo\s+hab[ií]amos\s+atendido|ya\s+hab[ií]amos\s+hablado\s+con|ya\s+es\s+cliente|verificar\s+si\s+ya|est[aá]\s+repetido|hist[oó]rico\s+de(l)?\s+cliente|revisar\s+(el\s+)?historial)/i;
+
 function detectarIntencion(mensaje, sesion) {
-  if (sesion.pendienteEscalamiento) return null;
+  if (sesion.pendienteEscalamiento || sesion.pendienteBusqueda) return null;
   if (mensaje.startsWith('__')) return null; // ya es un comando literal
   const t = mensaje.trim().toLowerCase();
 
   if (REGEX_ESCALAR_JURIDICO.test(t)) return '__escalar_juridico__';
+
+  if (REGEX_BUSCAR_CLIENTE.test(t)) return '__buscar_cliente__';
 
   if (sesion.estado === 'caso_abierto') {
     if (FRASES_RADICADO.some((f) => t.includes(f))) return '__radicado__';
@@ -249,8 +307,12 @@ function detectarIntencion(mensaje, sesion) {
 // Detecta si el mensaje es una duda/pregunta en vez de la respuesta directa
 // al dato que se le está pidiendo. No basta con mirar si termina en "?": el
 // asesor muchas veces escribe la duda sin signo de interrogación (ej. "el
-// cliente me pregunta por la ley cual es").
-const REGEX_PARECE_DUDA = /\?|pregunt|\bduda\b|no s[eé] qu[eé]|no s[eé] c[oó]mo|^(qu[eé]|c[oó]mo|cu[aá]l(es)?|cu[aá]ndo|d[oó]nde|por qu[eé]|cu[aá]nto|qui[eé]n)\b/i;
+// cliente me pregunta por la ley cual es"). También cubre pedidos de ayuda
+// tipo "dime el script", "ayúdame con el guion", "qué le digo al cliente":
+// antes estas frases no entraban aquí y Daniela las trataba como si fueran
+// la respuesta al campo que estaba pidiendo, así que nunca llegaba a usar
+// el SOP/objeciones/conocimiento cargado para responderlas.
+const REGEX_PARECE_DUDA = /\?|pregunt|\bduda\b|no s[eé] qu[eé]|no s[eé] c[oó]mo|^(qu[eé]|c[oó]mo|cu[aá]l(es)?|cu[aá]ndo|d[oó]nde|por qu[eé]|cu[aá]nto|qui[eé]n)\b|\bscript\b|\bguion\b|\bguión\b|\blibreto\b|ay[uú]dame|necesito (ayuda|el script|saber)|qu[eé] le digo|c[oó]mo le (digo|respondo|explico)|explica(me)?|recu[eé]rdame|^dime (el|la|c[oó]mo|qu[eé])|env[ií]ame (el|la)/i;
 
 function pareceDuda(mensaje) {
   return REGEX_PARECE_DUDA.test(mensaje.trim());
@@ -275,6 +337,8 @@ const MENSAJE_INICIAL =
   'Soy Daniela, tu asistente experta en beneficios tributarios por compra de ' +
   'vehículos eléctricos e híbridos 🙌. Solo cuéntame cómo vas y yo te voy guiando: ' +
   'dime algo como "tengo un cliente nuevo" en cuanto identifiques un caso, y arrancamos. ' +
+  'Si no estás seguro de si ya atendimos antes a alguien, dime "ya fue atendido este cliente" ' +
+  'o "buscar cliente" y te confirmo con nombre, cédula o placa antes de duplicar el caso. ' +
   'Mientras gestionas, escríbeme cualquier duda del proceso y te ayudo al toque.';
 
 app.get('/api/health', (req, res) => {
@@ -289,9 +353,14 @@ app.post('/api/conocimiento', async (req, res) => {
     if (!texto || !texto.trim()) {
       return res.status(400).json({ error: 'Falta el texto a enseñar' });
     }
-    if (texto.length > 20000) {
+    // Subido de 20.000 a 200.000 caracteres para que quepa el texto de un
+    // Excel convertido a CSV (una hoja mediana puede pasar fácil de 20.000
+    // caracteres). Si suben este número, actualicen también MAX_TEXTO en
+    // sidepanel.js de la extensión para que el contador sea consistente.
+    const MAX_TEXTO_CONOCIMIENTO = 200000;
+    if (texto.length > MAX_TEXTO_CONOCIMIENTO) {
       return res.status(400).json({
-        error: 'El texto es muy largo (máx. 20.000 caracteres). Divídelo en partes más cortas.',
+        error: `El texto es muy largo (máx. ${MAX_TEXTO_CONOCIMIENTO.toLocaleString('es-CO')} caracteres). Divídelo en partes más cortas.`,
       });
     }
     const registro = await guardarConocimiento(titulo, texto.trim(), agregadoPor);
@@ -416,6 +485,33 @@ app.post('/api/chat', async (req, res) => {
         mensajeRetomar += MENSAJE_INICIAL;
       }
       return res.json({ reply: mensajeRetomar });
+    }
+
+    // --- Buscar si un cliente ya fue atendido antes (evitar duplicar) ---
+    if (message === '__buscar_cliente__') {
+      sesion.pendienteBusqueda = true;
+      return res.json({
+        reply:
+          'Claro, dime el nombre completo, la cédula/NIT o la placa del cliente y reviso si ya tiene un caso registrado.',
+      });
+    }
+
+    if (sesion.pendienteBusqueda) {
+      sesion.pendienteBusqueda = false;
+      const termino = message.trim();
+      let reply;
+      try {
+        const resultados = await buscarCasoPorTermino(termino);
+        reply = formatearResultadosBusqueda(resultados, termino);
+      } catch (dbError) {
+        console.error('Error buscando cliente en Supabase:', dbError);
+        reply = `No pude consultar la base de datos en este momento (${dbError.message}). Intenta de nuevo en un momento.`;
+      }
+      const campoPendiente = campoActualDe(sesion);
+      if (campoPendiente) {
+        reply += `\n\n➡️ Sigamos donde íbamos: ${campoPendiente}`;
+      }
+      return res.json({ reply });
     }
 
     // --- Mensajes especiales ---

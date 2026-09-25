@@ -79,6 +79,7 @@ function nuevaSesion() {
     casoId: null,
     pendienteEscalamiento: null,
     pendienteBusqueda: false,
+    avisoDuplicadoMostrado: false,
   };
 }
 
@@ -282,7 +283,9 @@ const REGEX_BUSCAR_CLIENTE = /(ya\s+(fue|lo|la|hab[ií]amos|est[aá]|estuvo)\s+(
 function detectarIntencion(mensaje, sesion) {
   if (sesion.pendienteEscalamiento || sesion.pendienteBusqueda) return null;
   if (mensaje.startsWith('__')) return null; // ya es un comando literal
-  const t = mensaje.trim().toLowerCase();
+  // Normaliza errores de tipeo comunes ("ciente" por "cliente", etc.) antes
+  // de comparar contra las frases, para que un typo no rompa la detección.
+  const t = mensaje.trim().toLowerCase().replace(/\bciente\b/g, 'cliente');
 
   if (REGEX_ESCALAR_JURIDICO.test(t)) return '__escalar_juridico__';
 
@@ -527,6 +530,7 @@ app.post('/api/chat', async (req, res) => {
       sesion.stepIndex = 0;
       sesion.data = {};
       sesion.casoId = null;
+      sesion.avisoDuplicadoMostrado = false;
       const primerCampo = CAMPOS.caso_nuevo[0];
       return res.json({ reply: primerCampo.prompt });
     }
@@ -576,9 +580,29 @@ app.post('/api/chat', async (req, res) => {
       sesion.data[campo.id] = resultadoCampo.valor;
       sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
 
+      // Verificación automática de duplicados: apenas se captura el nombre,
+      // la cédula/NIT o la placa, revisamos si ya existe un caso con ese
+      // dato — así el asesor no tiene que acordarse de decir una frase
+      // especial para consultarlo, se hace solo dentro del flujo normal.
+      // Se avisa una sola vez por sesión para no repetir el aviso en cada
+      // campo si el mismo cliente coincide en varios (nombre, cédula, placa).
+      let avisoDuplicado = '';
+      if (!sesion.avisoDuplicadoMostrado && ['nombre_cliente', 'numero_identificacion', 'placa'].includes(campo.id)) {
+        try {
+          const coincidencias = await buscarCasoPorTermino(resultadoCampo.valor);
+          if (coincidencias.length > 0) {
+            sesion.avisoDuplicadoMostrado = true;
+            avisoDuplicado = `${formatearResultadosBusqueda(coincidencias, resultadoCampo.valor)}\n\nSi es el mismo cliente, mejor retoma ese caso en vez de crear uno nuevo (dime "buscar cliente" en cualquier momento si quieres revisarlo primero). Si de verdad es una gestión nueva, seguimos con los datos.\n\n`;
+          }
+        } catch (dbError) {
+          console.error('Error verificando duplicados:', dbError);
+          // No bloqueamos la captura si falla la verificación — seguimos igual.
+        }
+      }
+
       if (sesion.stepIndex < campos.length) {
         const siguiente = campos[sesion.stepIndex];
-        return res.json({ reply: `✅ Anotado.\n\n${siguiente.prompt}` });
+        return res.json({ reply: `${avisoDuplicado}✅ Anotado.\n\n${siguiente.prompt}` });
       }
 
       // Caso completo: crear el registro y pasar a "caso_abierto".
@@ -598,7 +622,7 @@ app.post('/api/chat', async (req, res) => {
       sesion.estado = 'caso_abierto';
       return res.json({
         reply:
-          `✅ Caso registrado:\n\n${resumenCampos(campos, sesion.data)}\n\n` +
+          `${avisoDuplicado}✅ Caso registrado:\n\n${resumenCampos(campos, sesion.data)}\n\n` +
           'Sigamos gestionando: pregúntame cualquier duda del proceso, y cuéntame cuando el caso se radique ' +
           '(dime algo como "ya se radicó") o si al final no aplicó (dime "no aplica" y el motivo).',
       });

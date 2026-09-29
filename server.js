@@ -127,6 +127,11 @@ const GATES_NEGOCIACION = [
   },
 ];
 
+// Última pregunta del flujo de negociación: cómo quedan los documentos del
+// cliente al momento de escalar el caso (una vez ya se registró el servicio
+// contratado).
+const OPCIONES_ESCALAR_DOCUMENTOS = ['Escalar con documentos completos', 'Escalar con documentos pendientes'];
+
 // Convierte un registro ya guardado en Supabase de vuelta al formato de
 // `sesion.data` (id de campo -> valor), para poder "retomar" un caso
 // existente sin volver a preguntar los datos que ya tiene. Solo se incluyen
@@ -191,6 +196,7 @@ function formatearResultadosBusqueda(casos, termino) {
       ` Última comunicación: ${fechaTexto}.` +
       (c.siguiente_paso ? ` Siguiente paso: ${c.siguiente_paso}.` : '') +
       (c.servicio_contratado ? ` Servicio contratado: ${c.servicio_contratado}.` : '') +
+      (c.escalamiento_documentos ? ` ${c.escalamiento_documentos}.` : '') +
       (motivoNegociacion ? ` Motivo: ${motivoNegociacion}.` : '') +
       (c.info_completa ? ` Información: ${c.info_completa}.` : '') +
       (c.observaciones ? ` Observaciones: ${c.observaciones}.` : '')
@@ -1278,10 +1284,52 @@ app.post('/api/chat', async (req, res) => {
             console.error('Error guardando el servicio contratado en Supabase:', dbError);
           }
         }
+        neg.sub = 'escalar';
+        return res.json({
+          reply: `✅ Anotado el servicio: "${match}".\n\n¿Cómo quedan los documentos para escalar este caso?`,
+          opciones: OPCIONES_ESCALAR_DOCUMENTOS,
+        });
+      }
+
+      if (neg.sub === 'escalar') {
+        const entrada = normalizarTexto(message).trim();
+        const match = OPCIONES_ESCALAR_DOCUMENTOS.find((o) => normalizarTexto(o).trim() === entrada);
+        if (!match) {
+          return res.json({
+            reply: '⚠️ Selecciona una opción.',
+            opciones: OPCIONES_ESCALAR_DOCUMENTOS,
+          });
+        }
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { escalamiento_documentos: match });
+          } catch (dbError) {
+            console.error('Error guardando el escalamiento de documentos en Supabase:', dbError);
+          }
+        }
+        neg.sub = 'cierre_final';
+        return res.json({
+          reply: `✅ Anotado: "${match}".\n\n¿Quieres cerrar la interacción con este cliente?`,
+          opciones: ['Sí', 'No'],
+        });
+      }
+
+      if (neg.sub === 'cierre_final') {
+        const respuesta = interpretarSiNo(message);
+        if (!respuesta) {
+          return res.json({ reply: '¿Quieres cerrar la interacción con este cliente?', opciones: ['Sí', 'No'] });
+        }
+        const nombreCerrado = sesion.data.nombre_cliente || 'el cliente';
         sesion.estado = 'caso_abierto';
         sesion.negociacion = null;
+        if (respuesta === 'sí') {
+          Object.assign(sesion, nuevaSesion());
+          return res.json({
+            reply: `✅ Listo, dejamos cerrada la interacción con ${nombreCerrado}. Cuéntame cuando tengas otro cliente (dime "tengo un cliente nuevo") y arrancamos.`,
+          });
+        }
         return res.json({
-          reply: `✅ Excelente, quedó registrado el servicio: "${match}". Sigamos gestionando: cuéntame cuando el caso se radique (dime algo como "ya se radicó") o si al final no aplicó (dime "no aplica" y el motivo).`,
+          reply: `Listo, seguimos gestionando el caso de ${nombreCerrado}: cuéntame cuando se radique (dime algo como "ya se radicó") o si al final no aplicó (dime "no aplica" y el motivo).`,
         });
       }
     }

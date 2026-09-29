@@ -36,6 +36,11 @@ async function crearCaso(sessionId, asesor, datos) {
     fecha_compra: datos.fecha_compra || null,
     valor_sin_iva: datos.valor_sin_iva || null,
     tiene_certificado_upme: datos.tiene_certificado_upme || null,
+    // Estado del pipeline comercial: un caso nuevo arranca como "Interesado"
+    // porque, para poder crearlo, el cliente ya tuvo que dar todos los datos
+    // requeridos. El asesor lo va cambiando después escribiéndole a Daniela
+    // (ej. "cambia el estado a cliente").
+    estado_pipeline: 'Interesado',
     datos,
   };
   const { data, error } = await supabase.from('casos').insert(row).select().single();

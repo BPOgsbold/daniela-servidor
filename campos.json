@@ -1,9 +1,41 @@
 {
   "caso_nuevo": [
     {
+      "id": "canal",
+      "label": "Canal",
+      "tipo": "botones",
+      "opciones": [
+        "Chattigo",
+        "Chattigo Voice",
+        "WhatsApp",
+        "Correo",
+        "Llamada de Voz",
+        "RRSS"
+      ],
+      "prompt": "¡Buenísimo, un caso nuevo! 🙌 Para ir dejando todo listo, ¿por qué canal llegó este cliente?",
+      "regex": "^.{2,}$",
+      "errorMessage": "Selecciona uno de los botones, o escribe el canal exacto (Chattigo, Chattigo Voice, WhatsApp, Correo, Llamada de Voz o RRSS)."
+    },
+    {
+      "id": "origen_cliente",
+      "label": "Origen del cliente",
+      "tipo": "botones",
+      "opciones": [
+        "Cita Sura",
+        "WhatsApp Sura",
+        "WhatsApp Cliente",
+        "Referido",
+        "RRSS",
+        "Referix"
+      ],
+      "prompt": "¿Cuál fue el origen de este cliente?",
+      "regex": "^.{2,}$",
+      "errorMessage": "Selecciona uno de los botones, o escribe el origen exacto (Cita Sura, WhatsApp Sura, WhatsApp Cliente, Referido, RRSS o Referix)."
+    },
+    {
       "id": "nombre_cliente",
       "label": "Nombre del cliente",
-      "prompt": "¡Buenísimo, un caso nuevo! 🙌 Para ir dejando todo listo, ¿cuál es el nombre completo del cliente?",
+      "prompt": "¿Cuál es el nombre completo del cliente?",
       "regex": "^.{3,}$",
       "errorMessage": "Escribe el nombre completo del cliente (mínimo 3 caracteres)."
     },
@@ -15,44 +47,53 @@
       "errorMessage": "Escribe un número de 7 a 10 dígitos, solo números."
     },
     {
-      "id": "canal",
-      "label": "Canal",
-      "prompt": "¿Por qué canal llegó este cliente? (ej. WhatsApp, referido, Instagram, campaña, sala de ventas, otro)",
-      "regex": "^.{2,}$",
-      "errorMessage": "Cuéntame por qué canal llegó el cliente (ej. WhatsApp, referido, redes, sala de ventas)."
-    },
-    {
-      "id": "tipo_identificacion",
-      "label": "Tipo de identificación",
-      "prompt": "¿Qué tipo de identificación tiene el cliente: CC, CE, NIT u otro?",
-      "regex": "^.{2,}$",
-      "errorMessage": "Dime el tipo de identificación (CC, CE, NIT, Pasaporte, etc.)."
+      "id": "contacto_logrado",
+      "label": "¿Lograste el contacto?",
+      "tipo": "botones",
+      "opciones": [
+        "Sí",
+        "No"
+      ],
+      "prompt": "¿Lograste el contacto con el cliente?",
+      "regex": "^.{1,}$",
+      "errorMessage": "Selecciona Sí o No."
     },
     {
       "id": "numero_identificacion",
       "label": "Número de identificación",
-      "prompt": "¿Cuál es el número de identificación?",
+      "prompt": "¿Cuál es la cédula o NIT del cliente?",
       "regex": "^[0-9]{5,15}$",
       "errorMessage": "Escribe el número de identificación, solo dígitos (5 a 15 números)."
     },
     {
-      "id": "ciudad",
-      "label": "Ciudad",
-      "prompt": "¿En qué ciudad está el cliente?",
-      "regex": "^.{2,}$",
-      "errorMessage": "Escribe el nombre de la ciudad."
+      "id": "email",
+      "label": "Correo electrónico",
+      "prompt": "¿Cuál es el correo (mail) del cliente?",
+      "regex": "^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$",
+      "errorMessage": "Escribe un correo válido (ej. nombre@correo.com)."
     },
     {
-      "id": "departamento",
-      "label": "Departamento",
-      "prompt": "¿Y en qué departamento queda esa ciudad?",
+      "id": "id_rrss",
+      "label": "ID / usuario de redes sociales",
+      "tipo": "botones_opcional",
+      "opciones": [
+        "Saltar (no tiene)"
+      ],
+      "prompt": "¿Tiene ID o usuario de redes sociales? Si no tiene, dale a \"Saltar (no tiene)\".",
+      "regex": "^.{0,}$",
+      "errorMessage": "Escribe el ID/usuario, o dale a \"Saltar (no tiene)\" si no tiene."
+    },
+    {
+      "id": "tipo_identificacion",
+      "label": "Tipo de documento",
+      "prompt": "¿Qué tipo de documento tiene el cliente: CC, CE, NIT u otro?",
       "regex": "^.{2,}$",
-      "errorMessage": "Escribe el nombre del departamento."
+      "errorMessage": "Dime el tipo de identificación (CC, CE, NIT, Pasaporte, etc.)."
     },
     {
       "id": "tipo_persona",
       "label": "Tipo de persona",
-      "prompt": "¿El carro quedó facturado a nombre de una persona natural o de una empresa (persona jurídica)?",
+      "prompt": "¿El carro está facturado a nombre de una persona natural o de una empresa (persona jurídica)?",
       "regex": "^.{3,}$",
       "errorMessage": "Cuéntame si es persona natural o persona jurídica (empresa)."
     },
@@ -93,11 +134,16 @@
     },
     {
       "id": "tiene_certificado_upme",
-      "label": "Ya tiene certificado UPME",
-      "tipo": "si_no",
+      "label": "Certificado UPME",
+      "tipo": "botones",
+      "opciones": [
+        "No tiene certificado",
+        "Sí tiene certificado",
+        "Certificado en trámite"
+      ],
       "prompt": "Una última antes de seguir: ¿el cliente ya tiene el certificado de la UPME, o hay que tramitarlo desde cero?",
-      "regex": "^(s[ií]|no)$",
-      "errorMessage": "Cuéntame si el cliente ya tiene el certificado UPME o todavía no."
+      "regex": "^.{2,}$",
+      "errorMessage": "Selecciona una de las 3 opciones del certificado UPME."
     }
   ],
   "radicado": [

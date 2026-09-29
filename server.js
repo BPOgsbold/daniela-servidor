@@ -80,6 +80,10 @@ function nuevaSesion() {
     pendienteEscalamiento: null,
     pendienteBusqueda: false,
     avisoDuplicadoMostrado: false,
+    // Cuando el asesor responde "No" a "¿lograste el contacto?", le
+    // preguntamos si quiere cerrar la interacción con ese cliente ahí mismo
+    // (ya quedó guardado como "Contacto") o seguir igual con las preguntas.
+    pendienteCierre: false,
   };
 }
 
@@ -834,6 +838,7 @@ app.post('/api/chat', async (req, res) => {
       sesion.data = {};
       sesion.casoId = null;
       sesion.avisoDuplicadoMostrado = false;
+      sesion.pendienteCierre = false;
       const primerCampo = CAMPOS.caso_nuevo[0];
       return res.json(conOpciones({ reply: primerCampo.prompt }, primerCampo));
     }
@@ -857,6 +862,31 @@ app.post('/api/chat', async (req, res) => {
     if (sesion.estado === 'capturando_caso') {
       const campos = CAMPOS.caso_nuevo;
       const campo = campos[sesion.stepIndex];
+
+      // El asesor está respondiendo a "¿quieres cerrar la interacción con
+      // este cliente?" (esto solo se pregunta cuando "¿lograste el
+      // contacto?" fue "No"). Se maneja aparte del flujo normal de campos
+      // porque no es una pregunta de CAMPOS.caso_nuevo.
+      if (sesion.pendienteCierre) {
+        const respuestaCierre = interpretarSiNo(message);
+        if (!respuestaCierre) {
+          return res.json({
+            reply: '¿Quieres cerrar la interacción con este cliente?',
+            opciones: ['Sí', 'No'],
+          });
+        }
+        if (respuestaCierre === 'sí') {
+          const nombreCerrado = sesion.data.nombre_cliente || 'el cliente';
+          Object.assign(sesion, nuevaSesion());
+          return res.json({
+            reply: `✅ Listo, dejamos cerrada la interacción con ${nombreCerrado} — ya quedó guardado en la base de datos con estado "Contacto". Cuéntame cuando tengas otro cliente (dime "tengo un cliente nuevo") y arrancamos.`,
+          });
+        }
+        // Sigue con las preguntas normales, desde donde iba.
+        sesion.pendienteCierre = false;
+        const siguienteCampo = campos[sesion.stepIndex];
+        return res.json(conOpciones({ reply: `Listo, seguimos.\n\n${siguienteCampo.prompt}` }, siguienteCampo));
+      }
 
       const esDuda = pareceDuda(message);
       if (esDuda) {
@@ -928,6 +958,17 @@ app.post('/api/chat', async (req, res) => {
           console.error(`Error actualizando el campo ${campo.id} en Supabase:`, dbError);
           // No bloqueamos el flujo si falla un guardado incremental.
         }
+      }
+
+      // Si NO se logró el contacto, le preguntamos al asesor si de una vez
+      // quiere cerrar la interacción con este cliente (ya quedó guardado
+      // como "Contacto") o si prefiere seguir con las demás preguntas.
+      if (campo.id === 'contacto_logrado' && resultadoCampo.valor === 'No') {
+        sesion.pendienteCierre = true;
+        return res.json({
+          reply: `${avisoDuplicado}${avisoGuardado}¿Quieres cerrar la interacción con este cliente?`,
+          opciones: ['Sí', 'No'],
+        });
       }
 
       if (sesion.stepIndex < campos.length) {

@@ -119,17 +119,11 @@ const GATES_NEGOCIACION = [
   },
   {
     id: 'acepta',
-    pregunta: '¿El cliente acepta todo?',
+    pregunta: '¿Finalizaste la negociación con el cliente?',
     motivoCampo: 'motivo_rechazo',
     motivos: ['No confía en el proceso', 'Precio', 'Tiempo limitado para el proceso'],
-    siguientePasoOpciones: [
-      'Pendiente de contrato',
-      'Pendiente de firma',
-      'Pendiente de pago',
-      'Solo DIAN',
-      'Servicio completo',
-      'Solo UPME',
-    ],
+    siguientePasoOpciones: ['Pendiente de contrato', 'Pendiente de firma', 'Pendiente de pago'],
+    servicioOpciones: ['Solo DIAN', 'Servicio completo', 'Solo UPME'],
   },
 ];
 
@@ -181,6 +175,11 @@ function formatearResultadosBusqueda(casos, termino) {
       estadoTexto = `no aplicó${c.motivo_no_aplica ? ` (motivo: ${c.motivo_no_aplica})` : ''}`;
     }
 
+    // Motivo de negociación: mostramos el más reciente que tenga dato (si el
+    // caso avanzó, un gate anterior puede haber quedado sin motivo porque se
+    // respondió "Sí").
+    const motivoNegociacion = c.motivo_rechazo || c.motivo_negociacion || c.motivo_no_interes || null;
+
     return (
       `• ${c.nombre_cliente || 'Sin nombre'} — ${c.tipo_identificacion || 'ID'} ${c.numero_identificacion || '—'}, ` +
       `placa ${c.placa || '—'}, vehículo ${c.vehiculo || '—'}.\n` +
@@ -190,6 +189,10 @@ function formatearResultadosBusqueda(casos, termino) {
           : ''
       }. Trámite ante la DIAN: ${estadoTexto}.` +
       ` Última comunicación: ${fechaTexto}.` +
+      (c.siguiente_paso ? ` Siguiente paso: ${c.siguiente_paso}.` : '') +
+      (c.servicio_contratado ? ` Servicio contratado: ${c.servicio_contratado}.` : '') +
+      (motivoNegociacion ? ` Motivo: ${motivoNegociacion}.` : '') +
+      (c.info_completa ? ` Información: ${c.info_completa}.` : '') +
       (c.observaciones ? ` Observaciones: ${c.observaciones}.` : '')
     );
   });
@@ -1244,10 +1247,41 @@ app.post('/api/chat', async (req, res) => {
             console.error('Error guardando el siguiente paso en Supabase:', dbError);
           }
         }
+        if (gate.servicioOpciones) {
+          neg.sub = 'servicio_contratado';
+          return res.json({
+            reply: `✅ Anotado: "${match}".\n\n¿Cuál es el servicio contratado?`,
+            opciones: gate.servicioOpciones,
+          });
+        }
         sesion.estado = 'caso_abierto';
         sesion.negociacion = null;
         return res.json({
           reply: `✅ Excelente, quedó registrado: "${match}". Sigamos gestionando: cuéntame cuando el caso se radique (dime algo como "ya se radicó") o si al final no aplicó (dime "no aplica" y el motivo).`,
+        });
+      }
+
+      if (neg.sub === 'servicio_contratado') {
+        const opcionesServicio = gate.servicioOpciones;
+        const entrada = normalizarTexto(message).trim();
+        const match = opcionesServicio.find((o) => normalizarTexto(o).trim() === entrada);
+        if (!match) {
+          return res.json({
+            reply: '⚠️ Selecciona una opción.',
+            opciones: opcionesServicio,
+          });
+        }
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { servicio_contratado: match });
+          } catch (dbError) {
+            console.error('Error guardando el servicio contratado en Supabase:', dbError);
+          }
+        }
+        sesion.estado = 'caso_abierto';
+        sesion.negociacion = null;
+        return res.json({
+          reply: `✅ Excelente, quedó registrado el servicio: "${match}". Sigamos gestionando: cuéntame cuando el caso se radique (dime algo como "ya se radicó") o si al final no aplicó (dime "no aplica" y el motivo).`,
         });
       }
     }

@@ -114,11 +114,27 @@ async function obtenerConocimientoReciente(limite = 30) {
   return data || [];
 }
 
+// Quita tildes para comparar nombres sin importar acentos (ej. "jimenez" vs
+// "Jiménez").
+function normalizarTexto(s) {
+  return (s || '')
+    .toString()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '');
+}
+
 /**
- * Busca casos ya registrados por nombre (parcial), número de identificación
- * (exacto) o placa (exacta), para que el asesor pueda confirmar si un
- * cliente ya fue atendido antes de crear un caso duplicado. Devuelve los
- * más recientemente actualizados primero.
+ * Busca casos ya registrados por nombre, número de identificación (exacto) o
+ * placa (exacta), para que el asesor pueda confirmar el estado de un cliente
+ * o evitar crear un caso duplicado. Devuelve los más recientemente
+ * actualizados primero.
+ *
+ * El nombre se busca por PALABRAS, no como frase exacta: "claudia jimenez"
+ * debe encontrar a "Claudia Ximena Jimenez" aunque "Ximena" quede en medio.
+ * Antes se buscaba con ilike de la frase completa, así que cualquier nombre
+ * de en medio (segundo nombre, apellido materno) hacía fallar la búsqueda
+ * aunque el cliente sí estuviera registrado.
  */
 async function buscarCasoPorTermino(termino, limite = 5) {
   const supabase = getClient();
@@ -130,21 +146,47 @@ async function buscarCasoPorTermino(termino, limite = 5) {
   const termLimpio = term.replace(/[%,()]/g, ' ').replace(/\s+/g, ' ').trim();
   if (!termLimpio) return [];
   const termPlaca = termLimpio.toUpperCase().replace(/[\s-]+/g, '');
+  const palabras = termLimpio.split(' ').filter((p) => p.length >= 2);
 
+  const filtrosNombre = (palabras.length > 0 ? palabras : [termLimpio]).map(
+    (p) => `nombre_cliente.ilike.%${p}%`
+  );
   const filtros = [
-    `nombre_cliente.ilike.%${termLimpio}%`,
+    ...filtrosNombre,
     `numero_identificacion.eq.${termLimpio}`,
     `placa.eq.${termPlaca}`,
   ].join(',');
 
+  // Traemos un grupo más amplio de candidatos (cualquiera que coincida con
+  // AL MENOS una palabra) y luego, en JS, priorizamos los que tienen TODAS
+  // las palabras del término, para no perder coincidencias reales por el
+  // orden o por nombres de en medio.
   const { data, error } = await supabase
     .from('casos')
     .select('*')
     .or(filtros)
     .order('updated_at', { ascending: false, nullsFirst: false })
-    .limit(limite);
+    .limit(50);
   if (error) throw error;
-  return data || [];
+
+  const palabrasNorm = palabras.map(normalizarTexto);
+  const completos = [];
+  const parciales = [];
+  for (const c of data || []) {
+    const nombreNorm = normalizarTexto(c.nombre_cliente);
+    const cedulaMatch = c.numero_identificacion && c.numero_identificacion === termLimpio;
+    const placaMatch = c.placa && c.placa === termPlaca;
+    const todasLasPalabras =
+      palabrasNorm.length > 0 && palabrasNorm.every((p) => nombreNorm.includes(p));
+
+    if (cedulaMatch || placaMatch || todasLasPalabras) {
+      completos.push(c);
+    } else {
+      parciales.push(c);
+    }
+  }
+
+  return [...completos, ...parciales].slice(0, limite);
 }
 
 module.exports = {

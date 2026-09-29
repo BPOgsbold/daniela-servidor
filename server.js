@@ -4,7 +4,7 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 
-const { responderAyuda } = require('./lib/claude');
+const { responderAyuda } = require('./claude');
 const {
   crearCaso,
   actualizarCaso,
@@ -12,7 +12,7 @@ const {
   guardarConocimiento,
   obtenerConocimientoReciente,
   buscarCasoPorTermino,
-} = require('./lib/supabase');
+} = require('./supabase');
 
 const app = express();
 app.use(cors());
@@ -25,11 +25,11 @@ app.use(express.json({ limit: '2mb' }));
 const PORT = process.env.PORT || 3000;
 
 const CAMPOS = JSON.parse(
-  fs.readFileSync(path.join(__dirname, 'config', 'campos.json'), 'utf8')
+  fs.readFileSync(path.join(__dirname, 'campos.json'), 'utf8')
 );
-const SOP_TEXT = fs.readFileSync(path.join(__dirname, 'config', 'sop.md'), 'utf8');
+const SOP_TEXT = fs.readFileSync(path.join(__dirname, 'sop.md'), 'utf8');
 const OBJECIONES_TEXT = fs.readFileSync(
-  path.join(__dirname, 'config', 'objeciones.md'),
+  path.join(__dirname, 'objeciones.md'),
   'utf8'
 );
 

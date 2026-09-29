@@ -905,7 +905,7 @@ app.post('/api/chat', async (req, res) => {
       const saludo = asesor ? `¡Hola, ${asesor}! ` : '¡Hola! ';
       return res.json({
         reply: `${saludo}${MENSAJE_INICIAL}`,
-        opciones: ['Tengo un cliente nuevo', 'Buscar cliente', 'Ya fue atendido este cliente'],
+        opciones: ['Tengo un cliente nuevo', 'Buscar cliente'],
       });
     }
 

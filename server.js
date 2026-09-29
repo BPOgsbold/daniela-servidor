@@ -140,6 +140,13 @@ function resumenCampos(campos, data) {
   return campos.map((c) => `• ${c.label}: ${data[c.id] ?? '—'}`).join('\n');
 }
 
+// Cuando el campo que se le está preguntando al asesor tiene opciones fijas
+// (tipo "botones"/"botones_opcional"), se las mandamos a la extensión en
+// `opciones` para que las pinte como botones clicables, además del texto.
+function conOpciones(base, campo) {
+  return campo && campo.opciones ? { ...base, opciones: campo.opciones } : base;
+}
+
 // Normaliza algunas respuestas cortas a una etiqueta completa y legible.
 const TIPO_PERSONA_MAP = {
   '1': 'Persona natural',
@@ -243,6 +250,33 @@ function validarYNormalizarCampo(campo, mensajeCrudo) {
     if (!valor) return { ok: false };
     return { ok: true, valor };
   }
+
+  // Campos con botones fijos (canal, origen, contacto logrado, certificado
+  // UPME): la extensión manda de vuelta exactamente el texto del botón que
+  // el asesor clickeó, así que comparamos ignorando mayúsculas/tildes por si
+  // lo escribe a mano en vez de dar clic.
+  if (campo.tipo === 'botones') {
+    const entrada = normalizarTexto(mensajeCrudo).trim();
+    const match = (campo.opciones || []).find((o) => normalizarTexto(o).trim() === entrada);
+    if (!match) return { ok: false };
+    return { ok: true, valor: match };
+  }
+
+  // Campo opcional con botón de "Saltar" (ej. ID de redes sociales): si el
+  // asesor da clic en el botón, o escribe algo como "no tiene"/"ninguno", se
+  // guarda como null y seguimos; si escribe cualquier otra cosa, se guarda
+  // tal cual.
+  if (campo.tipo === 'botones_opcional') {
+    const entrada = mensajeCrudo.trim();
+    const entradaNorm = normalizarTexto(entrada);
+    const esSaltar =
+      (campo.opciones || []).some((o) => normalizarTexto(o).trim() === entradaNorm) ||
+      /^(saltar|no tiene|ninguno|n\/a|no aplica|no)$/i.test(entrada);
+    if (esSaltar) return { ok: true, valor: null };
+    if (!entrada) return { ok: false };
+    return { ok: true, valor: entrada };
+  }
+
   const regex = new RegExp(campo.regex);
   if (!regex.test(mensajeCrudo.trim())) return { ok: false };
   return { ok: true, valor: normalizarValorCampo(campo.id, mensajeCrudo) };
@@ -801,7 +835,7 @@ app.post('/api/chat', async (req, res) => {
       sesion.casoId = null;
       sesion.avisoDuplicadoMostrado = false;
       const primerCampo = CAMPOS.caso_nuevo[0];
-      return res.json({ reply: primerCampo.prompt });
+      return res.json(conOpciones({ reply: primerCampo.prompt }, primerCampo));
     }
 
     if (message === '__radicado__' || message === '__no_aplica__') {
@@ -838,12 +872,12 @@ app.post('/api/chat', async (req, res) => {
           },
           conocimiento
         );
-        return res.json({ reply: `${respuesta}\n\n➡️ ${campo.prompt}` });
+        return res.json(conOpciones({ reply: `${respuesta}\n\n➡️ ${campo.prompt}` }, campo));
       }
 
       const resultadoCampo = validarYNormalizarCampo(campo, message);
       if (!resultadoCampo.ok) {
-        return res.json({ reply: `⚠️ ${campo.errorMessage}\n\n${campo.prompt}` });
+        return res.json(conOpciones({ reply: `⚠️ ${campo.errorMessage}\n\n${campo.prompt}` }, campo));
       }
 
       sesion.data[campo.id] = resultadoCampo.valor;
@@ -869,29 +903,61 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
-      if (sesion.stepIndex < campos.length) {
-        const siguiente = campos[sesion.stepIndex];
-        return res.json({ reply: `${avisoDuplicado}✅ Anotado.\n\n${siguiente.prompt}` });
+      // En cuanto se responde si se logró el contacto, ya creamos el caso en
+      // Supabase con estado "Contacto" — así, aunque después se caiga la
+      // llamada o no se alcance a llenar todo lo demás, el cliente NO se
+      // pierde: ya quedó guardado en la base de datos.
+      let avisoGuardado = '';
+      if (campo.id === 'contacto_logrado' && !sesion.casoId) {
+        try {
+          const registro = await crearCaso(sessionId, asesor, { ...sesion.data, estado_pipeline: 'Contacto' });
+          sesion.casoId = registro.id;
+          avisoGuardado =
+            '✅ Ya quedó guardado en la base de datos (estado: Contacto), así que aunque no alcancemos a completar todo, no se pierde.\n\n';
+        } catch (dbError) {
+          console.error('Error creando el caso en Supabase (paso de contacto):', dbError);
+          avisoGuardado = `⚠️ No pude guardar el caso en la base de datos en este momento (${dbError.message}). Sigamos igual, pero avisa a soporte si esto se repite.\n\n`;
+        }
+      } else if (sesion.casoId) {
+        // El caso ya existe (se creó en el paso de "contacto_logrado"): cada
+        // dato nuevo se va guardando de una vez, en vez de esperar a que se
+        // complete todo el formulario.
+        try {
+          await actualizarCaso(sesion.casoId, { [campo.id]: resultadoCampo.valor });
+        } catch (dbError) {
+          console.error(`Error actualizando el campo ${campo.id} en Supabase:`, dbError);
+          // No bloqueamos el flujo si falla un guardado incremental.
+        }
       }
 
-      // Caso completo: crear el registro y pasar a "caso_abierto".
-      try {
-        const registro = await crearCaso(sessionId, asesor, sesion.data);
-        sesion.casoId = registro.id;
-      } catch (dbError) {
-        console.error('Error guardando el caso en Supabase:', dbError);
-        return res.json({
-          reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
-            campos,
-            sesion.data
-          )}`,
-        });
+      if (sesion.stepIndex < campos.length) {
+        const siguiente = campos[sesion.stepIndex];
+        return res.json(conOpciones({ reply: `${avisoDuplicado}${avisoGuardado}✅ Anotado.\n\n${siguiente.prompt}` }, siguiente));
+      }
+
+      // Caso completo. Si ya se creó antes (en el paso de contacto), solo
+      // falta cerrar el estado local — los datos ya se fueron guardando
+      // incrementalmente. Si por algo no existiera todavía (no debería
+      // pasar), lo creamos aquí como respaldo.
+      if (!sesion.casoId) {
+        try {
+          const registro = await crearCaso(sessionId, asesor, sesion.data);
+          sesion.casoId = registro.id;
+        } catch (dbError) {
+          console.error('Error guardando el caso en Supabase:', dbError);
+          return res.json({
+            reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+              campos,
+              sesion.data
+            )}`,
+          });
+        }
       }
 
       sesion.estado = 'caso_abierto';
       return res.json({
         reply:
-          `${avisoDuplicado}✅ Caso registrado:\n\n${resumenCampos(campos, sesion.data)}\n\n` +
+          `${avisoDuplicado}${avisoGuardado}✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n` +
           'Sigamos gestionando: pregúntame cualquier duda del proceso, y cuéntame cuando el caso se radique ' +
           '(dime algo como "ya se radicó") o si al final no aplicó (dime "no aplica" y el motivo).',
       });

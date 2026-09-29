@@ -25,6 +25,10 @@ async function crearCaso(sessionId, asesor, datos) {
     nombre_cliente: datos.nombre_cliente || null,
     telefono: datos.telefono || null,
     canal: datos.canal || null,
+    origen_cliente: datos.origen_cliente || null,
+    contacto_logrado: datos.contacto_logrado || null,
+    email: datos.email || null,
+    id_rrss: datos.id_rrss || null,
     tipo_identificacion: datos.tipo_identificacion || null,
     numero_identificacion: datos.numero_identificacion || null,
     ciudad: datos.ciudad || null,
@@ -36,11 +40,11 @@ async function crearCaso(sessionId, asesor, datos) {
     fecha_compra: datos.fecha_compra || null,
     valor_sin_iva: datos.valor_sin_iva || null,
     tiene_certificado_upme: datos.tiene_certificado_upme || null,
-    // Estado del pipeline comercial: un caso nuevo arranca como "Interesado"
-    // porque, para poder crearlo, el cliente ya tuvo que dar todos los datos
-    // requeridos. El asesor lo va cambiando después escribiéndole a Daniela
-    // (ej. "cambia el estado a cliente").
-    estado_pipeline: 'Interesado',
+    // Estado del pipeline comercial: por defecto arranca como "Interesado",
+    // pero el caso ahora se puede crear desde antes de tener todos los
+    // datos (apenas se responde si se logró el contacto), así que quien
+    // llama puede pasar explícitamente estado_pipeline: 'Contacto'.
+    estado_pipeline: datos.estado_pipeline || 'Interesado',
     datos,
   };
   const { data, error } = await supabase.from('casos').insert(row).select().single();

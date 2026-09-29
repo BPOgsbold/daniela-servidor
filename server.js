@@ -84,7 +84,32 @@ function nuevaSesion() {
     // preguntamos si quiere cerrar la interacción con ese cliente ahí mismo
     // (ya quedó guardado como "Contacto") o seguir igual con las preguntas.
     pendienteCierre: false,
+    // Último caso único que encontró una búsqueda ("buscar cliente" / "ya
+    // fue atendido"), para que el botón "Retomar este caso" sepa cuál es sin
+    // tener que volver a buscar.
+    candidatoRetomar: null,
   };
+}
+
+// Convierte un registro ya guardado en Supabase de vuelta al formato de
+// `sesion.data` (id de campo -> valor), para poder "retomar" un caso
+// existente sin volver a preguntar los datos que ya tiene. Solo se incluyen
+// los campos que sí tienen valor: los que falten quedan pendientes, tal como
+// los detecta `siguienteIndicePendiente`.
+const CAMPOS_RETOMABLES = [
+  'canal', 'origen_cliente', 'nombre_cliente', 'telefono', 'contacto_logrado',
+  'numero_identificacion', 'email', 'id_rrss', 'tipo_identificacion',
+  'tipo_persona', 'vehiculo', 'tecnologia', 'placa', 'fecha_compra',
+  'valor_sin_iva', 'tiene_certificado_upme',
+];
+function datosDeCasoExistente(caso) {
+  const datos = {};
+  for (const id of CAMPOS_RETOMABLES) {
+    if (caso[id] !== null && caso[id] !== undefined && caso[id] !== '') {
+      datos[id] = caso[id];
+    }
+  }
+  return datos;
 }
 
 // Arma una respuesta legible con los casos que ya existen en Supabase para
@@ -626,6 +651,42 @@ app.post('/api/chat', async (req, res) => {
       sesiones.set(sessionId, sesion);
     }
 
+    // --- Retomar un caso ya existente (botón que aparece cuando una
+    // búsqueda encuentra exactamente un cliente): en vez de seguir pidiendo
+    // datos para un caso nuevo (que duplicaría al cliente), cargamos lo que
+    // el caso ya tiene y seguimos preguntando solo lo que falta.
+    if (/^retomar este caso$/i.test(message.trim())) {
+      const casoARetomar = sesion.candidatoRetomar;
+      if (!casoARetomar) {
+        return res.json({
+          reply: 'Ya no tengo a mano ese caso para retomarlo — dime "buscar cliente" y lo buscamos de nuevo.',
+        });
+      }
+      sesion.estado = 'capturando_caso';
+      sesion.tipo = null;
+      sesion.casoId = casoARetomar.id;
+      sesion.data = datosDeCasoExistente(casoARetomar);
+      sesion.stepIndex = siguienteIndicePendiente(CAMPOS.caso_nuevo, sesion.data);
+      sesion.avisoDuplicadoMostrado = true;
+      sesion.pendienteCierre = false;
+      sesion.pendienteBusqueda = false;
+      sesion.candidatoRetomar = null;
+      const nombreRetomado = casoARetomar.nombre_cliente || 'este cliente';
+      if (sesion.stepIndex < CAMPOS.caso_nuevo.length) {
+        const siguienteRetomado = CAMPOS.caso_nuevo[sesion.stepIndex];
+        return res.json(
+          conOpciones(
+            { reply: `✅ Retomamos el caso de ${nombreRetomado}. Sigamos completando lo que falta.\n\n${siguienteRetomado.prompt}` },
+            siguienteRetomado
+          )
+        );
+      }
+      sesion.estado = 'caso_abierto';
+      return res.json({
+        reply: `El caso de ${nombreRetomado} ya tiene todos los datos completos (estado del pipeline: ${casoARetomar.estado_pipeline || 'sin definir'}). Pregúntame cualquier duda, o cuéntame cuando se radique o no aplique.`,
+      });
+    }
+
     // --- Detección dinámica: si el mensaje libre suena a un cambio de
     // estado ("tengo un cliente nuevo", "ya se radicó", etc.), lo tratamos
     // como si hubiera pulsado el botón correspondiente.
@@ -786,9 +847,16 @@ app.post('/api/chat', async (req, res) => {
       const terminoInline = extraerTerminoBusqueda(mensajeOriginal);
       if (terminoInline) {
         let reply;
+        let opcionesBusqueda;
         try {
           const resultados = await buscarCasoPorTermino(terminoInline);
           reply = formatearResultadosBusqueda(resultados, terminoInline);
+          if (resultados.length === 1) {
+            sesion.candidatoRetomar = resultados[0];
+            opcionesBusqueda = ['Retomar este caso'];
+          } else {
+            sesion.candidatoRetomar = null;
+          }
         } catch (dbError) {
           console.error('Error buscando cliente en Supabase:', dbError);
           reply = `No pude consultar la base de datos en este momento (${dbError.message}). Intenta de nuevo en un momento.`;
@@ -797,7 +865,7 @@ app.post('/api/chat', async (req, res) => {
         if (campoPendienteInline) {
           reply += `\n\n➡️ Sigamos donde íbamos: ${campoPendienteInline}`;
         }
-        return res.json({ reply });
+        return res.json(opcionesBusqueda ? { reply, opciones: opcionesBusqueda } : { reply });
       }
       sesion.pendienteBusqueda = true;
       return res.json({
@@ -810,9 +878,16 @@ app.post('/api/chat', async (req, res) => {
       sesion.pendienteBusqueda = false;
       const termino = message.trim();
       let reply;
+      let opcionesBusqueda;
       try {
         const resultados = await buscarCasoPorTermino(termino);
         reply = formatearResultadosBusqueda(resultados, termino);
+        if (resultados.length === 1) {
+          sesion.candidatoRetomar = resultados[0];
+          opcionesBusqueda = ['Retomar este caso'];
+        } else {
+          sesion.candidatoRetomar = null;
+        }
       } catch (dbError) {
         console.error('Error buscando cliente en Supabase:', dbError);
         reply = `No pude consultar la base de datos en este momento (${dbError.message}). Intenta de nuevo en un momento.`;
@@ -821,14 +896,17 @@ app.post('/api/chat', async (req, res) => {
       if (campoPendiente) {
         reply += `\n\n➡️ Sigamos donde íbamos: ${campoPendiente}`;
       }
-      return res.json({ reply });
+      return res.json(opcionesBusqueda ? { reply, opciones: opcionesBusqueda } : { reply });
     }
 
     // --- Mensajes especiales ---
 
     if (message === '__inicio__') {
       const saludo = asesor ? `¡Hola, ${asesor}! ` : '¡Hola! ';
-      return res.json({ reply: `${saludo}${MENSAJE_INICIAL}` });
+      return res.json({
+        reply: `${saludo}${MENSAJE_INICIAL}`,
+        opciones: ['Tengo un cliente nuevo', 'Buscar cliente', 'Ya fue atendido este cliente'],
+      });
     }
 
     if (message === '__nuevo_caso__') {

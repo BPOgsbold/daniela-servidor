@@ -113,7 +113,11 @@ function formatearResultadosBusqueda(casos, termino) {
     return (
       `• ${c.nombre_cliente || 'Sin nombre'} — ${c.tipo_identificacion || 'ID'} ${c.numero_identificacion || '—'}, ` +
       `placa ${c.placa || '—'}, vehículo ${c.vehiculo || '—'}.\n` +
-      `  Estado del pipeline: ${c.estado_pipeline || 'sin definir'}. Trámite ante la DIAN: ${estadoTexto}.` +
+      `  Estado del pipeline: ${c.estado_pipeline || 'sin definir'}${
+        c.estado_pipeline && descripcionEstadoPipeline(c.estado_pipeline)
+          ? ` (${descripcionEstadoPipeline(c.estado_pipeline)})`
+          : ''
+      }. Trámite ante la DIAN: ${estadoTexto}.` +
       ` Última comunicación: ${fechaTexto}.` +
       (c.observaciones ? ` Observaciones: ${c.observaciones}.` : '')
     );
@@ -311,15 +315,54 @@ function normalizarTexto(s) {
 // no_aplica). El asesor los cambia escribiéndole a Daniela en lenguaje
 // natural, ej. "cambia el estado a cliente" o "márcalo como en proceso upme".
 const ESTADOS_PIPELINE = [
-  { label: 'Interesado', frases: ['interesado'] },
-  { label: 'Contacto', frases: ['contacto'] },
-  { label: 'Cliente', frases: ['cliente'] },
-  { label: 'Cierre perdido', frases: ['cierre perdido'] },
-  { label: 'En proceso UPME', frases: ['proceso upme', 'tramite upme', 'en upme'] },
-  { label: 'En proceso DIAN', frases: ['proceso dian', 'tramite dian', 'en dian'] },
-  { label: 'Pendiente desembolso', frases: ['pendiente desembolso', 'pdt desembolso'] },
-  { label: 'Desembolso realizado', frases: ['desembolso realizado'] },
+  {
+    label: 'Interesado',
+    frases: ['interesado'],
+    descripcion: 'es el que llega y ya se completaron todos los datos que el cliente brinda.',
+  },
+  {
+    label: 'Contacto',
+    frases: ['contacto'],
+    descripcion: 'el cliente se comunicó pero no brindó todos los datos.',
+  },
+  {
+    label: 'Cliente',
+    frases: ['cliente'],
+    descripcion: 'ya tenemos todos los documentos que debe enviar el cliente, la firma del contrato y el pago realizado.',
+  },
+  {
+    label: 'Cierre perdido',
+    frases: ['cierre perdido'],
+    descripcion: 'el cliente no firmó contrato, no envió documentación y/o no realizó el pago.',
+  },
+  {
+    label: 'En proceso UPME',
+    frases: ['proceso upme', 'tramite upme', 'en upme'],
+    descripcion: 'el cliente está en trámite del estado UPME.',
+  },
+  {
+    label: 'En proceso DIAN',
+    frases: ['proceso dian', 'tramite dian', 'en dian'],
+    descripcion: 'el cliente está en trámite ante la DIAN, pendiente de agendamiento de cita.',
+  },
+  {
+    label: 'Pendiente desembolso',
+    frases: ['pendiente desembolso', 'pdt desembolso'],
+    descripcion: 'está en espera de desembolso por parte de la DIAN.',
+  },
+  {
+    label: 'Desembolso realizado',
+    frases: ['desembolso realizado'],
+    descripcion: 'el cliente confirmó que el pago ya fue realizado.',
+  },
 ];
+
+// Devuelve la explicación de negocio de un estado del pipeline (para
+// mostrársela al asesor junto con el estado, no solo la etiqueta).
+function descripcionEstadoPipeline(label) {
+  const encontrado = ESTADOS_PIPELINE.find((e) => e.label === label);
+  return encontrado ? encontrado.descripcion : null;
+}
 
 // Compara el texto capturado como "estado destino" contra los estados
 // conocidos. Las frases de UNA sola palabra (cliente, contacto, interesado)

@@ -88,8 +88,50 @@ function nuevaSesion() {
     // fue atendido"), para que el botón "Retomar este caso" sepa cuál es sin
     // tener que volver a buscar.
     candidatoRetomar: null,
+    // Progreso en las 3 preguntas de negociación (estado de interés,
+    // negociación, cliente acepta todo) que se hacen una vez el caso ya
+    // tiene todos sus datos. Ver GATES_NEGOCIACION.
+    negociacion: null,
   };
 }
+
+// Las 3 preguntas de negociación, en orden. Cada una es un gate Sí/No: si es
+// "No" pide un motivo (con botones) y luego si cerrar la interacción; si es
+// "Sí" pasa a la siguiente (la última pide el siguiente paso en vez de eso).
+const GATES_NEGOCIACION = [
+  {
+    id: 'interes',
+    pregunta: '¿El cliente sigue interesado en el proceso?',
+    motivoCampo: 'motivo_no_interes',
+    motivos: [
+      'Tecnología del vehículo',
+      'Antigüedad',
+      'Segundo propietario',
+      'No entrega información',
+      'No le interesa el proceso',
+    ],
+  },
+  {
+    id: 'negociacion',
+    pregunta: '¿El cliente acepta la propuesta?',
+    motivoCampo: 'motivo_negociacion',
+    motivos: ['Lo pensará', 'Pide volver a llamar', 'Va a consultar un tercero'],
+  },
+  {
+    id: 'acepta',
+    pregunta: '¿El cliente acepta todo?',
+    motivoCampo: 'motivo_rechazo',
+    motivos: ['No confía en el proceso', 'Precio', 'Tiempo limitado para el proceso'],
+    siguientePasoOpciones: [
+      'Pendiente de contrato',
+      'Pendiente de firma',
+      'Pendiente de pago',
+      'Solo DIAN',
+      'Servicio completo',
+      'Solo UPME',
+    ],
+  },
+];
 
 // Convierte un registro ya guardado en Supabase de vuelta al formato de
 // `sesion.data` (id de campo -> valor), para poder "retomar" un caso
@@ -1073,13 +1115,141 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
-      sesion.estado = 'caso_abierto';
+      // En vez de terminar aquí, arrancamos las 3 preguntas de negociación
+      // (estado de interés, negociación, cliente acepta todo) para ir
+      // registrando cómo avanza la venta.
+      sesion.estado = 'negociacion';
+      sesion.negociacion = { gateIndex: 0, sub: 'pregunta' };
+      const primerGate = GATES_NEGOCIACION[0];
       return res.json({
         reply:
           `${avisoDuplicado}${avisoGuardado}✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n` +
-          'Sigamos gestionando: pregúntame cualquier duda del proceso, y cuéntame cuando el caso se radique ' +
-          '(dime algo como "ya se radicó") o si al final no aplicó (dime "no aplica" y el motivo).',
+          `➡️ ${primerGate.pregunta}`,
+        opciones: ['Sí', 'No'],
       });
+    }
+
+    // --- Preguntas de negociación (estado de interés, negociación, cliente
+    // acepta todo), una detrás de otra, una vez el caso ya tiene todos sus
+    // datos. Cada una es un gate Sí/No: si es "No", pide el motivo con
+    // botones y luego pregunta si cerrar la interacción; si cierra, marca el
+    // caso como "Cierre perdido". Si es "Sí", sigue con la siguiente
+    // pregunta (la última, "Cliente acepta todo", en vez de eso pide el
+    // siguiente paso).
+    if (sesion.estado === 'negociacion' && sesion.negociacion) {
+      const neg = sesion.negociacion;
+      const gate = GATES_NEGOCIACION[neg.gateIndex];
+
+      if (neg.sub === 'pregunta') {
+        const respuesta = interpretarSiNo(message);
+        if (!respuesta) {
+          return res.json({ reply: gate.pregunta, opciones: ['Sí', 'No'] });
+        }
+        if (respuesta === 'sí') {
+          if (gate.siguientePasoOpciones) {
+            neg.sub = 'siguiente_paso';
+            return res.json({
+              reply: '¡Excelente! ¿Cuál es el siguiente paso con este cliente?',
+              opciones: gate.siguientePasoOpciones,
+            });
+          }
+          neg.gateIndex += 1;
+          neg.sub = 'pregunta';
+          const siguienteGate = GATES_NEGOCIACION[neg.gateIndex];
+          return res.json({ reply: `Listo.\n\n➡️ ${siguienteGate.pregunta}`, opciones: ['Sí', 'No'] });
+        }
+        neg.sub = 'motivo';
+        return res.json({ reply: '¿Cuál es el motivo?', opciones: gate.motivos });
+      }
+
+      if (neg.sub === 'motivo') {
+        const entrada = normalizarTexto(message).trim();
+        const motivo = gate.motivos.find((m) => normalizarTexto(m).trim() === entrada);
+        if (!motivo) {
+          return res.json({ reply: '⚠️ Selecciona uno de los motivos.', opciones: gate.motivos });
+        }
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { [gate.motivoCampo]: motivo });
+          } catch (dbError) {
+            console.error(`Error guardando ${gate.motivoCampo} en Supabase:`, dbError);
+          }
+        }
+        neg.sub = 'cierre';
+        return res.json({ reply: '¿Quieres cerrar la interacción con este cliente?', opciones: ['Sí', 'No'] });
+      }
+
+      if (neg.sub === 'cierre') {
+        const respuesta = interpretarSiNo(message);
+        if (!respuesta) {
+          return res.json({ reply: '¿Quieres cerrar la interacción con este cliente?', opciones: ['Sí', 'No'] });
+        }
+        if (respuesta === 'sí') {
+          neg.sub = 'completitud';
+          return res.json({
+            reply: '¿La información del caso quedó completa, o queda pendiente algún dato?',
+            opciones: ['Información completa', 'Pendiente de información'],
+          });
+        }
+        // No cierra: sigue con la siguiente pregunta igual.
+        neg.gateIndex += 1;
+        neg.sub = 'pregunta';
+        if (neg.gateIndex >= GATES_NEGOCIACION.length) {
+          sesion.estado = 'caso_abierto';
+          sesion.negociacion = null;
+          return res.json({ reply: 'Listo, seguimos gestionando este caso.' });
+        }
+        const siguienteGate = GATES_NEGOCIACION[neg.gateIndex];
+        return res.json({ reply: `Listo, seguimos.\n\n➡️ ${siguienteGate.pregunta}`, opciones: ['Sí', 'No'] });
+      }
+
+      if (neg.sub === 'completitud') {
+        const opcionesCompletitud = ['Información completa', 'Pendiente de información'];
+        const entrada = normalizarTexto(message).trim();
+        const match = opcionesCompletitud.find((o) => normalizarTexto(o).trim() === entrada);
+        if (!match) {
+          return res.json({
+            reply: '⚠️ Selecciona una opción.',
+            opciones: opcionesCompletitud,
+          });
+        }
+        const nombreCerrado = sesion.data.nombre_cliente || 'el cliente';
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { estado_pipeline: 'Cierre perdido', info_completa: match });
+          } catch (dbError) {
+            console.error('Error cerrando la negociación en Supabase:', dbError);
+          }
+        }
+        Object.assign(sesion, nuevaSesion());
+        return res.json({
+          reply: `✅ Listo, dejamos cerrada la interacción con ${nombreCerrado} — quedó como "Cierre perdido" (${match}). Cuéntame cuando tengas otro cliente (dime "tengo un cliente nuevo") y arrancamos.`,
+        });
+      }
+
+      if (neg.sub === 'siguiente_paso') {
+        const opcionesSiguientePaso = gate.siguientePasoOpciones;
+        const entrada = normalizarTexto(message).trim();
+        const match = opcionesSiguientePaso.find((o) => normalizarTexto(o).trim() === entrada);
+        if (!match) {
+          return res.json({
+            reply: '⚠️ Selecciona una opción.',
+            opciones: opcionesSiguientePaso,
+          });
+        }
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { siguiente_paso: match });
+          } catch (dbError) {
+            console.error('Error guardando el siguiente paso en Supabase:', dbError);
+          }
+        }
+        sesion.estado = 'caso_abierto';
+        sesion.negociacion = null;
+        return res.json({
+          reply: `✅ Excelente, quedó registrado: "${match}". Sigamos gestionando: cuéntame cuando el caso se radique (dime algo como "ya se radicó") o si al final no aplicó (dime "no aplica" y el motivo).`,
+        });
+      }
     }
 
     // --- Captura del resultado final (radicado / no_aplica) ---

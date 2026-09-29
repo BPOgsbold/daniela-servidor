@@ -370,8 +370,15 @@ function extraerNombreDeCambioEstado(antes) {
     if (nombre) return nombre;
   }
 
-  const resto = t
-    .replace(REGEX_VERBO_CAMBIO_ESTADO, ' ')
+  // Solo miramos el texto que viene DESPUÉS de la última aparición del
+  // verbo de cambio, para no arrastrar palabras de relleno que el asesor
+  // haya escrito antes del verbo (ej. "necesito cambiar el estado a
+  // cliente" no debe capturar "necesito" como si fuera el nombre).
+  const verbos = [...t.matchAll(new RegExp(REGEX_VERBO_CAMBIO_ESTADO.source, 'gi'))];
+  const ultimoVerbo = verbos[verbos.length - 1];
+  const desdeVerbo = ultimoVerbo ? t.slice(ultimoVerbo.index + ultimoVerbo[0].length) : t;
+
+  const resto = desdeVerbo
     .replace(/\b(el|la|los|las|del|de|al|a|un|una|como)\b/gi, ' ')
     .replace(/\b(estado|pipeline|caso)\b/gi, ' ')
     .replace(/\s+/g, ' ')

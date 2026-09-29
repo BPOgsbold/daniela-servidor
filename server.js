@@ -278,7 +278,23 @@ const FRASES_NUEVO_CASO = [
 // duplicar información. Es más específico que FRASES_NUEVO_CASO a propósito
 // (ej. exige "ya" + "atendido/gestionado/etc." o "duplicar"/"repetido") para
 // que "tengo un cliente nuevo" siga cayendo en __nuevo_caso__.
-const REGEX_BUSCAR_CLIENTE = /(ya\s+(fue|lo|la|hab[ií]amos|est[aá]|estuvo)\s+(atendid|gestionad|contactad|llamad)|cliente\s+(repetid|duplicad)|ya\s+(ten[ií]a|tiene|hab[ií]a)\s+caso|ya\s+existe\s+(ese|el|la|este)?\s*cliente|buscar\s+(el\s+|la\s+)?cliente|buscar\s+(este|ese)\s+cliente|consultar\s+(el\s+|la\s+)?cliente|revisar\s+si\s+ya\s+(existe|est[aá]|lo\s+(tenemos|ten[ií]amos))|no\s+(quiero|queremos)\s+duplicar|ya\s+lo\s+hab[ií]amos\s+atendido|ya\s+hab[ií]amos\s+hablado\s+con|ya\s+es\s+cliente|verificar\s+si\s+ya|est[aá]\s+repetido|hist[oó]rico\s+de(l)?\s+cliente|revisar\s+(el\s+)?historial)/i;
+// (Se agregaron además las variantes de "estado del caso"/"cómo va el caso":
+// un asesor preguntando "puedes brindarme estado del caso del cliente X" es
+// una consulta de estado tan válida como "buscar cliente", pero antes solo
+// caía en el flujo libre de IA, que no tiene acceso a Supabase y por eso
+// respondía que no podía consultar nada.)
+const REGEX_BUSCAR_CLIENTE = /(ya\s+(fue|lo|la|hab[ií]amos|est[aá]|estuvo)\s+(atendid|gestionad|contactad|llamad)|cliente\s+(repetid|duplicad)|ya\s+(ten[ií]a|tiene|hab[ií]a)\s+caso|ya\s+existe\s+(ese|el|la|este)?\s*cliente|buscar\s+(el\s+|la\s+)?cliente|buscar\s+(este|ese)\s+cliente|consultar\s+(el\s+|la\s+)?cliente|revisar\s+si\s+ya\s+(existe|est[aá]|lo\s+(tenemos|ten[ií]amos))|no\s+(quiero|queremos)\s+duplicar|ya\s+lo\s+hab[ií]amos\s+atendido|ya\s+hab[ií]amos\s+hablado\s+con|ya\s+es\s+cliente|verificar\s+si\s+ya|est[aá]\s+repetido|hist[oó]rico\s+de(l)?\s+cliente|revisar\s+(el\s+)?historial|estado\s+del?\s+(caso|cliente|tr[aá]mite)|c[oó]mo\s+va\s+(el|ese|su|este)?\s*(caso|tr[aá]mite)|en\s+qu[eé]\s+va\s+(el|ese|este)?\s*(caso|tr[aá]mite)|(brindar|dar|dame|darme|pasar|pasarme)(me)?\s+(el\s+)?(estado|informaci[oó]n)|informaci[oó]n\s+del\s+caso|info\s+del\s+caso|consultar\s+(el\s+)?estado)/i;
+
+// Si el mensaje que disparó "__buscar_cliente__" ya trae el nombre del
+// cliente (ej. "...del cliente michael barco"), lo extraemos para buscar de
+// una vez en vez de volver a preguntarle al asesor un dato que ya escribió.
+function extraerTerminoBusqueda(mensaje) {
+  const m = mensaje.match(/cliente\s+([a-záéíóúñ0-9.\-\s]{3,60})$/i);
+  if (!m) return null;
+  const termino = m[1].trim().replace(/[?.!¡¿]+$/g, '').trim();
+  if (!termino || /^(nuevo|repetido|duplicado|es)$/i.test(termino)) return null;
+  return termino;
+}
 
 function detectarIntencion(mensaje, sesion) {
   if (sesion.pendienteEscalamiento || sesion.pendienteBusqueda) return null;
@@ -403,6 +419,7 @@ app.post('/api/chat', async (req, res) => {
     // --- Detección dinámica: si el mensaje libre suena a un cambio de
     // estado ("tengo un cliente nuevo", "ya se radicó", etc.), lo tratamos
     // como si hubiera pulsado el botón correspondiente.
+    const mensajeOriginal = message;
     const intencionDetectada = detectarIntencion(message, sesion);
     if (intencionDetectada) {
       message = intencionDetectada;
@@ -490,8 +507,28 @@ app.post('/api/chat', async (req, res) => {
       return res.json({ reply: mensajeRetomar });
     }
 
-    // --- Buscar si un cliente ya fue atendido antes (evitar duplicar) ---
+    // --- Buscar si un cliente ya fue atendido antes / consultar el estado
+    // de su caso (evitar duplicar, o simplemente responder "cómo va") ---
     if (message === '__buscar_cliente__') {
+      // Si el asesor ya escribió el nombre en el mismo mensaje (ej.
+      // "estado del caso del cliente michael barco"), buscamos de una vez en
+      // vez de preguntarle otra vez un dato que ya dio.
+      const terminoInline = extraerTerminoBusqueda(mensajeOriginal);
+      if (terminoInline) {
+        let reply;
+        try {
+          const resultados = await buscarCasoPorTermino(terminoInline);
+          reply = formatearResultadosBusqueda(resultados, terminoInline);
+        } catch (dbError) {
+          console.error('Error buscando cliente en Supabase:', dbError);
+          reply = `No pude consultar la base de datos en este momento (${dbError.message}). Intenta de nuevo en un momento.`;
+        }
+        const campoPendienteInline = campoActualDe(sesion);
+        if (campoPendienteInline) {
+          reply += `\n\n➡️ Sigamos donde íbamos: ${campoPendienteInline}`;
+        }
+        return res.json({ reply });
+      }
       sesion.pendienteBusqueda = true;
       return res.json({
         reply:

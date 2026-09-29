@@ -4,7 +4,7 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 
-const { responderAyuda } = require('./claude');
+const { responderAyuda } = require('./lib/claude');
 const {
   crearCaso,
   actualizarCaso,
@@ -12,7 +12,7 @@ const {
   guardarConocimiento,
   obtenerConocimientoReciente,
   buscarCasoPorTermino,
-} = require('./supabase');
+} = require('./lib/supabase');
 
 const app = express();
 app.use(cors());
@@ -25,11 +25,11 @@ app.use(express.json({ limit: '2mb' }));
 const PORT = process.env.PORT || 3000;
 
 const CAMPOS = JSON.parse(
-  fs.readFileSync(path.join(__dirname, 'campos.json'), 'utf8')
+  fs.readFileSync(path.join(__dirname, 'config', 'campos.json'), 'utf8')
 );
-const SOP_TEXT = fs.readFileSync(path.join(__dirname, 'sop.md'), 'utf8');
+const SOP_TEXT = fs.readFileSync(path.join(__dirname, 'config', 'sop.md'), 'utf8');
 const OBJECIONES_TEXT = fs.readFileSync(
-  path.join(__dirname, 'objeciones.md'),
+  path.join(__dirname, 'config', 'objeciones.md'),
   'utf8'
 );
 
@@ -113,7 +113,8 @@ function formatearResultadosBusqueda(casos, termino) {
     return (
       `• ${c.nombre_cliente || 'Sin nombre'} — ${c.tipo_identificacion || 'ID'} ${c.numero_identificacion || '—'}, ` +
       `placa ${c.placa || '—'}, vehículo ${c.vehiculo || '—'}.\n` +
-      `  Última comunicación: ${fechaTexto}. Estado: ${estadoTexto}.` +
+      `  Estado del pipeline: ${c.estado_pipeline || 'sin definir'}. Trámite ante la DIAN: ${estadoTexto}.` +
+      ` Última comunicación: ${fechaTexto}.` +
       (c.observaciones ? ` Observaciones: ${c.observaciones}.` : '')
     );
   });
@@ -296,6 +297,122 @@ function extraerTerminoBusqueda(mensaje) {
   return termino;
 }
 
+// Quita tildes para comparar texto sin importar acentos.
+function normalizarTexto(s) {
+  return (s || '')
+    .toString()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '');
+}
+
+// Los 8 estados del pipeline comercial que define el negocio (distintos del
+// resultado final del trámite ante la DIAN, que es otra cosa: radicado /
+// no_aplica). El asesor los cambia escribiéndole a Daniela en lenguaje
+// natural, ej. "cambia el estado a cliente" o "márcalo como en proceso upme".
+const ESTADOS_PIPELINE = [
+  { label: 'Interesado', frases: ['interesado'] },
+  { label: 'Contacto', frases: ['contacto'] },
+  { label: 'Cliente', frases: ['cliente'] },
+  { label: 'Cierre perdido', frases: ['cierre perdido'] },
+  { label: 'En proceso UPME', frases: ['proceso upme', 'tramite upme', 'en upme'] },
+  { label: 'En proceso DIAN', frases: ['proceso dian', 'tramite dian', 'en dian'] },
+  { label: 'Pendiente desembolso', frases: ['pendiente desembolso', 'pdt desembolso'] },
+  { label: 'Desembolso realizado', frases: ['desembolso realizado'] },
+];
+
+// Compara el texto capturado como "estado destino" contra los estados
+// conocidos. Las frases de UNA sola palabra (cliente, contacto, interesado)
+// exigen coincidencia EXACTA (después de quitar artículos como "el/la/un") —
+// si aceptáramos "contiene", frases ya usadas en la app para otra cosa (ej.
+// "otro cliente" de FRASES_NUEVO_CASO) dispararían un cambio de estado por
+// error. Las frases de 2+ palabras (más específicas, ej. "proceso upme") sí
+// aceptan que el texto capturado las contenga, para tolerar variaciones
+// como "ya está en proceso upme".
+function identificarEstadoPipeline(textoCrudo) {
+  const norm = normalizarTexto(textoCrudo).trim().replace(/^(el|la|un|una|de|en)\s+/, '');
+  if (!norm) return null;
+
+  const candidatos = ESTADOS_PIPELINE.flatMap((e) =>
+    e.frases.map((f) => ({ label: e.label, frase: normalizarTexto(f) }))
+  );
+
+  for (const c of candidatos) {
+    if (norm === c.frase) return c.label;
+  }
+  for (const c of candidatos) {
+    if (c.frase.split(' ').length >= 2 && norm.includes(c.frase)) return c.label;
+  }
+  return null;
+}
+
+// Frases que indican que el asesor quiere CAMBIAR el estado del pipeline de
+// un cliente: un verbo de cambio ("cambia", "marca", "pasa", "actualiza",
+// "pon"...) seguido, en algún punto, de "a"/"como"/"en" + el estado destino
+// al final del mensaje. Solo capturamos el texto final (grupo 3): así, si el
+// mensaje también menciona "cliente <nombre>" antes (ej. "cambia el estado
+// del cliente juan pérez a cliente"), el nombre del cliente no se confunde
+// con la palabra "cliente" usada como estado destino.
+const REGEX_VERBO_CAMBIO_ESTADO = /\b(cambia|cambiar|actualiza|actualizar|pon|poner|marca|marcar|m[aá]rcal[oa]|pasa|pasar|p[aá]sal[oa]|mueve|mover|mu[eé]vel[oa])\b/i;
+
+// Saca el nombre del cliente de la parte del mensaje ANTES del conector que
+// introduce el estado destino. Primero intenta la frase explícita
+// "cliente <nombre>"; si no aparece (ej. "marca a michael barco como..."),
+// quita el verbo de cambio y palabras de relleno ("el estado", "del caso",
+// artículos) y usa lo que sobre como nombre — pero solo si sobra algo con
+// pinta de nombre real, para no terminar usando "estado" o "" como si fuera
+// un cliente.
+function extraerNombreDeCambioEstado(antes) {
+  const t = antes.trim();
+  const conCliente = t.match(/cliente\s+([a-záéíóúñ0-9.\-\s]{3,60})$/i);
+  if (conCliente) {
+    const nombre = conCliente[1].trim().replace(/[?.!¡¿]+$/g, '').trim();
+    if (nombre) return nombre;
+  }
+
+  const resto = t
+    .replace(REGEX_VERBO_CAMBIO_ESTADO, ' ')
+    .replace(/\b(el|la|los|las|del|de|al|a|un|una|como)\b/gi, ' ')
+    .replace(/\b(estado|pipeline|caso)\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return resto.length >= 3 ? resto : null;
+}
+
+// Devuelve { estadoLabel, nombre } si el mensaje pide cambiar el estado de un
+// cliente a un estado reconocido, o null si no aplica. Busca todas las
+// apariciones de "a"/"como" como conector y prueba desde la más cercana al
+// final hacia atrás: la primera cuyo texto siguiente coincide con uno de los
+// 8 estados conocidos es la que separa "a quién" de "a qué estado". Esto
+// evita depender de una sola conjetura de dónde está el conector correcto
+// cuando el mensaje tiene varias apariciones de "a" (una para el cliente,
+// otra para el estado).
+function detectarCambioEstado(mensaje) {
+  if (!REGEX_VERBO_CAMBIO_ESTADO.test(mensaje)) return null;
+
+  const conectorRegex = /\b(a|como|en)\b/gi;
+  const posiciones = [];
+  let match;
+  while ((match = conectorRegex.exec(mensaje)) !== null) {
+    posiciones.push({ inicio: match.index, fin: match.index + match[0].length });
+  }
+
+  for (let i = posiciones.length - 1; i >= 0; i--) {
+    const despues = mensaje.slice(posiciones[i].fin).trim();
+    const estadoLabel = identificarEstadoPipeline(despues);
+    if (estadoLabel) {
+      // "antes" excluye el propio conector ("a"/"como"), para que no se
+      // cuele como parte del nombre del cliente (ej. "...jimenez a" en vez
+      // de "...jimenez").
+      const antes = mensaje.slice(0, posiciones[i].inicio);
+      const nombre = extraerNombreDeCambioEstado(antes);
+      return { estadoLabel, nombre };
+    }
+  }
+  return null;
+}
+
 function detectarIntencion(mensaje, sesion) {
   if (sesion.pendienteEscalamiento || sesion.pendienteBusqueda) return null;
   if (mensaje.startsWith('__')) return null; // ya es un comando literal
@@ -304,6 +421,11 @@ function detectarIntencion(mensaje, sesion) {
   const t = mensaje.trim().toLowerCase().replace(/\bciente\b/g, 'cliente');
 
   if (REGEX_ESCALAR_JURIDICO.test(t)) return '__escalar_juridico__';
+
+  // Se revisa ANTES que "buscar cliente" porque frases como "cambia el
+  // estado del cliente juan a cliente" también contienen "estado del
+  // cliente", que REGEX_BUSCAR_CLIENTE reconocería como consulta de estado.
+  if (detectarCambioEstado(mensaje)) return '__cambiar_estado__';
 
   if (REGEX_BUSCAR_CLIENTE.test(t)) return '__buscar_cliente__';
 
@@ -505,6 +627,66 @@ app.post('/api/chat', async (req, res) => {
         mensajeRetomar += MENSAJE_INICIAL;
       }
       return res.json({ reply: mensajeRetomar });
+    }
+
+    // --- Cambiar el estado del pipeline comercial de un caso (Interesado,
+    // Contacto, Cliente, Cierre perdido, En proceso UPME, En proceso DIAN,
+    // Pendiente desembolso, Desembolso realizado) ---
+    if (message === '__cambiar_estado__') {
+      const cambio = detectarCambioEstado(mensajeOriginal);
+      // No debería pasar (ya se validó en detectarIntencion), pero por si
+      // acaso el mensaje cambió de forma entre medio.
+      if (!cambio) {
+        return res.json({
+          reply: 'No logré identificar a qué estado quieres cambiarlo. Dime algo como "cambia el estado del cliente [nombre] a cliente".',
+        });
+      }
+
+      let casoObjetivo = null;
+
+      if (cambio.nombre) {
+        try {
+          const coincidencias = await buscarCasoPorTermino(cambio.nombre);
+          if (coincidencias.length === 0) {
+            return res.json({
+              reply: `No encontré ningún caso registrado que coincida con "${cambio.nombre}", así que no pude cambiarle el estado. Revisa que el nombre esté bien escrito, o dime "tengo un cliente nuevo" si todavía no está registrado.`,
+            });
+          }
+          if (coincidencias.length > 1) {
+            return res.json({
+              reply: `${formatearResultadosBusqueda(coincidencias, cambio.nombre)}\n\nHay más de un caso que coincide con "${cambio.nombre}" — dime la cédula/NIT o la placa exacta para saber cuál actualizar.`,
+            });
+          }
+          casoObjetivo = coincidencias[0];
+        } catch (dbError) {
+          console.error('Error buscando cliente para cambiar estado:', dbError);
+          return res.json({
+            reply: `No pude consultar la base de datos en este momento (${dbError.message}). Intenta de nuevo en un momento.`,
+          });
+        }
+      } else if (sesion.casoId) {
+        casoObjetivo = { id: sesion.casoId, nombre_cliente: sesion.data?.nombre_cliente };
+      } else {
+        return res.json({
+          reply: 'Dime de qué cliente quieres cambiar el estado (ej. "cambia el estado del cliente Juan Pérez a cliente").',
+        });
+      }
+
+      try {
+        await actualizarCaso(casoObjetivo.id, { estado_pipeline: cambio.estadoLabel });
+      } catch (dbError) {
+        console.error('Error actualizando el estado del pipeline:', dbError);
+        return res.json({
+          reply: `No pude guardar el cambio de estado en este momento (${dbError.message}). Intenta de nuevo en un momento.`,
+        });
+      }
+
+      let reply = `✅ Listo, actualicé el estado de ${casoObjetivo.nombre_cliente || 'ese caso'} a "${cambio.estadoLabel}".`;
+      const campoPendienteCambio = campoActualDe(sesion);
+      if (campoPendienteCambio) {
+        reply += `\n\n➡️ Sigamos donde íbamos: ${campoPendienteCambio}`;
+      }
+      return res.json({ reply });
     }
 
     // --- Buscar si un cliente ya fue atendido antes / consultar el estado

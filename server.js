@@ -132,14 +132,26 @@ const GATES_NEGOCIACION = [
 // contratado).
 const OPCIONES_ESCALAR_DOCUMENTOS = ['Escalar con documentos completos', 'Escalar con documentos pendientes'];
 
+// Botones que se muestran en cada una de las 3 preguntas de negociación
+// (interés, negociación, acepta): además de Sí/No, "Cerrar interacción" para
+// cuando el cliente deja de responder a mitad de la gestión — así el asesor
+// no queda trabado esperando una respuesta Sí/No que puede que nunca llegue;
+// el caso ya está guardado en Supabase con lo que se alcanzó a registrar.
+const OPCIONES_GATE_PREGUNTA = ['Sí', 'No', 'Cerrar interacción'];
+const ETIQUETA_CERRAR_INTERACCION = 'Cerrar interacción';
+function esCerrarInteraccion(mensaje) {
+  return normalizarTexto(mensaje).trim() === normalizarTexto(ETIQUETA_CERRAR_INTERACCION).trim();
+}
+
 // Convierte un registro ya guardado en Supabase de vuelta al formato de
 // `sesion.data` (id de campo -> valor), para poder "retomar" un caso
 // existente sin volver a preguntar los datos que ya tiene. Solo se incluyen
 // los campos que sí tienen valor: los que falten quedan pendientes, tal como
 // los detecta `siguienteIndicePendiente`.
 const CAMPOS_RETOMABLES = [
-  'canal', 'origen_cliente', 'nombre_cliente', 'telefono', 'contacto_logrado',
-  'numero_identificacion', 'email', 'id_rrss', 'tipo_identificacion',
+  'canal', 'fuente', 'nombre_cliente', 'telefono', 'contacto_logrado',
+  'tipo_identificacion', 'numero_identificacion', 'email', 'id_rrss',
+  'tipo_cuenta', 'nombre_empresa', 'cuenta',
   'tipo_persona', 'vehiculo', 'tecnologia', 'placa', 'fecha_compra',
   'valor_sin_iva', 'tiene_certificado_upme',
 ];
@@ -251,6 +263,12 @@ const ETIQUETA_SALTAR = 'No tiene este dato';
 function conOpciones(base, campo) {
   if (!campo) return base;
   const opcionesCampo = campo.opciones || [];
+  // Los campos marcados "sinSaltar" son obligatorios: no se les agrega el
+  // botón de "No tiene este dato" (ej. nombre, teléfono, si se logró el
+  // contacto).
+  if (campo.sinSaltar) {
+    return opcionesCampo.length ? { ...base, opciones: opcionesCampo } : base;
+  }
   return { ...base, opciones: [...opcionesCampo, ETIQUETA_SALTAR] };
 }
 
@@ -312,6 +330,26 @@ const TIPO_IDENTIFICACION_MAP = {
   passport: 'Pasaporte',
 };
 
+// Pone en "Nombre Propio" un texto que el asesor escribió libremente (nombre
+// del cliente, vehículo, nombre del asesor): primera letra de cada palabra
+// en mayúscula, el resto en minúscula — así no importa si lo escriben todo
+// en mayúsculas, todo en minúsculas o mezclado, siempre queda parejo. Los
+// conectores cortos (de, del, la...) se dejan en minúscula salvo que sean la
+// primera palabra, para que se vea como un nombre real y no un título.
+const CONECTORES_NOMBRE = new Set(['de', 'del', 'la', 'las', 'los', 'y']);
+function capitalizarNombrePropio(texto) {
+  return texto
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLowerCase()
+    .split(' ')
+    .map((palabra, i) => {
+      if (i > 0 && CONECTORES_NOMBRE.has(palabra)) return palabra;
+      return palabra.charAt(0).toUpperCase() + palabra.slice(1);
+    })
+    .join(' ');
+}
+
 function normalizarValorCampo(campoId, valorCrudo) {
   const valor = valorCrudo.trim();
   if (campoId === 'tipo_persona') {
@@ -325,6 +363,12 @@ function normalizarValorCampo(campoId, valorCrudo) {
   }
   if (campoId === 'placa') {
     return valor.toUpperCase().replace(/[\s-]+/g, '');
+  }
+  if (campoId === 'nombre_cliente' || campoId === 'vehiculo') {
+    return capitalizarNombrePropio(valor);
+  }
+  if (campoId === 'email') {
+    return valor.toLowerCase();
   }
   return valor;
 }
@@ -356,7 +400,10 @@ function validarYNormalizarCampo(campo, mensajeCrudo) {
   // campo (texto libre, botones, si_no): si el asesor le da clic (o lo
   // escribe tal cual), se guarda null para ese dato y se sigue sin exigirlo.
   // Va primero, antes de cualquier validación específica del tipo de campo.
-  if (normalizarTexto(mensajeCrudo).trim() === normalizarTexto(ETIQUETA_SALTAR).trim()) {
+  // Los campos "sinSaltar" son obligatorios, así que ni siquiera aceptan
+  // esta frase como respuesta válida (queda igual que si la hubieran
+  // escrito como cualquier otro texto que no cumple el formato esperado).
+  if (!campo.sinSaltar && normalizarTexto(mensajeCrudo).trim() === normalizarTexto(ETIQUETA_SALTAR).trim()) {
     return { ok: true, valor: null };
   }
 
@@ -725,7 +772,8 @@ app.get('/api/conocimiento', async (req, res) => {
 
 app.post('/api/chat', async (req, res) => {
   try {
-    const { sessionId, asesor } = req.body || {};
+    const { sessionId, asesor: asesorCrudo } = req.body || {};
+    const asesor = asesorCrudo ? capitalizarNombrePropio(asesorCrudo) : asesorCrudo;
     let message = req.body && req.body.message;
     if (!sessionId || !message) {
       return res.status(400).json({ error: 'Falta sessionId o message' });
@@ -1078,6 +1126,68 @@ app.post('/api/chat', async (req, res) => {
       // este cliente?" (esto solo se pregunta cuando "¿lograste el
       // contacto?" fue "No"). Se maneja aparte del flujo normal de campos
       // porque no es una pregunta de CAMPOS.caso_nuevo.
+      // El asesor está respondiendo "¿Cuál es el nombre o razón social de la
+      // empresa?" (esto solo se pregunta cuando el tipo de documento fue
+      // NIT). Se maneja aparte del flujo normal de campos porque no es una
+      // pregunta de CAMPOS.caso_nuevo: es un dato obligatorio derivado de
+      // haber elegido NIT, no un campo saltable.
+      if (sesion.pendienteNombreEmpresa) {
+        const nombreEmpresaCrudo = message.trim();
+        if (
+          !nombreEmpresaCrudo ||
+          nombreEmpresaCrudo.length < 2 ||
+          normalizarTexto(nombreEmpresaCrudo).trim() === normalizarTexto(ETIQUETA_SALTAR).trim()
+        ) {
+          return res.json({
+            reply:
+              '⚠️ Escribe el nombre o razón social de la empresa (mínimo 2 caracteres) — este dato es obligatorio porque el cliente es persona jurídica (NIT).\n\n¿Cuál es el nombre o razón social de la empresa?',
+          });
+        }
+        const nombreEmpresa = capitalizarNombrePropio(nombreEmpresaCrudo);
+        sesion.data.nombre_empresa = nombreEmpresa;
+        sesion.data.cuenta = nombreEmpresa;
+        sesion.pendienteNombreEmpresa = false;
+
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { nombre_empresa: nombreEmpresa, cuenta: nombreEmpresa });
+          } catch (dbError) {
+            console.error('Error guardando el nombre de la empresa en Supabase:', dbError);
+          }
+        }
+
+        sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
+        if (sesion.stepIndex < campos.length) {
+          const siguienteTrasEmpresa = campos[sesion.stepIndex];
+          return res.json(
+            conOpciones({ reply: `✅ Anotado.\n\n${siguienteTrasEmpresa.prompt}` }, siguienteTrasEmpresa)
+          );
+        }
+        // Caso raro: la empresa era el último dato que faltaba. Guardamos el
+        // caso si aún no existía y arrancamos la confirmación de datos, igual
+        // que al terminar el flujo normal de captura.
+        if (!sesion.casoId) {
+          try {
+            const registro = await crearCaso(sessionId, asesor, sesion.data);
+            sesion.casoId = registro.id;
+          } catch (dbError) {
+            console.error('Error guardando el caso en Supabase:', dbError);
+            return res.json({
+              reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+                campos,
+                sesion.data
+              )}`,
+            });
+          }
+        }
+        sesion.estado = 'negociacion';
+        sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
+        return res.json({
+          reply: `✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar alguno?`,
+          opciones: ['Están correctos', 'Modificar un dato'],
+        });
+      }
+
       if (sesion.pendienteCierre) {
         const respuestaCierre = interpretarSiNo(message);
         if (!respuestaCierre) {
@@ -1122,6 +1232,22 @@ app.post('/api/chat', async (req, res) => {
       }
 
       sesion.data[campo.id] = resultadoCampo.valor;
+
+      // Al responder el tipo de documento, derivamos solos si la cuenta es
+      // "Persona natural" o "Empresa" (CC/CE/TI/Pasaporte -> Persona natural,
+      // NIT -> Empresa), y también el nombre de cuenta unificado: para
+      // persona natural es el nombre del cliente (ya lo tenemos); para
+      // empresa lo pedimos aparte (ver sesion.pendienteNombreEmpresa más
+      // abajo), porque el nombre de la empresa es un dato nuevo que el
+      // cliente-persona-natural no tiene.
+      if (campo.id === 'tipo_identificacion' && resultadoCampo.valor) {
+        const esEmpresa = resultadoCampo.valor === 'NIT';
+        sesion.data.tipo_cuenta = esEmpresa ? 'Empresa' : 'Persona natural';
+        if (!esEmpresa) {
+          sesion.data.cuenta = sesion.data.nombre_cliente || null;
+        }
+      }
+
       sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
 
       // Verificación automática de duplicados: apenas se captura el nombre,
@@ -1168,7 +1294,12 @@ app.post('/api/chat', async (req, res) => {
         // dato nuevo se va guardando de una vez, en vez de esperar a que se
         // complete todo el formulario.
         try {
-          await actualizarCaso(sesion.casoId, { [campo.id]: resultadoCampo.valor });
+          const cambiosIncrementales = { [campo.id]: resultadoCampo.valor };
+          if (campo.id === 'tipo_identificacion' && resultadoCampo.valor) {
+            cambiosIncrementales.tipo_cuenta = sesion.data.tipo_cuenta;
+            if (sesion.data.cuenta !== undefined) cambiosIncrementales.cuenta = sesion.data.cuenta;
+          }
+          await actualizarCaso(sesion.casoId, cambiosIncrementales);
         } catch (dbError) {
           console.error(`Error actualizando el campo ${campo.id} en Supabase:`, dbError);
           // No bloqueamos el flujo si falla un guardado incremental.
@@ -1183,6 +1314,17 @@ app.post('/api/chat', async (req, res) => {
         return res.json({
           reply: `${avisoDuplicado}${avisoGuardado}¿Quieres cerrar la interacción con este cliente?`,
           opciones: ['Sí', 'No'],
+        });
+      }
+
+      // Si el tipo de documento es NIT, el cliente es persona jurídica y
+      // necesitamos el nombre/razón social de la empresa antes de seguir
+      // (ese dato no existe todavía y es obligatorio para este tipo de
+      // cliente).
+      if (campo.id === 'tipo_identificacion' && resultadoCampo.valor === 'NIT') {
+        sesion.pendienteNombreEmpresa = true;
+        return res.json({
+          reply: `${avisoDuplicado}${avisoGuardado}✅ Anotado.\n\n¿Cuál es el nombre o razón social de la empresa?`,
         });
       }
 
@@ -1210,17 +1352,17 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
-      // En vez de terminar aquí, arrancamos las 3 preguntas de negociación
-      // (estado de interés, negociación, cliente acepta todo) para ir
-      // registrando cómo avanza la venta.
+      // Antes de arrancar las preguntas de negociación, le mostramos al
+      // asesor el resumen completo y le preguntamos si todo está correcto o
+      // si necesita corregir algún dato — así no toca escalar a soporte por
+      // un error de tipeo que se pudo arreglar ahí mismo.
       sesion.estado = 'negociacion';
-      sesion.negociacion = { gateIndex: 0, sub: 'pregunta' };
-      const primerGate = GATES_NEGOCIACION[0];
+      sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
       return res.json({
         reply:
           `${avisoDuplicado}${avisoGuardado}✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n` +
-          `➡️ ${primerGate.pregunta}`,
-        opciones: ['Sí', 'No'],
+          `¿Estos datos están correctos, o necesitas modificar alguno?`,
+        opciones: ['Están correctos', 'Modificar un dato'],
       });
     }
 
@@ -1235,10 +1377,117 @@ app.post('/api/chat', async (req, res) => {
       const neg = sesion.negociacion;
       const gate = GATES_NEGOCIACION[neg.gateIndex];
 
+      if (neg.sub === 'confirmar_datos') {
+        const camposConfirmar = CAMPOS.caso_nuevo;
+        const entradaConfirmar = normalizarTexto(message).trim();
+        if (entradaConfirmar === normalizarTexto('Están correctos').trim() || interpretarSiNo(message) === 'sí') {
+          neg.sub = 'pregunta';
+          return res.json({ reply: `➡️ ${gate.pregunta}`, opciones: OPCIONES_GATE_PREGUNTA });
+        }
+        if (entradaConfirmar === normalizarTexto('Modificar un dato').trim()) {
+          const etiquetasConfirmar = camposConfirmar
+            .map((c) => c.label)
+            .concat(sesion.data.nombre_empresa !== undefined ? ['Nombre de la empresa'] : []);
+          neg.sub = 'pidiendo_campo_modificar';
+          return res.json({ reply: '¿Cuál dato quieres corregir?', opciones: etiquetasConfirmar });
+        }
+        return res.json({
+          reply: '⚠️ Selecciona una opción.',
+          opciones: ['Están correctos', 'Modificar un dato'],
+        });
+      }
+
+      if (neg.sub === 'pidiendo_campo_modificar') {
+        const camposMod = CAMPOS.caso_nuevo;
+        const etiquetasMod = camposMod
+          .map((c) => c.label)
+          .concat(sesion.data.nombre_empresa !== undefined ? ['Nombre de la empresa'] : []);
+        const entradaMod = normalizarTexto(message).trim();
+        const esEmpresaEspecial = entradaMod === normalizarTexto('Nombre de la empresa').trim();
+        const campoAModificar = esEmpresaEspecial
+          ? null
+          : camposMod.find((c) => normalizarTexto(c.label).trim() === entradaMod);
+        if (!campoAModificar && !esEmpresaEspecial) {
+          return res.json({ reply: '⚠️ Selecciona uno de los datos de la lista.', opciones: etiquetasMod });
+        }
+        neg.campoModificando = esEmpresaEspecial ? '__nombre_empresa__' : campoAModificar.id;
+        neg.sub = 'pidiendo_valor_modificar';
+        if (esEmpresaEspecial) {
+          return res.json({ reply: '¿Cuál es el nombre o razón social correcto de la empresa?' });
+        }
+        return res.json(conOpciones({ reply: campoAModificar.prompt }, campoAModificar));
+      }
+
+      if (neg.sub === 'pidiendo_valor_modificar') {
+        const camposVal = CAMPOS.caso_nuevo;
+        if (neg.campoModificando === '__nombre_empresa__') {
+          const nuevoNombreCrudo = message.trim();
+          if (!nuevoNombreCrudo || nuevoNombreCrudo.length < 2) {
+            return res.json({ reply: '⚠️ Escribe el nombre o razón social de la empresa (mínimo 2 caracteres).' });
+          }
+          const nuevoNombre = capitalizarNombrePropio(nuevoNombreCrudo);
+          sesion.data.nombre_empresa = nuevoNombre;
+          sesion.data.cuenta = nuevoNombre;
+          if (sesion.casoId) {
+            try {
+              await actualizarCaso(sesion.casoId, { nombre_empresa: nuevoNombre, cuenta: nuevoNombre });
+            } catch (dbError) {
+              console.error('Error corrigiendo el nombre de la empresa en Supabase:', dbError);
+            }
+          }
+        } else {
+          const campoMod = camposVal.find((c) => c.id === neg.campoModificando);
+          const resultadoMod = validarYNormalizarCampo(campoMod, message);
+          if (!resultadoMod.ok) {
+            return res.json(conOpciones({ reply: `⚠️ ${campoMod.errorMessage}\n\n${campoMod.prompt}` }, campoMod));
+          }
+          sesion.data[campoMod.id] = resultadoMod.valor;
+          // Si se corrige el tipo de documento, recalculamos tipo_cuenta y,
+          // si aplica (persona natural), el nombre de cuenta unificado.
+          if (campoMod.id === 'tipo_identificacion' && resultadoMod.valor) {
+            const esEmpresaMod = resultadoMod.valor === 'NIT';
+            sesion.data.tipo_cuenta = esEmpresaMod ? 'Empresa' : 'Persona natural';
+            if (!esEmpresaMod) sesion.data.cuenta = sesion.data.nombre_cliente || null;
+          }
+          if (campoMod.id === 'nombre_cliente' && sesion.data.tipo_cuenta === 'Persona natural') {
+            sesion.data.cuenta = resultadoMod.valor;
+          }
+          if (sesion.casoId) {
+            try {
+              const cambiosMod = { [campoMod.id]: resultadoMod.valor };
+              if (campoMod.id === 'tipo_identificacion') cambiosMod.tipo_cuenta = sesion.data.tipo_cuenta;
+              if (
+                (campoMod.id === 'tipo_identificacion' || campoMod.id === 'nombre_cliente') &&
+                sesion.data.cuenta !== undefined
+              ) {
+                cambiosMod.cuenta = sesion.data.cuenta;
+              }
+              await actualizarCaso(sesion.casoId, cambiosMod);
+            } catch (dbError) {
+              console.error(`Error corrigiendo el campo ${campoMod.id} en Supabase:`, dbError);
+            }
+          }
+        }
+
+        neg.sub = 'confirmar_datos';
+        neg.campoModificando = null;
+        return res.json({
+          reply: `✅ Corregido.\n\n${resumenCampos(camposVal, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar otro?`,
+          opciones: ['Están correctos', 'Modificar un dato'],
+        });
+      }
+
       if (neg.sub === 'pregunta') {
+        if (esCerrarInteraccion(message)) {
+          const nombreCerrado = sesion.data.nombre_cliente || 'el cliente';
+          Object.assign(sesion, nuevaSesion());
+          return res.json({
+            reply: `✅ Listo, guardé la interacción con ${nombreCerrado} tal como está — ya quedó en la base de datos, no se pierde nada. Cuéntame cuando el cliente vuelva a responder o tengas otro caso.`,
+          });
+        }
         const respuesta = interpretarSiNo(message);
         if (!respuesta) {
-          return res.json({ reply: gate.pregunta, opciones: ['Sí', 'No'] });
+          return res.json({ reply: gate.pregunta, opciones: OPCIONES_GATE_PREGUNTA });
         }
         if (respuesta === 'sí') {
           if (gate.siguientePasoOpciones) {
@@ -1251,7 +1500,7 @@ app.post('/api/chat', async (req, res) => {
           neg.gateIndex += 1;
           neg.sub = 'pregunta';
           const siguienteGate = GATES_NEGOCIACION[neg.gateIndex];
-          return res.json({ reply: `Listo.\n\n➡️ ${siguienteGate.pregunta}`, opciones: ['Sí', 'No'] });
+          return res.json({ reply: `Listo.\n\n➡️ ${siguienteGate.pregunta}`, opciones: OPCIONES_GATE_PREGUNTA });
         }
         neg.sub = 'motivo';
         return res.json({ reply: '¿Cuál es el motivo?', opciones: gate.motivos });
@@ -1295,7 +1544,7 @@ app.post('/api/chat', async (req, res) => {
           return res.json({ reply: 'Listo, seguimos gestionando este caso.' });
         }
         const siguienteGate = GATES_NEGOCIACION[neg.gateIndex];
-        return res.json({ reply: `Listo, seguimos.\n\n➡️ ${siguienteGate.pregunta}`, opciones: ['Sí', 'No'] });
+        return res.json({ reply: `Listo, seguimos.\n\n➡️ ${siguienteGate.pregunta}`, opciones: OPCIONES_GATE_PREGUNTA });
       }
 
       if (neg.sub === 'completitud') {

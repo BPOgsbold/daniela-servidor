@@ -257,6 +257,12 @@ function resumenCampos(campos, data) {
 // y seguir sin quedar trabado esperando una respuesta que no va a llegar.
 const ETIQUETA_SALTAR = 'No tiene este dato';
 
+// Cuando al asesor le mostramos varias líneas candidatas de un vehículo (ver
+// más abajo, desambiguación) y ninguna es la correcta, le damos la opción de
+// escribir la referencia completa de una vez, en vez de solo poder saltar
+// directo a preguntar la tecnología a mano.
+const ETIQUETA_OTRO_VEHICULO = 'Otro (escribir la referencia completa)';
+
 // Cuando el campo que se le está preguntando al asesor tiene opciones fijas
 // (tipo "botones"/"botones_opcional"), se las mandamos a la extensión en
 // `opciones` para que las pinte como botones clicables, además del texto. A
@@ -424,16 +430,18 @@ function construirPreguntaDesambiguarVehiculo(candidatos, asesor) {
   const lista = candidatos.map((c, i) => `${i + 1}. ${c.marca} ${c.modelo}`).join('\n');
   return (
     `${saludo}encontré varias versiones de ${marca}${modeloComun} que podrían ser — no quiero adivinar cuál le queda al cliente. ` +
-    `¿Cuál de estas es exactamente?\n\n${lista}\n\nResponde con el número, o dale clic a "${ETIQUETA_SALTAR}" si no sabes cuál es exactamente.`
+    `¿Cuál de estas es exactamente?\n\n${lista}\n\nResponde con el número, dale clic a "${ETIQUETA_OTRO_VEHICULO}" si es otra línea distinta y me escribes la referencia completa, o a "${ETIQUETA_SALTAR}" si de plano no la sabes.`
   );
 }
 
 // Botones para la pregunta de desambiguar vehículo: uno por cada línea
-// candidata (para poder responder con un clic) más la opción de saltar, para
-// cuando el asesor de verdad no sabe cuál es la referencia exacta — no debe
-// quedar bloqueado sin poder avanzar solo por no saber ese detalle.
+// candidata (para poder responder con un clic), más "Otro" (para escribir la
+// referencia completa cuando ninguna de las opciones listadas es la
+// correcta) y "No tiene este dato" (para cuando el asesor de verdad no sabe
+// cuál es) — no debe quedar bloqueado sin poder avanzar por ninguno de los
+// dos motivos.
 function opcionesDesambiguarVehiculo(candidatos) {
-  return [...candidatos.map((c) => `${c.marca} ${c.modelo}`), ETIQUETA_SALTAR];
+  return [...candidatos.map((c) => `${c.marca} ${c.modelo}`), ETIQUETA_OTRO_VEHICULO, ETIQUETA_SALTAR];
 }
 
 const TIPO_IDENTIFICACION_MAP = {
@@ -1349,6 +1357,19 @@ app.post('/api/chat', async (req, res) => {
 
         const respuesta = (message || '').trim();
 
+        // Ninguna de las líneas listadas es la correcta — el asesor prefiere
+        // escribir la referencia completa de una vez, en vez de saltar
+        // directo a preguntar la tecnología a mano. Con ese texto nuevo se
+        // vuelve a intentar la búsqueda (puede salir un match único, puede
+        // volver a quedar ambiguo con otras líneas, o puede no encontrarse).
+        if (normalizarTexto(respuesta).trim() === normalizarTexto(ETIQUETA_OTRO_VEHICULO).trim()) {
+          sesion.pendienteDesambiguarVehiculo = null;
+          sesion.pendienteReferenciaVehiculo = true;
+          return res.json({
+            reply: 'Sin problema — escríbeme la referencia completa del vehículo (marca, línea y versión), tal como aparece en la factura o en la tarjeta de propiedad.',
+          });
+        }
+
         // El asesor no sabe cuál es la referencia/línea exacta — no lo
         // dejamos bloqueado por eso. Seguimos igual que cuando el vehículo no
         // se encuentra en la base: se pregunta la tecnología a mano y el
@@ -1465,6 +1486,111 @@ app.post('/api/chat', async (req, res) => {
         sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
         return res.json({
           reply: `✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar alguno?`,
+          opciones: ['Están correctos', 'Modificar un dato'],
+        });
+      }
+
+      // El asesor está escribiendo la referencia completa del vehículo,
+      // porque en la desambiguación anterior le dio clic a "Otro". Se maneja
+      // aparte del flujo normal porque no es una pregunta de CAMPOS.caso_nuevo:
+      // con este texto nuevo se vuelve a intentar la búsqueda en la base de
+      // referencia, igual que la primera vez que se captura el vehículo.
+      if (sesion.pendienteReferenciaVehiculo) {
+        if (pareceDuda(message)) {
+          const conocimiento = await obtenerConocimientoTexto();
+          const respuestaDuda = await responderAyuda(
+            SOP_TEXT,
+            OBJECIONES_TEXT,
+            message,
+            {
+              estado: sesion.estado,
+              campoActual: 'Escribe la referencia completa del vehículo',
+              datosCapturados: sesion.data,
+            },
+            conocimiento
+          );
+          return res.json({
+            reply: `${respuestaDuda}\n\n➡️ Escríbeme la referencia completa del vehículo (marca, línea y versión).`,
+          });
+        }
+
+        const textoReferencia = (message || '').trim();
+        if (textoReferencia.length < 3) {
+          return res.json({
+            reply: '⚠️ Escribe la referencia completa del vehículo (marca, línea y versión).',
+          });
+        }
+
+        sesion.pendienteReferenciaVehiculo = false;
+        let avisoReferencia = '';
+        try {
+          const referencia = await obtenerVehiculosReferenciaCacheada();
+          const candidatos = buscarVehiculosEnReferencia(textoReferencia, referencia);
+          if (candidatos.length === 1) {
+            const encontrado = candidatos[0];
+            sesion.data.tecnologia = encontrado.tecnologia;
+            sesion.data.vehiculo = `${encontrado.marca} ${encontrado.modelo}`;
+            avisoReferencia = `✅ Listo, encontré "${sesion.data.vehiculo}" en la base (tecnología: ${encontrado.tecnologia}), no hace falta preguntarla.\n\n`;
+          } else if (candidatos.length > 1) {
+            sesion.pendienteDesambiguarVehiculo = { candidatos, textoOriginal: textoReferencia };
+            const preguntaOtraVez = construirPreguntaDesambiguarVehiculo(candidatos, asesor);
+            return res.json({
+              reply: preguntaOtraVez,
+              opciones: opcionesDesambiguarVehiculo(candidatos),
+            });
+          } else {
+            sesion.vehiculoSinListar = textoReferencia;
+            sesion.data.vehiculo = textoReferencia;
+          }
+        } catch (err) {
+          console.error('Error consultando la base de referencia de vehículos:', err);
+          sesion.data.vehiculo = textoReferencia;
+        }
+
+        if (sesion.casoId) {
+          try {
+            const cambios = { vehiculo: sesion.data.vehiculo };
+            if (sesion.data.tecnologia) cambios.tecnologia = sesion.data.tecnologia;
+            await actualizarCaso(sesion.casoId, cambios);
+          } catch (dbError) {
+            console.error('Error guardando la referencia del vehículo:', dbError);
+          }
+        }
+
+        sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
+        if (sesion.stepIndex < campos.length) {
+          const siguienteTrasReferencia = campos[sesion.stepIndex];
+          return res.json(
+            conOpciones(
+              { reply: `${avisoReferencia}✅ Anotado.\n\n${siguienteTrasReferencia.prompt}` },
+              siguienteTrasReferencia
+            )
+          );
+        }
+        // Caso raro: el vehículo era el último dato que faltaba.
+        if (!sesion.casoId) {
+          try {
+            const registro = await crearCaso(sessionId, asesor, sesion.data);
+            sesion.casoId = registro.id;
+          } catch (dbError) {
+            console.error('Error guardando el caso en Supabase:', dbError);
+            return res.json({
+              reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+                campos,
+                sesion.data
+              )}`,
+            });
+          }
+        }
+        try {
+          await actualizarCaso(sesion.casoId, { estado_pipeline: 'Interesado' });
+        } catch (dbError) {
+          console.error('Error actualizando estado_pipeline a Interesado:', dbError);
+        }
+        sesion.estado = 'negociacion';
+        sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
+        return res.json({
+          reply: `${avisoReferencia}✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar alguno?`,
           opciones: ['Están correctos', 'Modificar un dato'],
         });
       }

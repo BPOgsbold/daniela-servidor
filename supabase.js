@@ -208,6 +208,39 @@ async function buscarCasoPorTermino(termino, limite = 5) {
   return [...completos, ...parciales].slice(0, limite);
 }
 
+/**
+ * Trae toda la base de referencia de vehículos que aplican al beneficio
+ * (marca, modelo, tecnología). Se usa para autocompletar/validar la
+ * tecnología cuando el asesor escribe el vehículo del cliente. Quien llama
+ * la cachea en memoria un rato — no hace falta consultarla en cada mensaje.
+ */
+async function obtenerVehiculosReferencia() {
+  const supabase = getClient();
+  const { data, error } = await supabase
+    .from('vehiculos_referencia')
+    .select('marca, modelo, tecnologia')
+    .eq('activo', true);
+  if (error) throw error;
+  return data || [];
+}
+
+/**
+ * Registra un vehículo que el asesor escribió y que NO se encontró en la
+ * base de referencia — así se puede ir completando la base con el tiempo
+ * (revisando cuáles de estos "no listados" sí aplican y agregándolos).
+ */
+async function guardarVehiculoNoListado(casoId, textoEscrito, tecnologiaDeclarada, asesor) {
+  const supabase = getClient();
+  const row = {
+    caso_id: casoId || null,
+    texto_escrito: textoEscrito,
+    tecnologia_declarada: tecnologiaDeclarada || null,
+    asesor: asesor || null,
+  };
+  const { error } = await supabase.from('vehiculos_no_listados').insert(row);
+  if (error) throw error;
+}
+
 module.exports = {
   crearCaso,
   actualizarCaso,
@@ -215,4 +248,6 @@ module.exports = {
   guardarConocimiento,
   obtenerConocimientoReciente,
   buscarCasoPorTermino,
+  obtenerVehiculosReferencia,
+  guardarVehiculoNoListado,
 };

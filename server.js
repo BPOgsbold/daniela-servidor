@@ -122,7 +122,7 @@ const GATES_NEGOCIACION = [
     pregunta: '¿Finalizaste la negociación con el cliente?',
     motivoCampo: 'motivo_rechazo',
     motivos: ['No confía en el proceso', 'Precio', 'Tiempo limitado para el proceso'],
-    siguientePasoOpciones: ['Pendiente de contrato', 'Pendiente de firma', 'Pendiente de pago'],
+    siguientePasoOpciones: ['Pendiente de contrato', 'Pendiente de firma', 'Pendiente de pago', 'Proceso completado'],
     servicioOpciones: ['Solo DIAN', 'Servicio completo', 'Solo UPME'],
   },
 ];

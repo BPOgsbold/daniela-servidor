@@ -54,6 +54,7 @@ async function crearCaso(sessionId, asesor, datos) {
     // datos (apenas se responde si se logró el contacto), así que quien
     // llama puede pasar explícitamente estado_pipeline: 'Contacto'.
     estado_pipeline: datos.estado_pipeline || 'Interesado',
+    estado_actual_cliente: datos.estado_actual_cliente || null,
     datos,
   };
   const { data, error } = await supabase.from(TABLA_CASOS).insert(row).select().single();

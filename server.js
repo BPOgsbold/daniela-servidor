@@ -12,6 +12,8 @@ const {
   guardarConocimiento,
   obtenerConocimientoReciente,
   buscarCasoPorTermino,
+  obtenerVehiculosReferencia,
+  guardarVehiculoNoListado,
 } = require('./supabase');
 
 const app = express();
@@ -308,7 +310,80 @@ const TECNOLOGIA_MAP = {
   phev: 'Híbrido enchufable',
   'plug-in': 'Híbrido enchufable',
   'plug in': 'Híbrido enchufable',
+  reev: 'Híbrido de rango extendido',
+  'rango extendido': 'Híbrido de rango extendido',
+  'de rango extendido': 'Híbrido de rango extendido',
 };
+
+// ====== Base de referencia de vehículos que aplican al beneficio ======
+// Se usa para autocompletar/validar la tecnología apenas el asesor escribe
+// el vehículo del cliente. La base puede no estar completa todavía, así que
+// si un vehículo no aparece NO se bloquea el caso — solo se avisa al asesor
+// para que confirme bien que aplica, y queda registrado para ir creciendo la
+// base con el tiempo (tabla vehiculos_no_listados).
+let vehiculosReferenciaCache = null;
+let vehiculosReferenciaCacheEn = 0;
+const VEHICULOS_REFERENCIA_TTL_MS = 5 * 60 * 1000; // 5 minutos
+
+async function obtenerVehiculosReferenciaCacheada() {
+  const ahora = Date.now();
+  if (vehiculosReferenciaCache && ahora - vehiculosReferenciaCacheEn < VEHICULOS_REFERENCIA_TTL_MS) {
+    return vehiculosReferenciaCache;
+  }
+  try {
+    vehiculosReferenciaCache = await obtenerVehiculosReferencia();
+    vehiculosReferenciaCacheEn = ahora;
+  } catch (err) {
+    console.error('Error cargando la base de referencia de vehículos:', err);
+    // Si falla, seguimos con lo que hubiera en caché (aunque esté vencido) o
+    // con una lista vacía — nunca bloqueamos el flujo por esto.
+    vehiculosReferenciaCache = vehiculosReferenciaCache || [];
+  }
+  return vehiculosReferenciaCache;
+}
+
+function normalizarParaComparar(s) {
+  return (s || '')
+    .toString()
+    .toUpperCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/[^A-Z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Busca el vehículo que escribió el asesor (texto libre, ej. "Toyota
+ * Corolla Cross Hybrid") dentro de la base de referencia. No exige que
+ * coincida exactamente: alcanza con que la marca aparezca en el texto y que
+ * al menos una palabra significativa del modelo también aparezca.
+ */
+function buscarVehiculoEnReferencia(textoVehiculo, referencia) {
+  const texto = normalizarParaComparar(textoVehiculo);
+  if (!texto) return null;
+  let mejor = null;
+  let mejorPuntaje = 0;
+  for (const v of referencia) {
+    const marcaNorm = normalizarParaComparar(v.marca);
+    if (!marcaNorm || !texto.includes(marcaNorm)) continue;
+    const palabrasModelo = normalizarParaComparar(v.modelo)
+      .split(' ')
+      .filter((p) => p.length >= 3);
+    if (palabrasModelo.length === 0) continue;
+    const coincidencias = palabrasModelo.filter((p) => texto.includes(p)).length;
+    if (coincidencias === 0) continue;
+    const puntaje = coincidencias / palabrasModelo.length;
+    if (puntaje > mejorPuntaje) {
+      mejorPuntaje = puntaje;
+      mejor = v;
+    }
+  }
+  // Con que coincida al menos una palabra clave del modelo (además de la
+  // marca) ya lo damos por encontrado — es una ayuda para el asesor, no una
+  // validación estricta.
+  return mejor;
+}
 
 const TIPO_IDENTIFICACION_MAP = {
   cc: 'CC',
@@ -1249,6 +1324,42 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
+      // Al capturar el vehículo, lo cruzamos contra la base de referencia de
+      // vehículos que aplican. Si lo encontramos, ya sabemos la tecnología y
+      // nos ahorramos preguntarla; si no aparece, seguimos preguntando todo
+      // normal (la base puede no estar completa) pero lo dejamos marcado
+      // para avisar y registrar apenas se responda la tecnología.
+      let avisoVehiculo = '';
+      if (campo.id === 'vehiculo' && resultadoCampo.valor) {
+        try {
+          const referencia = await obtenerVehiculosReferenciaCacheada();
+          const encontrado = buscarVehiculoEnReferencia(resultadoCampo.valor, referencia);
+          if (encontrado) {
+            sesion.data.tecnologia = encontrado.tecnologia;
+            avisoVehiculo = `✅ Ese modelo ya está en nuestra base de vehículos que aplican (tecnología: ${encontrado.tecnologia}), así que no hace falta preguntarla.\n\n`;
+          } else {
+            sesion.vehiculoSinListar = resultadoCampo.valor;
+          }
+        } catch (err) {
+          console.error('Error consultando la base de referencia de vehículos:', err);
+        }
+      }
+
+      // Cuando la tecnología queda capturada (a mano, porque el vehículo no
+      // estaba en la base) dejamos el aviso y registramos el vehículo como
+      // "no listado" para poder revisarlo después y, si aplica, agregarlo a
+      // la base de referencia.
+      if (campo.id === 'tecnologia' && sesion.vehiculoSinListar) {
+        avisoVehiculo =
+          `⚠️ Este vehículo todavía no está en nuestra base de referencia — confirma bien que SÍ aplica al beneficio antes de continuar. Queda registrado para revisión.\n\n`;
+        try {
+          await guardarVehiculoNoListado(sesion.casoId, sesion.vehiculoSinListar, resultadoCampo.valor, asesor);
+        } catch (err) {
+          console.error('Error guardando vehículo no listado:', err);
+        }
+        sesion.vehiculoSinListar = null;
+      }
+
       sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
 
       // Verificación automática de duplicados: apenas se captura el nombre,
@@ -1303,6 +1414,13 @@ app.post('/api/chat', async (req, res) => {
             cambiosIncrementales.tipo_cuenta = sesion.data.tipo_cuenta;
             if (sesion.data.cuenta !== undefined) cambiosIncrementales.cuenta = sesion.data.cuenta;
           }
+          // Si el vehículo se encontró en la base de referencia, la
+          // tecnología quedó autocompletada en el mismo paso (ver arriba) y
+          // ese campo se salta — así que la guardamos ya mismo, de una vez
+          // con el vehículo, para que no falte en Supabase.
+          if (campo.id === 'vehiculo' && sesion.data.tecnologia) {
+            cambiosIncrementales.tecnologia = sesion.data.tecnologia;
+          }
           await actualizarCaso(sesion.casoId, cambiosIncrementales);
         } catch (dbError) {
           console.error(`Error actualizando el campo ${campo.id} en Supabase:`, dbError);
@@ -1316,7 +1434,7 @@ app.post('/api/chat', async (req, res) => {
       if (campo.id === 'contacto_logrado' && resultadoCampo.valor === 'No') {
         sesion.pendienteCierre = true;
         return res.json({
-          reply: `${avisoDuplicado}${avisoGuardado}¿Quieres cerrar la interacción con este cliente?`,
+          reply: `${avisoDuplicado}${avisoGuardado}${avisoVehiculo}¿Quieres cerrar la interacción con este cliente?`,
           opciones: ['Sí', 'No'],
         });
       }
@@ -1328,13 +1446,13 @@ app.post('/api/chat', async (req, res) => {
       if (campo.id === 'tipo_identificacion' && resultadoCampo.valor === 'NIT') {
         sesion.pendienteNombreEmpresa = true;
         return res.json({
-          reply: `${avisoDuplicado}${avisoGuardado}✅ Anotado.\n\n¿Cuál es el nombre o razón social de la empresa?`,
+          reply: `${avisoDuplicado}${avisoGuardado}${avisoVehiculo}✅ Anotado.\n\n¿Cuál es el nombre o razón social de la empresa?`,
         });
       }
 
       if (sesion.stepIndex < campos.length) {
         const siguiente = campos[sesion.stepIndex];
-        return res.json(conOpciones({ reply: `${avisoDuplicado}${avisoGuardado}✅ Anotado.\n\n${siguiente.prompt}` }, siguiente));
+        return res.json(conOpciones({ reply: `${avisoDuplicado}${avisoGuardado}${avisoVehiculo}✅ Anotado.\n\n${siguiente.prompt}` }, siguiente));
       }
 
       // Caso completo. Si ya se creó antes (en el paso de contacto), solo
@@ -1372,7 +1490,7 @@ app.post('/api/chat', async (req, res) => {
       sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
       return res.json({
         reply:
-          `${avisoDuplicado}${avisoGuardado}✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n` +
+          `${avisoDuplicado}${avisoGuardado}${avisoVehiculo}✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n` +
           `¿Estos datos están correctos, o necesitas modificar alguno?`,
         opciones: ['Están correctos', 'Modificar un dato'],
       });

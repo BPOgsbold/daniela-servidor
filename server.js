@@ -153,6 +153,24 @@ function datosDeCasoExistente(caso) {
   return datos;
 }
 
+// Cuando un mismo cliente vuelve con un SEGUNDO vehículo (se gestiona como un
+// caso aparte, con su propio pipeline), reutilizamos solo sus datos de
+// identidad/contacto — nunca los del vehículo — para no volver a preguntar
+// nombre, teléfono, cédula, etc., pero sí pedir de cero los datos del carro
+// nuevo (vehículo, tecnología, placa, fecha de compra, valor, certificado).
+const CAMPOS_CLIENTE_COMPARTIDOS = CAMPOS_RETOMABLES.filter(
+  (id) => !['vehiculo', 'tecnologia', 'placa', 'fecha_compra', 'valor_sin_iva', 'tiene_certificado_upme'].includes(id)
+);
+function datosClienteExistente(caso) {
+  const datos = {};
+  for (const id of CAMPOS_CLIENTE_COMPARTIDOS) {
+    if (caso[id] !== null && caso[id] !== undefined && caso[id] !== '') {
+      datos[id] = caso[id];
+    }
+  }
+  return datos;
+}
+
 // Arma una respuesta legible con los casos que ya existen en Supabase para
 // un cliente, para que el asesor pueda confirmar rápido si ya fue atendido
 // antes en vez de crear un caso duplicado.
@@ -220,11 +238,20 @@ function resumenCampos(campos, data) {
   return campos.map((c) => `• ${c.label}: ${data[c.id] ?? '—'}`).join('\n');
 }
 
+// Botón universal que se agrega a TODAS las preguntas de captura de datos:
+// si el cliente no tiene o no quiso dar ese dato, el asesor puede darle clic
+// y seguir sin quedar trabado esperando una respuesta que no va a llegar.
+const ETIQUETA_SALTAR = 'No tiene este dato';
+
 // Cuando el campo que se le está preguntando al asesor tiene opciones fijas
 // (tipo "botones"/"botones_opcional"), se las mandamos a la extensión en
-// `opciones` para que las pinte como botones clicables, además del texto.
+// `opciones` para que las pinte como botones clicables, además del texto. A
+// esas opciones (o, si el campo es de texto libre, como única opción) se le
+// suma siempre el botón de "No tiene este dato".
 function conOpciones(base, campo) {
-  return campo && campo.opciones ? { ...base, opciones: campo.opciones } : base;
+  if (!campo) return base;
+  const opcionesCampo = campo.opciones || [];
+  return { ...base, opciones: [...opcionesCampo, ETIQUETA_SALTAR] };
 }
 
 // Normaliza algunas respuestas cortas a una etiqueta completa y legible.
@@ -325,6 +352,14 @@ function interpretarSiNo(texto) {
 // marcados con tipo "si_no" se interpretan de forma conversacional en vez de
 // exigir una palabra exacta.
 function validarYNormalizarCampo(campo, mensajeCrudo) {
+  // El botón "No tiene este dato" funciona igual para cualquier tipo de
+  // campo (texto libre, botones, si_no): si el asesor le da clic (o lo
+  // escribe tal cual), se guarda null para ese dato y se sigue sin exigirlo.
+  // Va primero, antes de cualquier validación específica del tipo de campo.
+  if (normalizarTexto(mensajeCrudo).trim() === normalizarTexto(ETIQUETA_SALTAR).trim()) {
+    return { ok: true, valor: null };
+  }
+
   if (campo.tipo === 'si_no') {
     const valor = interpretarSiNo(mensajeCrudo);
     if (!valor) return { ok: false };
@@ -738,6 +773,53 @@ app.post('/api/chat', async (req, res) => {
       });
     }
 
+    // --- Mismo cliente, pero un vehículo (caso) distinto: se reutilizan sus
+    // datos de contacto/identidad, pero se crea un caso NUEVO y aparte (no se
+    // toca el caso ya existente), porque cada vehículo se gestiona con su
+    // propio pipeline/negociación.
+    if (/^mismo cliente,? otro veh[ií]culo$/i.test(message.trim())) {
+      const casoBase = sesion.candidatoRetomar;
+      if (!casoBase) {
+        return res.json({
+          reply: 'Ya no tengo a mano ese cliente — dime "buscar cliente" y lo buscamos de nuevo.',
+        });
+      }
+      sesion.estado = 'capturando_caso';
+      sesion.tipo = null;
+      sesion.casoId = null;
+      sesion.data = datosClienteExistente(casoBase);
+      sesion.avisoDuplicadoMostrado = true;
+      sesion.pendienteCierre = false;
+      sesion.pendienteBusqueda = false;
+      sesion.candidatoRetomar = null;
+      const nombreCliente = casoBase.nombre_cliente || 'este cliente';
+
+      let avisoGuardadoVehiculo = '';
+      try {
+        const registro = await crearCaso(sessionId, asesor, { ...sesion.data, estado_pipeline: 'Contacto' });
+        sesion.casoId = registro.id;
+        avisoGuardadoVehiculo = '✅ Ya quedó creado el caso nuevo para este vehículo (estado: Contacto), así que no se pierde aunque no completemos todo de una vez.\n\n';
+      } catch (dbError) {
+        console.error('Error creando el caso del segundo vehículo en Supabase:', dbError);
+        avisoGuardadoVehiculo = `⚠️ No pude guardar el caso en la base de datos en este momento (${dbError.message}). Sigamos igual, pero avisa a soporte si esto se repite.\n\n`;
+      }
+
+      sesion.stepIndex = siguienteIndicePendiente(CAMPOS.caso_nuevo, sesion.data);
+      if (sesion.stepIndex < CAMPOS.caso_nuevo.length) {
+        const siguienteCampo = CAMPOS.caso_nuevo[sesion.stepIndex];
+        return res.json(
+          conOpciones(
+            {
+              reply: `${avisoGuardadoVehiculo}✅ Perfecto, abrimos un caso aparte para el vehículo nuevo de ${nombreCliente}. Ya tengo sus datos de contacto, así que sigamos solo con la información de este vehículo.\n\n${siguienteCampo.prompt}`,
+            },
+            siguienteCampo
+          )
+        );
+      }
+      sesion.estado = 'caso_abierto';
+      return res.json({ reply: `${avisoGuardadoVehiculo}Listo, el caso del vehículo nuevo de ${nombreCliente} ya quedó completo.` });
+    }
+
     // --- Detección dinámica: si el mensaje libre suena a un cambio de
     // estado ("tengo un cliente nuevo", "ya se radicó", etc.), lo tratamos
     // como si hubiera pulsado el botón correspondiente.
@@ -761,7 +843,7 @@ app.post('/api/chat', async (req, res) => {
         },
       };
       const primerCampo = CAMPOS.escalamiento_juridico[0];
-      return res.json({ reply: primerCampo.prompt });
+      return res.json(conOpciones({ reply: primerCampo.prompt }, primerCampo));
     }
 
     // --- Si hay un escalamiento en curso, todo mensaje libre va ahí ---
@@ -784,12 +866,12 @@ app.post('/api/chat', async (req, res) => {
           },
           conocimiento
         );
-        return res.json({ reply: `${respuesta}\n\n➡️ ${campo.prompt}` });
+        return res.json(conOpciones({ reply: `${respuesta}\n\n➡️ ${campo.prompt}` }, campo));
       }
 
       const resultadoCampo = validarYNormalizarCampo(campo, message);
       if (!resultadoCampo.ok) {
-        return res.json({ reply: `⚠️ ${campo.errorMessage}\n\n${campo.prompt}` });
+        return res.json(conOpciones({ reply: `⚠️ ${campo.errorMessage}\n\n${campo.prompt}` }, campo));
       }
 
       esc.data[campo.id] = resultadoCampo.valor;
@@ -797,7 +879,7 @@ app.post('/api/chat', async (req, res) => {
 
       if (esc.stepIndex < campos.length) {
         const siguiente = campos[esc.stepIndex];
-        return res.json({ reply: `✅ Anotado.\n\n${siguiente.prompt}` });
+        return res.json(conOpciones({ reply: `✅ Anotado.\n\n${siguiente.prompt}` }, siguiente));
       }
 
       // Escalamiento completo: guardar y volver a donde estaba el asesor.
@@ -904,7 +986,7 @@ app.post('/api/chat', async (req, res) => {
           reply = formatearResultadosBusqueda(resultados, terminoInline);
           if (resultados.length === 1) {
             sesion.candidatoRetomar = resultados[0];
-            opcionesBusqueda = ['Retomar este caso'];
+            opcionesBusqueda = ['Retomar este caso', 'Mismo cliente, otro vehículo'];
           } else {
             sesion.candidatoRetomar = null;
           }
@@ -935,7 +1017,7 @@ app.post('/api/chat', async (req, res) => {
         reply = formatearResultadosBusqueda(resultados, termino);
         if (resultados.length === 1) {
           sesion.candidatoRetomar = resultados[0];
-          opcionesBusqueda = ['Retomar este caso'];
+          opcionesBusqueda = ['Retomar este caso', 'Mismo cliente, otro vehículo'];
         } else {
           sesion.candidatoRetomar = null;
         }
@@ -984,7 +1066,7 @@ app.post('/api/chat', async (req, res) => {
       sesion.stepIndex = 0;
       sesion.data = {};
       const primerCampo = CAMPOS[sesion.tipo][0];
-      return res.json({ reply: primerCampo.prompt });
+      return res.json(conOpciones({ reply: primerCampo.prompt }, primerCampo));
     }
 
     // --- Captura de datos del caso nuevo ---
@@ -1049,7 +1131,11 @@ app.post('/api/chat', async (req, res) => {
       // Se avisa una sola vez por sesión para no repetir el aviso en cada
       // campo si el mismo cliente coincide en varios (nombre, cédula, placa).
       let avisoDuplicado = '';
-      if (!sesion.avisoDuplicadoMostrado && ['nombre_cliente', 'numero_identificacion', 'placa'].includes(campo.id)) {
+      if (
+        resultadoCampo.valor &&
+        !sesion.avisoDuplicadoMostrado &&
+        ['nombre_cliente', 'numero_identificacion', 'placa'].includes(campo.id)
+      ) {
         try {
           const coincidencias = await buscarCasoPorTermino(resultadoCampo.valor);
           if (coincidencias.length > 0) {
@@ -1353,12 +1439,12 @@ app.post('/api/chat', async (req, res) => {
           },
           conocimiento
         );
-        return res.json({ reply: `${respuesta}\n\n➡️ ${campo.prompt}` });
+        return res.json(conOpciones({ reply: `${respuesta}\n\n➡️ ${campo.prompt}` }, campo));
       }
 
       const resultadoCampo = validarYNormalizarCampo(campo, message);
       if (!resultadoCampo.ok) {
-        return res.json({ reply: `⚠️ ${campo.errorMessage}\n\n${campo.prompt}` });
+        return res.json(conOpciones({ reply: `⚠️ ${campo.errorMessage}\n\n${campo.prompt}` }, campo));
       }
 
       sesion.data[campo.id] = resultadoCampo.valor;
@@ -1366,7 +1452,7 @@ app.post('/api/chat', async (req, res) => {
 
       if (sesion.stepIndex < campos.length) {
         const siguiente = campos[sesion.stepIndex];
-        return res.json({ reply: `✅ Anotado.\n\n${siguiente.prompt}` });
+        return res.json(conOpciones({ reply: `✅ Anotado.\n\n${siguiente.prompt}` }, siguiente));
       }
 
       try {

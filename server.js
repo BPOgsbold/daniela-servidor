@@ -522,6 +522,11 @@ const ESTADOS_PIPELINE = [
     descripcion: 'el cliente se comunicó pero no brindó todos los datos.',
   },
   {
+    label: 'Negociación',
+    frases: ['negociacion', 'en negociacion', 'negociando'],
+    descripcion: 'el cliente ya confirmó que sigue interesado y se está negociando la propuesta (aceptación, siguiente paso, servicio contratado).',
+  },
+  {
     label: 'Cliente',
     frases: ['cliente'],
     descripcion: 'ya tenemos todos los documentos que debe enviar el cliente, la firma del contrato y el pago realizado.',
@@ -1180,6 +1185,13 @@ app.post('/api/chat', async (req, res) => {
             });
           }
         }
+        // El caso ya tiene todos sus datos: el sistema lo categoriza solo
+        // como "Interesado" (antes se quedaba pegado en "Contacto").
+        try {
+          await actualizarCaso(sesion.casoId, { estado_pipeline: 'Interesado' });
+        } catch (dbError) {
+          console.error('Error actualizando estado_pipeline a Interesado:', dbError);
+        }
         sesion.estado = 'negociacion';
         sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
         return res.json({
@@ -1352,6 +1364,14 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
+      // El caso ya tiene todos sus datos: el sistema lo categoriza solo
+      // como "Interesado" (antes se quedaba pegado en "Contacto").
+      try {
+        await actualizarCaso(sesion.casoId, { estado_pipeline: 'Interesado' });
+      } catch (dbError) {
+        console.error('Error actualizando estado_pipeline a Interesado:', dbError);
+      }
+
       // Antes de arrancar las preguntas de negociación, le mostramos al
       // asesor el resumen completo y le preguntamos si todo está correcto o
       // si necesita corregir algún dato — así no toca escalar a soporte por
@@ -1490,6 +1510,17 @@ app.post('/api/chat', async (req, res) => {
           return res.json({ reply: gate.pregunta, opciones: OPCIONES_GATE_PREGUNTA });
         }
         if (respuesta === 'sí') {
+          // El sistema categoriza solo: en cuanto el cliente confirma que
+          // sigue interesado (o acepta en cualquiera de las 3 preguntas),
+          // el caso pasa a "Negociación" — sin que el asesor tenga que
+          // cambiarlo a mano en el desplegable.
+          if (sesion.casoId) {
+            try {
+              await actualizarCaso(sesion.casoId, { estado_pipeline: 'Negociación' });
+            } catch (dbError) {
+              console.error('Error actualizando estado_pipeline a Negociación:', dbError);
+            }
+          }
           if (gate.siguientePasoOpciones) {
             neg.sub = 'siguiente_paso';
             return res.json({
@@ -1514,7 +1545,11 @@ app.post('/api/chat', async (req, res) => {
         }
         if (sesion.casoId) {
           try {
-            await actualizarCaso(sesion.casoId, { [gate.motivoCampo]: motivo });
+            // El sistema categoriza solo: en cuanto se responde "No" a
+            // cualquiera de las 3 preguntas de negociación, el caso ya queda
+            // como "Cierre perdido" — sin esperar a que además confirmen
+            // que quieren cerrar la interacción ahora mismo.
+            await actualizarCaso(sesion.casoId, { [gate.motivoCampo]: motivo, estado_pipeline: 'Cierre perdido' });
           } catch (dbError) {
             console.error(`Error guardando ${gate.motivoCampo} en Supabase:`, dbError);
           }
@@ -1583,7 +1618,11 @@ app.post('/api/chat', async (req, res) => {
         }
         if (sesion.casoId) {
           try {
-            await actualizarCaso(sesion.casoId, { siguiente_paso: match });
+            const cambiosPaso = { siguiente_paso: match };
+            // Si ya se ejecutó todo el proceso, el sistema categoriza el
+            // caso solo como "Cliente" (documentos, firma y pago listos).
+            if (match === 'Proceso completado') cambiosPaso.estado_pipeline = 'Cliente';
+            await actualizarCaso(sesion.casoId, cambiosPaso);
           } catch (dbError) {
             console.error('Error guardando el siguiente paso en Supabase:', dbError);
           }

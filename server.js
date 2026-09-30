@@ -510,16 +510,25 @@ function normalizarTexto(s) {
 // resultado final del trámite ante la DIAN, que es otra cosa: radicado /
 // no_aplica). El asesor los cambia escribiéndole a Daniela en lenguaje
 // natural, ej. "cambia el estado a cliente" o "márcalo como en proceso upme".
+// El pipeline llega hasta "Cliente" (ahí ya está ganado el caso). Lo que
+// pasa DESPUÉS de ganar (trámite UPME, DIAN, desembolso) ya NO es un estado
+// de este pipeline: vive aparte en la columna "estado_actual_cliente", que
+// por ahora solo se maneja desde el panel web (no por chat).
 const ESTADOS_PIPELINE = [
   {
-    label: 'Interesado',
-    frases: ['interesado'],
-    descripcion: 'es el que llega y ya se completaron todos los datos que el cliente brinda.',
+    label: 'Registro',
+    frases: ['registro'],
+    descripcion: 'se intentó el contacto pero no se logró (el cliente no respondió o no se pudo hablar con él).',
   },
   {
     label: 'Contacto',
     frases: ['contacto'],
     descripcion: 'el cliente se comunicó pero no brindó todos los datos.',
+  },
+  {
+    label: 'Interesado',
+    frases: ['interesado'],
+    descripcion: 'es el que llega y ya se completaron todos los datos que el cliente brinda.',
   },
   {
     label: 'Negociación',
@@ -535,26 +544,6 @@ const ESTADOS_PIPELINE = [
     label: 'Cierre perdido',
     frases: ['cierre perdido'],
     descripcion: 'el cliente no firmó contrato, no envió documentación y/o no realizó el pago.',
-  },
-  {
-    label: 'En proceso UPME',
-    frases: ['proceso upme', 'tramite upme', 'en upme'],
-    descripcion: 'el cliente está en trámite del estado UPME.',
-  },
-  {
-    label: 'En proceso DIAN',
-    frases: ['proceso dian', 'tramite dian', 'en dian'],
-    descripcion: 'el cliente está en trámite ante la DIAN, pendiente de agendamiento de cita.',
-  },
-  {
-    label: 'Pendiente desembolso',
-    frases: ['pendiente desembolso', 'pdt desembolso'],
-    descripcion: 'está en espera de desembolso por parte de la DIAN.',
-  },
-  {
-    label: 'Desembolso realizado',
-    frases: ['desembolso realizado'],
-    descripcion: 'el cliente confirmó que el pago ya fue realizado.',
   },
 ];
 
@@ -1287,16 +1276,19 @@ app.post('/api/chat', async (req, res) => {
       }
 
       // En cuanto se responde si se logró el contacto, ya creamos el caso en
-      // Supabase con estado "Contacto" — así, aunque después se caiga la
-      // llamada o no se alcance a llenar todo lo demás, el cliente NO se
-      // pierde: ya quedó guardado en la base de datos.
+      // Supabase — así, aunque después se caiga la llamada o no se alcance a
+      // llenar todo lo demás, el cliente NO se pierde: ya quedó guardado en
+      // la base de datos. El sistema categoriza solo: si NO se logró el
+      // contacto, el caso queda como "Registro" (no como "Contacto", que es
+      // solo para cuando sí se habló con el cliente).
       let avisoGuardado = '';
       if (campo.id === 'contacto_logrado' && !sesion.casoId) {
         try {
-          const registro = await crearCaso(sessionId, asesor, { ...sesion.data, estado_pipeline: 'Contacto' });
+          const estadoInicial = resultadoCampo.valor === 'No' ? 'Registro' : 'Contacto';
+          const registro = await crearCaso(sessionId, asesor, { ...sesion.data, estado_pipeline: estadoInicial });
           sesion.casoId = registro.id;
           avisoGuardado =
-            '✅ Ya quedó guardado en la base de datos (estado: Contacto), así que aunque no alcancemos a completar todo, no se pierde.\n\n';
+            `✅ Ya quedó guardado en la base de datos (estado: ${estadoInicial}), así que aunque no alcancemos a completar todo, no se pierde.\n\n`;
         } catch (dbError) {
           console.error('Error creando el caso en Supabase (paso de contacto):', dbError);
           avisoGuardado = `⚠️ No pude guardar el caso en la base de datos en este momento (${dbError.message}). Sigamos igual, pero avisa a soporte si esto se repite.\n\n`;

@@ -366,15 +366,28 @@ function normalizarParaComparar(s) {
  * palabra "Corolla" en los tres) — ahí no se puede adivinar cuál es, hay que
  * preguntar. En cambio "Toyota Corolla Cross" ya coincide en 2 palabras
  * ("Corolla" + "Cross") contra esa línea puntual, así que gana ella sola.
+ *
+ * Primero intenta anclar por marca + modelo (más confiable). Si el asesor no
+ * escribió la marca (ej. escribió solo "Corolla" sin "Toyota"), eso no debe
+ * hacer que el vehículo quede sin detectar — así que si esa primera pasada no
+ * encuentra nada, se reintenta comparando solo por el modelo.
  */
 function buscarVehiculosEnReferencia(textoVehiculo, referencia) {
   const texto = normalizarParaComparar(textoVehiculo);
   if (!texto) return [];
+  const conMarca = coincidenciasVehiculo(texto, referencia, true);
+  if (conMarca.length > 0) return conMarca;
+  return coincidenciasVehiculo(texto, referencia, false);
+}
+
+function coincidenciasVehiculo(texto, referencia, exigirMarca) {
   let mejores = [];
   let mejorCoincidencias = 0;
   for (const v of referencia) {
-    const marcaNorm = normalizarParaComparar(v.marca);
-    if (!marcaNorm || !texto.includes(marcaNorm)) continue;
+    if (exigirMarca) {
+      const marcaNorm = normalizarParaComparar(v.marca);
+      if (!marcaNorm || !texto.includes(marcaNorm)) continue;
+    }
     const palabrasModelo = normalizarParaComparar(v.modelo)
       .split(' ')
       .filter((p) => p.length >= 3);
@@ -389,6 +402,30 @@ function buscarVehiculosEnReferencia(textoVehiculo, referencia) {
     }
   }
   return mejores;
+}
+
+/**
+ * Arma la pregunta para que el asesor precise cuál de varias líneas
+ * candidatas es la correcta. Se dirige al asesor por su nombre y suena a
+ * pregunta de conversación normal (ej. "Migue, ¿el cliente tiene un Toyota
+ * Corolla Cross, Seg, Xei o Xli?"), en vez de mostrar solo una lista fría de
+ * referencias técnicas.
+ */
+function construirPreguntaDesambiguarVehiculo(candidatos, asesor) {
+  const saludo = asesor ? `${asesor}, ` : '';
+  const marca = candidatos[0].marca;
+  // Palabras del modelo que se repiten en TODAS las líneas candidatas (ej.
+  // "COROLLA" en Corolla Cross/Seg/Xei/Xli) — sirven para nombrar el modelo
+  // en la pregunta ("Toyota Corolla") y no solo la marca ("Toyota").
+  const palabrasComunes = normalizarParaComparar(candidatos[0].modelo)
+    .split(' ')
+    .filter((p) => candidatos.every((c) => normalizarParaComparar(c.modelo).split(' ').includes(p)));
+  const modeloComun = palabrasComunes.length > 0 ? ` ${palabrasComunes.join(' ')}` : '';
+  const lista = candidatos.map((c, i) => `${i + 1}. ${c.marca} ${c.modelo}`).join('\n');
+  return (
+    `${saludo}encontré varias versiones de ${marca}${modeloComun} que podrían ser — no quiero adivinar cuál le queda al cliente. ` +
+    `¿Cuál de estas es exactamente?\n\n${lista}\n\nResponde con el número o escribe el nombre completo de la línea.`
+  );
 }
 
 const TIPO_IDENTIFICACION_MAP = {
@@ -1276,6 +1313,29 @@ app.post('/api/chat', async (req, res) => {
       // normal porque no es una pregunta de CAMPOS.caso_nuevo.
       if (sesion.pendienteDesambiguarVehiculo) {
         const { candidatos } = sesion.pendienteDesambiguarVehiculo;
+        const preguntaDesambiguar = construirPreguntaDesambiguarVehiculo(candidatos, asesor);
+
+        // Si en vez de responder cuál línea es, el asesor aprovecha para
+        // preguntar cualquier otra duda del proceso, se la resolvemos igual
+        // que en cualquier otro punto del flujo y luego retomamos la
+        // pregunta pendiente — no lo dejamos "atascado" teniendo que elegir
+        // una línea antes de poder preguntar algo.
+        if (pareceDuda(message)) {
+          const conocimiento = await obtenerConocimientoTexto();
+          const respuestaDuda = await responderAyuda(
+            SOP_TEXT,
+            OBJECIONES_TEXT,
+            message,
+            {
+              estado: sesion.estado,
+              campoActual: preguntaDesambiguar,
+              datosCapturados: sesion.data,
+            },
+            conocimiento
+          );
+          return res.json({ reply: `${respuestaDuda}\n\n➡️ ${preguntaDesambiguar}` });
+        }
+
         const respuesta = (message || '').trim();
         let elegido = null;
 
@@ -1292,9 +1352,8 @@ app.post('/api/chat', async (req, res) => {
         }
 
         if (!elegido) {
-          const lista = candidatos.map((c, i) => `${i + 1}. ${c.marca} ${c.modelo}`).join('\n');
           return res.json({
-            reply: `⚠️ No logré identificar cuál de estas líneas es. Responde con el número o escribe el nombre completo:\n\n${lista}`,
+            reply: `⚠️ No logré identificar cuál de estas líneas es.\n\n${preguntaDesambiguar}`,
           });
         }
 
@@ -1536,11 +1595,12 @@ app.post('/api/chat', async (req, res) => {
       // referencia/línea exacta, para no adivinar y dejar un dato mal
       // parametrizado.
       if (sesion.pendienteDesambiguarVehiculo) {
-        const lista = sesion.pendienteDesambiguarVehiculo.candidatos
-          .map((c, i) => `${i + 1}. ${c.marca} ${c.modelo}`)
-          .join('\n');
+        const preguntaDesambiguarInicial = construirPreguntaDesambiguarVehiculo(
+          sesion.pendienteDesambiguarVehiculo.candidatos,
+          asesor
+        );
         return res.json({
-          reply: `${avisoDuplicado}${avisoGuardado}Encontramos varias versiones de ese vehículo en nuestra base y no queremos adivinar cuál es. ¿Cuál es la referencia/línea exacta?\n\n${lista}\n\nResponde con el número o escribe el nombre completo de la línea.`,
+          reply: `${avisoDuplicado}${avisoGuardado}${preguntaDesambiguarInicial}`,
         });
       }
 

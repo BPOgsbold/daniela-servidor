@@ -358,12 +358,20 @@ function normalizarParaComparar(s) {
  * Corolla Cross Hybrid") dentro de la base de referencia. No exige que
  * coincida exactamente: alcanza con que la marca aparezca en el texto y que
  * al menos una palabra significativa del modelo también aparezca.
+ *
+ * Devuelve TODAS las líneas que empatan en el mayor número de palabras
+ * coincidentes (no solo la "mejor"), para poder distinguir un match único de
+ * uno ambiguo. Ej.: "Toyota Corolla" a secas empata igual contra "Corolla
+ * Cross Seg Hev", "Corolla Xei Hv" y "Corolla Xli Hv" (solo coincide la
+ * palabra "Corolla" en los tres) — ahí no se puede adivinar cuál es, hay que
+ * preguntar. En cambio "Toyota Corolla Cross" ya coincide en 2 palabras
+ * ("Corolla" + "Cross") contra esa línea puntual, así que gana ella sola.
  */
-function buscarVehiculoEnReferencia(textoVehiculo, referencia) {
+function buscarVehiculosEnReferencia(textoVehiculo, referencia) {
   const texto = normalizarParaComparar(textoVehiculo);
-  if (!texto) return null;
-  let mejor = null;
-  let mejorPuntaje = 0;
+  if (!texto) return [];
+  let mejores = [];
+  let mejorCoincidencias = 0;
   for (const v of referencia) {
     const marcaNorm = normalizarParaComparar(v.marca);
     if (!marcaNorm || !texto.includes(marcaNorm)) continue;
@@ -373,16 +381,14 @@ function buscarVehiculoEnReferencia(textoVehiculo, referencia) {
     if (palabrasModelo.length === 0) continue;
     const coincidencias = palabrasModelo.filter((p) => texto.includes(p)).length;
     if (coincidencias === 0) continue;
-    const puntaje = coincidencias / palabrasModelo.length;
-    if (puntaje > mejorPuntaje) {
-      mejorPuntaje = puntaje;
-      mejor = v;
+    if (coincidencias > mejorCoincidencias) {
+      mejorCoincidencias = coincidencias;
+      mejores = [v];
+    } else if (coincidencias === mejorCoincidencias) {
+      mejores.push(v);
     }
   }
-  // Con que coincida al menos una palabra clave del modelo (además de la
-  // marca) ya lo damos por encontrado — es una ayuda para el asesor, no una
-  // validación estricta.
-  return mejor;
+  return mejores;
 }
 
 const TIPO_IDENTIFICACION_MAP = {
@@ -1264,6 +1270,86 @@ app.post('/api/chat', async (req, res) => {
         });
       }
 
+      // El asesor está respondiendo cuál es la línea/referencia exacta del
+      // vehículo, porque lo que escribió antes coincidía igual contra varias
+      // líneas distintas de la base (ver arriba). Se maneja aparte del flujo
+      // normal porque no es una pregunta de CAMPOS.caso_nuevo.
+      if (sesion.pendienteDesambiguarVehiculo) {
+        const { candidatos } = sesion.pendienteDesambiguarVehiculo;
+        const respuesta = (message || '').trim();
+        let elegido = null;
+
+        const numero = parseInt(respuesta, 10);
+        if (!isNaN(numero) && numero >= 1 && numero <= candidatos.length) {
+          elegido = candidatos[numero - 1];
+        } else {
+          const respuestaNorm = normalizarParaComparar(respuesta);
+          if (respuestaNorm) {
+            elegido =
+              candidatos.find((c) => normalizarParaComparar(c.modelo).includes(respuestaNorm)) ||
+              candidatos.find((c) => respuestaNorm.includes(normalizarParaComparar(c.modelo)));
+          }
+        }
+
+        if (!elegido) {
+          const lista = candidatos.map((c, i) => `${i + 1}. ${c.marca} ${c.modelo}`).join('\n');
+          return res.json({
+            reply: `⚠️ No logré identificar cuál de estas líneas es. Responde con el número o escribe el nombre completo:\n\n${lista}`,
+          });
+        }
+
+        sesion.data.tecnologia = elegido.tecnologia;
+        sesion.data.vehiculo = `${elegido.marca} ${elegido.modelo}`;
+        sesion.pendienteDesambiguarVehiculo = null;
+
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { vehiculo: sesion.data.vehiculo, tecnologia: sesion.data.tecnologia });
+          } catch (dbError) {
+            console.error('Error guardando la línea exacta del vehículo:', dbError);
+          }
+        }
+
+        sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
+        if (sesion.stepIndex < campos.length) {
+          const siguienteTrasVehiculo = campos[sesion.stepIndex];
+          return res.json(
+            conOpciones(
+              {
+                reply: `✅ Anotado como "${sesion.data.vehiculo}" (tecnología: ${elegido.tecnologia}).\n\n${siguienteTrasVehiculo.prompt}`,
+              },
+              siguienteTrasVehiculo
+            )
+          );
+        }
+        // Caso raro: el vehículo era el último dato que faltaba.
+        if (!sesion.casoId) {
+          try {
+            const registro = await crearCaso(sessionId, asesor, sesion.data);
+            sesion.casoId = registro.id;
+          } catch (dbError) {
+            console.error('Error guardando el caso en Supabase:', dbError);
+            return res.json({
+              reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+                campos,
+                sesion.data
+              )}`,
+            });
+          }
+        }
+        try {
+          await actualizarCaso(sesion.casoId, { estado_pipeline: 'Interesado' });
+        } catch (dbError) {
+          console.error('Error actualizando estado_pipeline a Interesado:', dbError);
+        }
+        sesion.estado = 'negociacion';
+        sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
+        return res.json({
+          reply: `✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar alguno?`,
+          opciones: ['Están correctos', 'Modificar un dato'],
+        });
+      }
+
       if (sesion.pendienteCierre) {
         const respuestaCierre = interpretarSiNo(message);
         if (!respuestaCierre) {
@@ -1325,18 +1411,27 @@ app.post('/api/chat', async (req, res) => {
       }
 
       // Al capturar el vehículo, lo cruzamos contra la base de referencia de
-      // vehículos que aplican. Si lo encontramos, ya sabemos la tecnología y
-      // nos ahorramos preguntarla; si no aparece, seguimos preguntando todo
-      // normal (la base puede no estar completa) pero lo dejamos marcado
-      // para avisar y registrar apenas se responda la tecnología.
+      // vehículos que aplican. Si hay una sola línea que coincide, ya sabemos
+      // la tecnología (nos ahorramos preguntarla) y además dejamos el dato
+      // guardado con el nombre completo y correcto de la referencia (no el
+      // texto suelto que haya escrito el asesor). Si el texto es ambiguo
+      // (coincide igual contra varias líneas distintas, ej. "Toyota Corolla"
+      // sin más detalle) le pedimos al asesor que precise cuál es, en vez de
+      // adivinar. Si no coincide con nada, seguimos preguntando todo normal
+      // (la base puede no estar completa) pero lo dejamos marcado para
+      // avisar y registrar apenas se responda la tecnología.
       let avisoVehiculo = '';
       if (campo.id === 'vehiculo' && resultadoCampo.valor) {
         try {
           const referencia = await obtenerVehiculosReferenciaCacheada();
-          const encontrado = buscarVehiculoEnReferencia(resultadoCampo.valor, referencia);
-          if (encontrado) {
+          const candidatos = buscarVehiculosEnReferencia(resultadoCampo.valor, referencia);
+          if (candidatos.length === 1) {
+            const encontrado = candidatos[0];
             sesion.data.tecnologia = encontrado.tecnologia;
-            avisoVehiculo = `✅ Ese modelo ya está en nuestra base de vehículos que aplican (tecnología: ${encontrado.tecnologia}), así que no hace falta preguntarla.\n\n`;
+            sesion.data.vehiculo = `${encontrado.marca} ${encontrado.modelo}`;
+            avisoVehiculo = `✅ Ese modelo ya está en nuestra base de vehículos que aplican (tecnología: ${encontrado.tecnologia}). Lo dejamos anotado como "${sesion.data.vehiculo}" y no hace falta preguntar la tecnología.\n\n`;
+          } else if (candidatos.length > 1) {
+            sesion.pendienteDesambiguarVehiculo = { candidatos, textoOriginal: resultadoCampo.valor };
           } else {
             sesion.vehiculoSinListar = resultadoCampo.valor;
           }
@@ -1409,7 +1504,14 @@ app.post('/api/chat', async (req, res) => {
         // dato nuevo se va guardando de una vez, en vez de esperar a que se
         // complete todo el formulario.
         try {
-          const cambiosIncrementales = { [campo.id]: resultadoCampo.valor };
+          // Para vehículo guardamos sesion.data.vehiculo (no
+          // resultadoCampo.valor): si hubo un match único contra la base de
+          // referencia, ya quedó normalizado con el nombre completo y
+          // correcto de la línea (ver arriba); si no, es el mismo texto que
+          // escribió el asesor.
+          const cambiosIncrementales = {
+            [campo.id]: campo.id === 'vehiculo' ? sesion.data.vehiculo : resultadoCampo.valor,
+          };
           if (campo.id === 'tipo_identificacion' && resultadoCampo.valor) {
             cambiosIncrementales.tipo_cuenta = sesion.data.tipo_cuenta;
             if (sesion.data.cuenta !== undefined) cambiosIncrementales.cuenta = sesion.data.cuenta;
@@ -1426,6 +1528,20 @@ app.post('/api/chat', async (req, res) => {
           console.error(`Error actualizando el campo ${campo.id} en Supabase:`, dbError);
           // No bloqueamos el flujo si falla un guardado incremental.
         }
+      }
+
+      // Si el vehículo que escribió el asesor coincide igual contra varias
+      // líneas distintas de la base (ambiguo), no seguimos con las preguntas
+      // normales todavía: primero pedimos que confirme cuál es la
+      // referencia/línea exacta, para no adivinar y dejar un dato mal
+      // parametrizado.
+      if (sesion.pendienteDesambiguarVehiculo) {
+        const lista = sesion.pendienteDesambiguarVehiculo.candidatos
+          .map((c, i) => `${i + 1}. ${c.marca} ${c.modelo}`)
+          .join('\n');
+        return res.json({
+          reply: `${avisoDuplicado}${avisoGuardado}Encontramos varias versiones de ese vehículo en nuestra base y no queremos adivinar cuál es. ¿Cuál es la referencia/línea exacta?\n\n${lista}\n\nResponde con el número o escribe el nombre completo de la línea.`,
+        });
       }
 
       // Si NO se logró el contacto, le preguntamos al asesor si de una vez

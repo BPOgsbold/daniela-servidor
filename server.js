@@ -424,8 +424,16 @@ function construirPreguntaDesambiguarVehiculo(candidatos, asesor) {
   const lista = candidatos.map((c, i) => `${i + 1}. ${c.marca} ${c.modelo}`).join('\n');
   return (
     `${saludo}encontré varias versiones de ${marca}${modeloComun} que podrían ser — no quiero adivinar cuál le queda al cliente. ` +
-    `¿Cuál de estas es exactamente?\n\n${lista}\n\nResponde con el número o escribe el nombre completo de la línea.`
+    `¿Cuál de estas es exactamente?\n\n${lista}\n\nResponde con el número, o dale clic a "${ETIQUETA_SALTAR}" si no sabes cuál es exactamente.`
   );
+}
+
+// Botones para la pregunta de desambiguar vehículo: uno por cada línea
+// candidata (para poder responder con un clic) más la opción de saltar, para
+// cuando el asesor de verdad no sabe cuál es la referencia exacta — no debe
+// quedar bloqueado sin poder avanzar solo por no saber ese detalle.
+function opcionesDesambiguarVehiculo(candidatos) {
+  return [...candidatos.map((c) => `${c.marca} ${c.modelo}`), ETIQUETA_SALTAR];
 }
 
 const TIPO_IDENTIFICACION_MAP = {
@@ -1333,10 +1341,61 @@ app.post('/api/chat', async (req, res) => {
             },
             conocimiento
           );
-          return res.json({ reply: `${respuestaDuda}\n\n➡️ ${preguntaDesambiguar}` });
+          return res.json({
+            reply: `${respuestaDuda}\n\n➡️ ${preguntaDesambiguar}`,
+            opciones: opcionesDesambiguarVehiculo(candidatos),
+          });
         }
 
         const respuesta = (message || '').trim();
+
+        // El asesor no sabe cuál es la referencia/línea exacta — no lo
+        // dejamos bloqueado por eso. Seguimos igual que cuando el vehículo no
+        // se encuentra en la base: se pregunta la tecnología a mano y el
+        // vehículo queda registrado como "no listado" para revisión.
+        if (normalizarTexto(respuesta).trim() === normalizarTexto(ETIQUETA_SALTAR).trim()) {
+          sesion.vehiculoSinListar = sesion.pendienteDesambiguarVehiculo.textoOriginal;
+          sesion.pendienteDesambiguarVehiculo = null;
+          sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
+          if (sesion.stepIndex < campos.length) {
+            const siguienteTrasSaltar = campos[sesion.stepIndex];
+            return res.json(
+              conOpciones(
+                {
+                  reply: `De acuerdo, no hay problema — entonces cuéntame la tecnología a mano.\n\n${siguienteTrasSaltar.prompt}`,
+                },
+                siguienteTrasSaltar
+              )
+            );
+          }
+          // Caso raro: el vehículo era el último dato que faltaba.
+          if (!sesion.casoId) {
+            try {
+              const registro = await crearCaso(sessionId, asesor, sesion.data);
+              sesion.casoId = registro.id;
+            } catch (dbError) {
+              console.error('Error guardando el caso en Supabase:', dbError);
+              return res.json({
+                reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+                  campos,
+                  sesion.data
+                )}`,
+              });
+            }
+          }
+          try {
+            await actualizarCaso(sesion.casoId, { estado_pipeline: 'Interesado' });
+          } catch (dbError) {
+            console.error('Error actualizando estado_pipeline a Interesado:', dbError);
+          }
+          sesion.estado = 'negociacion';
+          sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
+          return res.json({
+            reply: `✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar alguno?`,
+            opciones: ['Están correctos', 'Modificar un dato'],
+          });
+        }
+
         let elegido = null;
 
         const numero = parseInt(respuesta, 10);
@@ -1354,6 +1413,7 @@ app.post('/api/chat', async (req, res) => {
         if (!elegido) {
           return res.json({
             reply: `⚠️ No logré identificar cuál de estas líneas es.\n\n${preguntaDesambiguar}`,
+            opciones: opcionesDesambiguarVehiculo(candidatos),
           });
         }
 
@@ -1601,6 +1661,7 @@ app.post('/api/chat', async (req, res) => {
         );
         return res.json({
           reply: `${avisoDuplicado}${avisoGuardado}${preguntaDesambiguarInicial}`,
+          opciones: opcionesDesambiguarVehiculo(sesion.pendienteDesambiguarVehiculo.candidatos),
         });
       }
 

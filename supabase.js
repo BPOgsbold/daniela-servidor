@@ -1,5 +1,11 @@
 const { createClient } = require('@supabase/supabase-js');
 
+// Nombre de la tabla de casos en Supabase. Si se vuelve a renombrar la
+// tabla desde el panel de Supabase, solo hay que actualizar este valor
+// (tiene que ser EXACTAMENTE igual a como aparece en Supabase, mayúsculas
+// y guiones bajos incluidos).
+const TABLA_CASOS = 'Perfilamiento_y_ventas_GLA';
+
 let client = null;
 function getClient() {
   if (!client) {
@@ -47,7 +53,7 @@ async function crearCaso(sessionId, asesor, datos) {
     estado_pipeline: datos.estado_pipeline || 'Interesado',
     datos,
   };
-  const { data, error } = await supabase.from('casos').insert(row).select().single();
+  const { data, error } = await supabase.from(TABLA_CASOS).insert(row).select().single();
   if (error) throw error;
   return data;
 }
@@ -59,7 +65,7 @@ async function crearCaso(sessionId, asesor, datos) {
 async function actualizarCaso(casoId, cambios) {
   const supabase = getClient();
   const { data, error } = await supabase
-    .from('casos')
+    .from(TABLA_CASOS)
     .update({ ...cambios, updated_at: new Date().toISOString() })
     .eq('id', casoId)
     .select()
@@ -171,7 +177,7 @@ async function buscarCasoPorTermino(termino, limite = 5) {
   // las palabras del término, para no perder coincidencias reales por el
   // orden o por nombres de en medio.
   const { data, error } = await supabase
-    .from('casos')
+    .from(TABLA_CASOS)
     .select('*')
     .or(filtros)
     .order('updated_at', { ascending: false, nullsFirst: false })

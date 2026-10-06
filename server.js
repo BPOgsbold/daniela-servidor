@@ -386,19 +386,75 @@ function buscarVehiculosEnReferencia(textoVehiculo, referencia) {
   return coincidenciasVehiculo(texto, referencia, false);
 }
 
+// Distancia de edición (Levenshtein) entre dos palabras — cuenta cuántas
+// letras hay que cambiar/agregar/quitar para pasar de una a la otra. Se usa
+// para tolerar errores de tipeo (ej. "porolla" en vez de "Corolla") sin
+// tener que escribir la palabra exacta.
+function distanciaLevenshtein(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const fila = new Array(n + 1);
+  for (let j = 0; j <= n; j++) fila[j] = j;
+  for (let i = 1; i <= m; i++) {
+    let anterior = fila[0];
+    fila[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const temp = fila[j];
+      const costo = a[i - 1] === b[j - 1] ? 0 : 1;
+      fila[j] = Math.min(fila[j] + 1, fila[j - 1] + 1, anterior + costo);
+      anterior = temp;
+    }
+  }
+  return fila[n];
+}
+
+// Cuántas letras de diferencia se toleran antes de considerar que dos
+// palabras ya no son "la misma, con un error de tipeo". Palabras muy cortas
+// (3 letras o menos, ej. "KIA", "MG") no toleran ningún error, para no
+// confundir marcas distintas que se parecen; palabras más largas toleran 1
+// o 2 letras de diferencia.
+function toleranciaTipeo(longitud) {
+  if (longitud <= 3) return 0;
+  if (longitud <= 7) return 1;
+  return 2;
+}
+
+// Compara una palabra de la referencia (ej. "COROLLA") contra todas las
+// palabras que escribió el asesor, aceptando tanto coincidencia exacta como
+// un error de tipeo pequeño (ej. "POROLLA" o "COROLA").
+function algunaPalabraCoincide(palabraReferencia, palabrasTexto) {
+  const tolerancia = toleranciaTipeo(palabraReferencia.length);
+  for (const palabraTexto of palabrasTexto) {
+    if (palabraTexto === palabraReferencia) return true;
+    if (tolerancia === 0) continue;
+    // Si la diferencia de longitud ya supera la tolerancia, ni vale la pena
+    // calcular la distancia completa.
+    if (Math.abs(palabraTexto.length - palabraReferencia.length) > tolerancia) continue;
+    if (distanciaLevenshtein(palabraTexto, palabraReferencia) <= tolerancia) return true;
+  }
+  return false;
+}
+
 function coincidenciasVehiculo(texto, referencia, exigirMarca) {
+  const palabrasTexto = texto.split(' ').filter(Boolean);
   let mejores = [];
   let mejorCoincidencias = 0;
   for (const v of referencia) {
     if (exigirMarca) {
       const marcaNorm = normalizarParaComparar(v.marca);
-      if (!marcaNorm || !texto.includes(marcaNorm)) continue;
+      if (!marcaNorm) continue;
+      const marcaCoincide = texto.includes(marcaNorm) || algunaPalabraCoincide(marcaNorm, palabrasTexto);
+      if (!marcaCoincide) continue;
     }
     const palabrasModelo = normalizarParaComparar(v.modelo)
       .split(' ')
       .filter((p) => p.length >= 3);
     if (palabrasModelo.length === 0) continue;
-    const coincidencias = palabrasModelo.filter((p) => texto.includes(p)).length;
+    const coincidencias = palabrasModelo.filter(
+      (p) => texto.includes(p) || algunaPalabraCoincide(p, palabrasTexto)
+    ).length;
     if (coincidencias === 0) continue;
     if (coincidencias > mejorCoincidencias) {
       mejorCoincidencias = coincidencias;
@@ -1863,7 +1919,8 @@ app.post('/api/chat', async (req, res) => {
     // acepta todo), una detrás de otra, una vez el caso ya tiene todos sus
     // datos. Cada una es un gate Sí/No: si es "No", pide el motivo con
     // botones y luego pregunta si cerrar la interacción; si cierra, marca el
-    // caso como "Cierre perdido". Si es "Sí", sigue con la siguiente
+    // caso como "Cierre perdido" (salvo el gate negociacion: Lo pensará etc.
+    // deja el caso en "Negociación", no perdido). Si es "Sí", sigue con la siguiente
     // pregunta (la última, "Cliente acepta todo", en vez de eso pide el
     // siguiente paso).
     if (sesion.estado === 'negociacion' && sesion.negociacion) {
@@ -2022,10 +2079,22 @@ app.post('/api/chat', async (req, res) => {
             // cualquiera de las 3 preguntas de negociación, el caso ya queda
             // como "Cierre perdido" — sin esperar a que además confirmen
             // que quieren cerrar la interacción ahora mismo.
-            await actualizarCaso(sesion.casoId, { [gate.motivoCampo]: motivo, estado_pipeline: 'Cierre perdido' });
+            // OJO: "Lo pensará / Pide volver a llamar / Va a consultar un
+            // tercero" (gate negociacion) NO es una pérdida: el cliente sigue
+            // en la fase Negociación. Solo se marca Cierre perdido en los
+            // gates interes y acepta.
+            const campos = { [gate.motivoCampo]: motivo };
+            campos.estado_pipeline = gate.id === 'negociacion' ? 'Negociación' : 'Cierre perdido';
+            await actualizarCaso(sesion.casoId, campos);
           } catch (dbError) {
             console.error(`Error guardando ${gate.motivoCampo} en Supabase:`, dbError);
           }
+        }
+        if (gate.id === 'negociacion') {
+          // No se pregunta por cerrar: el caso sigue vivo en Interesado.
+          sesion.estado = 'caso_abierto';
+          sesion.negociacion = null;
+          return res.json({ reply: `Listo, el cliente sigue en "Negociación" (${motivo}). No se marca como perdido; seguimos gestionando este caso.` });
         }
         neg.sub = 'cierre';
         return res.json({ reply: '¿Quieres cerrar la interacción con este cliente?', opciones: ['Sí', 'No'] });

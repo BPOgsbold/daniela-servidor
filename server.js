@@ -16,7 +16,7 @@ const {
   guardarVehiculoNoListado,
 } = require('./supabase');
 
-const { TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento } = require('./sharepoint');
+const { TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento, moverACliente, esClienteDefinitivo } = require('./sharepoint');
 
 const app = express();
 app.use(cors());
@@ -958,6 +958,47 @@ app.get('/api/conocimiento', async (req, res) => {
   }
 });
 
+// Cuando un caso pasa a "Cliente", su carpeta de SharePoint se mueve de
+// "00. En proceso" a su lugar definitivo. Es de mejor esfuerzo: si falla, no
+// interrumpe a la asesora (se reintenta al sincronizar o al adjuntar algo).
+async function moverCarpetaSiCliente(casoId) {
+  try {
+    if (!sharepointConfigurado() || !casoId) return;
+    const { createClient } = require('@supabase/supabase-js');
+    const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+    const { data } = await sb.from('Perfilamiento_y_ventas_GLA').select('*').eq('id', casoId).maybeSingle();
+    if (data && esClienteDefinitivo(data) && data.numero_identificacion && data.nombre_cliente) {
+      await moverACliente(String(data.numero_identificacion).trim(), String(data.nombre_cliente).trim());
+    }
+  } catch (e) {
+    console.error('No se pudo mover la carpeta de SharePoint:', e.message);
+  }
+}
+
+// Mueve de una vez las carpetas de TODOS los clientes ya cerrados (lo usa el
+// botón "Sincronizar carpetas" del panel). Es seguro repetirlo.
+app.post('/api/sincronizar-carpetas', async (req, res) => {
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    const { createClient } = require('@supabase/supabase-js');
+    const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+    const { data, error } = await sb.from('Perfilamiento_y_ventas_GLA').select('*').eq('estado_pipeline', 'Cliente').limit(500);
+    if (error) throw error;
+    const clientes = (data || []).filter((c) => esClienteDefinitivo(c) && c.numero_identificacion && c.nombre_cliente);
+    let movidas = 0, sinCarpeta = 0, errores = 0;
+    for (const c of clientes) {
+      try {
+        const r = await moverACliente(String(c.numero_identificacion).trim(), String(c.nombre_cliente).trim());
+        if (r.movida) movidas++; else sinCarpeta++;
+      } catch (e) { errores++; console.error('Sincronizar carpeta:', c.nombre_cliente, e.message); }
+    }
+    res.json({ ok: true, clientes: clientes.length, movidas, sinCarpeta, errores });
+  } catch (err) {
+    console.error('Error sincronizando carpetas:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
 // --- Adjuntar documentos del cliente (cédula, factura de compra, RUT,
 // certificado UPME, soporte de pago) → carpeta "cédula - nombre" en SharePoint.
 app.post('/api/adjuntar', async (req, res) => {
@@ -974,7 +1015,7 @@ app.post('/api/adjuntar', async (req, res) => {
       try {
         const lista = await buscarCasoPorTermino(String(datos.numero_identificacion || datos.nombre_cliente || ''));
         const caso = Array.isArray(lista) ? lista.find((c) => String(c.id) === String(sesion.casoId)) : null;
-        if (caso) datos = { ...caso, ...datos };
+        if (caso) datos = { ...caso, ...datos, estado_pipeline: caso.estado_pipeline, siguiente_paso: caso.siguiente_paso };
       } catch (e) { /* si falla, seguimos con lo de la sesión */ }
     }
     const cedula = String(datos.numero_identificacion || '').trim();
@@ -987,7 +1028,7 @@ app.post('/api/adjuntar', async (req, res) => {
     }
     const buffer = Buffer.from(base64, 'base64');
     if (buffer.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'El archivo pesa más de 25 MB.' });
-    const r = await subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer });
+    const r = await subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer, esCliente: esClienteDefinitivo(datos) });
     res.json({
       ok: true,
       reply: `📎 Listo, guardé "${TIPOS_DOC[tipo]}" de ${nombre} en SharePoint, carpeta "${r.carpeta}".`,
@@ -1233,6 +1274,7 @@ app.post('/api/chat', async (req, res) => {
 
       try {
         await actualizarCaso(casoObjetivo.id, { estado_pipeline: cambio.estadoLabel });
+        if (cambio.estadoLabel === 'Cliente') moverCarpetaSiCliente(casoObjetivo.id);
       } catch (dbError) {
         console.error('Error actualizando el estado del pipeline:', dbError);
         return res.json({
@@ -2210,6 +2252,7 @@ app.post('/api/chat', async (req, res) => {
             // caso solo como "Cliente" (documentos, firma y pago listos).
             if (match === 'Proceso completado') cambiosPaso.estado_pipeline = 'Cliente';
             await actualizarCaso(sesion.casoId, cambiosPaso);
+            if (match === 'Proceso completado') moverCarpetaSiCliente(sesion.casoId);
           } catch (dbError) {
             console.error('Error guardando el siguiente paso en Supabase:', dbError);
           }

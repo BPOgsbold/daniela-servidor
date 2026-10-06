@@ -62,16 +62,71 @@ function nombreCarpeta(cedula, nombre) {
   return limpiar(`${cedula} - ${nombre}`).slice(0, 120);
 }
 
-// Sube el archivo a Clientes/<cedula - nombre>/<Tipo>.<ext>. Crea la carpeta
-// si no existe y, si ya hay un archivo con ese nombre, no lo pisa (renombra).
-async function subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer }) {
+const PENDIENTES = ['Pendiente de contrato', 'Pendiente de firma', 'Pendiente de pago'];
+// Un caso es "Cliente" (carpeta definitiva) cuando su estado es Cliente y ya
+// no tiene nada pendiente (igual que el embudo del panel).
+function esClienteDefinitivo(caso) {
+  return !!caso && caso.estado_pipeline === 'Cliente' && !PENDIENTES.includes(caso.siguiente_paso);
+}
+
+const rutaBase = () => limpiar(process.env.SHAREPOINT_BASE_FOLDER || 'Clientes');
+const rutaProspectos = () => limpiar(process.env.SHAREPOINT_PROSPECTOS_FOLDER || '00. En proceso');
+
+async function obtenerItem(siteId, ruta) {
+  try {
+    return await graph(`/sites/${siteId}/drive/root:/${ruta.split('/').map(encodeURIComponent).join('/')}`);
+  } catch (e) {
+    if (/404|itemNotFound/i.test(e.message)) return null;
+    throw e;
+  }
+}
+
+// Mueve la carpeta de un prospecto (Clientes/00. En proceso/<cédula - nombre>)
+// a su lugar definitivo (Clientes/<cédula - nombre>). No borra archivos: si la
+// carpeta definitiva ya existe, pasa los archivos uno a uno (sin pisar) y solo
+// borra la carpeta vieja si quedó vacía.
+async function moverACliente(cedula, nombre) {
   const siteId = await obtenerSite();
-  const base = limpiar(process.env.SHAREPOINT_BASE_FOLDER || 'Clientes');
   const carpeta = nombreCarpeta(cedula, nombre);
+  const origen = await obtenerItem(siteId, `${rutaBase()}/${rutaProspectos()}/${carpeta}`);
+  if (!origen) return { movida: false, motivo: 'no tenía carpeta en proceso' };
+  const base = await obtenerItem(siteId, rutaBase());
+  if (!base) throw new Error('No encuentro la carpeta base en SharePoint.');
+  const destino = await obtenerItem(siteId, `${rutaBase()}/${carpeta}`);
+  const patch = (id, parentId) => graph(`/sites/${siteId}/drive/items/${id}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parentReference: { id: parentId }, '@microsoft.graph.conflictBehavior': 'rename' }),
+  });
+  if (!destino) {
+    await patch(origen.id, base.id);
+    return { movida: true, modo: 'carpeta completa' };
+  }
+  const hijos = await graph(`/sites/${siteId}/drive/items/${origen.id}/children?$top=200`);
+  for (const h of hijos.value || []) await patch(h.id, destino.id);
+  const quedan = await graph(`/sites/${siteId}/drive/items/${origen.id}/children?$top=1`);
+  if (!(quedan.value || []).length) {
+    await graph(`/sites/${siteId}/drive/items/${origen.id}`, { method: 'DELETE' });
+  }
+  return { movida: true, modo: 'archivos combinados' };
+}
+
+// Sube el archivo. Prospectos: Clientes/00. En proceso/<cédula - nombre>/.
+// Clientes definitivos: Clientes/<cédula - nombre>/ (y, si todavía tenía su
+// carpeta en proceso, primero se mueve). Si ya hay un archivo con ese nombre
+// no lo pisa (renombra).
+async function subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer, esCliente }) {
+  const siteId = await obtenerSite();
+  const base = rutaBase();
+  const carpeta = nombreCarpeta(cedula, nombre);
+  if (esCliente) {
+    try { await moverACliente(cedula, nombre); } catch (e) { console.error('No se pudo mover la carpeta a Cliente:', e.message); }
+  }
+  const rutaCarpeta = esCliente ? `${base}/${carpeta}` : `${base}/${rutaProspectos()}/${carpeta}`;
   const ext = (String(nombreArchivo || '').match(/\.[A-Za-z0-9]{1,6}$/) || [''])[0].toLowerCase();
   const fecha = new Date().toISOString().slice(0, 10);
   const archivo = `${TIPOS_DOC[tipo]} ${fecha}${ext}`;
-  const ruta = `/sites/${siteId}/drive/root:/${encodeURI(base)}/${encodeURI(carpeta)}/${encodeURI(archivo)}`;
+  const enc = (t) => t.split('/').map(encodeURIComponent).join('/');
+  const ruta = `/sites/${siteId}/drive/root:/${enc(rutaCarpeta)}/${encodeURIComponent(archivo)}`;
   let item;
   if (buffer.length <= 3.5 * 1024 * 1024) {
     item = await graph(`${ruta}:/content?@microsoft.graph.conflictBehavior=rename`, {
@@ -90,13 +145,12 @@ async function subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer }) {
     if (!r.ok) throw new Error('No se pudo subir el archivo grande: ' + r.status);
     item = await r.json();
   }
-  // Enlace a la carpeta del cliente
   let linkCarpeta = null;
   try {
-    const c = await graph(`/sites/${siteId}/drive/root:/${encodeURI(base)}/${encodeURI(carpeta)}`);
-    linkCarpeta = c.webUrl;
+    const c = await obtenerItem(siteId, rutaCarpeta);
+    linkCarpeta = c && c.webUrl;
   } catch (e) {}
-  return { carpeta, archivo: item.name || archivo, linkArchivo: item.webUrl, linkCarpeta };
+  return { carpeta: esCliente ? carpeta : `${rutaProspectos()}/${carpeta}`, archivo: item.name || archivo, linkArchivo: item.webUrl, linkCarpeta };
 }
 
-module.exports = { TIPOS_DOC, configurado, subirDocumento, nombreCarpeta };
+module.exports = { TIPOS_DOC, configurado, subirDocumento, nombreCarpeta, moverACliente, esClienteDefinitivo };

@@ -16,8 +16,12 @@ const {
   guardarVehiculoNoListado,
 } = require('./supabase');
 
+const { TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento } = require('./sharepoint');
+
 const app = express();
 app.use(cors());
+// Los documentos adjuntos llegan en base64: este endpoint admite hasta ~25mb.
+app.use('/api/adjuntar', express.json({ limit: '35mb' }));
 // Límite subido de 100kb (default de Express) a 2mb: una entrada de
 // conocimiento larga (ej. un Excel convertido a texto) puede pesar más de
 // 100kb y Express la rechazaría con un error 413 antes de llegar a la
@@ -951,6 +955,47 @@ app.get('/api/conocimiento', async (req, res) => {
   } catch (err) {
     console.error('Error listando conocimiento:', err);
     res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+// --- Adjuntar documentos del cliente (cédula, factura de compra, RUT,
+// certificado UPME, soporte de pago) → carpeta "cédula - nombre" en SharePoint.
+app.post('/api/adjuntar', async (req, res) => {
+  try {
+    const { sessionId, tipo, nombreArchivo, base64 } = req.body || {};
+    if (!TIPOS_DOC[tipo]) return res.status(400).json({ error: 'Tipo de documento no válido.' });
+    if (!base64) return res.status(400).json({ error: 'No llegó el archivo.' });
+    if (!sharepointConfigurado()) {
+      return res.status(503).json({ error: 'SharePoint todavía no está configurado en el servidor (faltan las variables de Microsoft).' });
+    }
+    const sesion = sesiones.get(sessionId);
+    let datos = (sesion && sesion.data) || {};
+    if (sesion && sesion.casoId) {
+      try {
+        const lista = await buscarCasoPorTermino(String(datos.numero_identificacion || datos.nombre_cliente || ''));
+        const caso = Array.isArray(lista) ? lista.find((c) => String(c.id) === String(sesion.casoId)) : null;
+        if (caso) datos = { ...caso, ...datos };
+      } catch (e) { /* si falla, seguimos con lo de la sesión */ }
+    }
+    const cedula = String(datos.numero_identificacion || '').trim();
+    const nombre = String(datos.nombre_cliente || '').trim();
+    if (!cedula || !nombre) {
+      return res.status(400).json({ error: 'Primero necesito el nombre y la cédula del cliente para crear su carpeta. Termina de registrarlos y vuelve a adjuntar.' });
+    }
+    if (tipo === 'certificado_upme' && datos.tiene_certificado_upme && datos.tiene_certificado_upme !== 'Sí tiene certificado') {
+      return res.status(400).json({ error: 'Este cliente no está registrado con certificado UPME.' });
+    }
+    const buffer = Buffer.from(base64, 'base64');
+    if (buffer.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'El archivo pesa más de 25 MB.' });
+    const r = await subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer });
+    res.json({
+      ok: true,
+      reply: `📎 Listo, guardé "${TIPOS_DOC[tipo]}" de ${nombre} en SharePoint, carpeta "${r.carpeta}".`,
+      link: r.linkCarpeta || r.linkArchivo || null,
+    });
+  } catch (err) {
+    console.error('Error adjuntando a SharePoint:', err);
+    res.status(500).json({ error: 'No pude guardar el archivo en SharePoint. ' + (err.message || '') });
   }
 });
 

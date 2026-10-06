@@ -9,6 +9,8 @@ const TIPOS_DOC = {
   rut: 'RUT',
   certificado_upme: 'Certificado UPME',
   soporte_pago: 'Soporte de pago',
+  certificacion_bancaria: 'Certificación bancaria',
+  contrato: 'Contrato',
 };
 
 let tokenCache = { valor: null, vence: 0 };

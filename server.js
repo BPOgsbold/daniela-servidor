@@ -2574,6 +2574,122 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
+
+// ============ Usuarios y perfiles del panel (solo el perfil "admin") ============
+// Un solo link para todos: cada correo tiene un perfil en la tabla panel_roles
+// (admin = todo + crear usuarios, bo = back office, hace todo, cliente = solo
+// Embudo y Seguimiento sin mover nada). Estas rutas crean/cambian usuarios con la llave de
+// servicio de Supabase, pero SOLO si quien llama es un admin con sesión válida.
+const PERFILES_VALIDOS = ['admin', 'bo', 'cliente'];
+
+function sbServicio() {
+  const { createClient } = require('@supabase/supabase-js');
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  });
+}
+
+async function exigirAdmin(req, res) {
+  try {
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    if (!token) { res.status(401).json({ error: 'Falta iniciar sesión' }); return null; }
+    const sb = sbServicio();
+    const { data, error } = await sb.auth.getUser(token);
+    if (error || !data || !data.user || !data.user.email) { res.status(401).json({ error: 'Sesión no válida' }); return null; }
+    const email = data.user.email.toLowerCase();
+    const { data: fila } = await sb.from('panel_roles').select('rol, activo').ilike('email', email).maybeSingle();
+    if (!fila || fila.rol !== 'admin' || fila.activo === false) { res.status(403).json({ error: 'Solo un administrador puede hacer esto' }); return null; }
+    return { sb, email };
+  } catch (err) {
+    console.error('exigirAdmin:', err);
+    res.status(500).json({ error: 'No se pudo validar el usuario' });
+    return null;
+  }
+}
+
+async function buscarUsuarioAuth(sb, email) {
+  for (let pagina = 1; pagina <= 20; pagina++) {
+    const { data, error } = await sb.auth.admin.listUsers({ page: pagina, perPage: 200 });
+    if (error) throw error;
+    const u = (data.users || []).find((x) => (x.email || '').toLowerCase() === email);
+    if (u) return u;
+    if (!data.users || data.users.length < 200) break;
+  }
+  return null;
+}
+
+app.get('/api/usuarios', async (req, res) => {
+  const ctx = await exigirAdmin(req, res); if (!ctx) return;
+  const { data, error } = await ctx.sb.from('panel_roles').select('email, rol, nombre, activo, creado_en').order('email');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ usuarios: data || [], yo: ctx.email });
+});
+
+// Crear usuario (o, si el correo ya existe en Supabase, solo asignarle perfil)
+app.post('/api/usuarios', async (req, res) => {
+  const ctx = await exigirAdmin(req, res); if (!ctx) return;
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const clave = String(req.body.clave || '');
+    const rol = String(req.body.rol || '').trim();
+    const nombre = String(req.body.nombre || '').trim() || null;
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Correo no válido' });
+    if (!PERFILES_VALIDOS.includes(rol)) return res.status(400).json({ error: 'Perfil no válido' });
+    let existente = await buscarUsuarioAuth(ctx.sb, email);
+    let creado = false;
+    if (!existente) {
+      if (clave.length < 8) return res.status(400).json({ error: 'La contraseña debe tener mínimo 8 caracteres' });
+      const { error } = await ctx.sb.auth.admin.createUser({ email, password: clave, email_confirm: true });
+      if (error) return res.status(400).json({ error: error.message });
+      creado = true;
+    }
+    const { error: e2 } = await ctx.sb.from('panel_roles').upsert({ email, rol, nombre, activo: true }, { onConflict: 'email' });
+    if (e2) return res.status(500).json({ error: e2.message });
+    res.json({ ok: true, creado });
+  } catch (err) {
+    console.error('crear usuario:', err);
+    res.status(500).json({ error: err.message || 'No se pudo crear el usuario' });
+  }
+});
+
+// Cambiar perfil, nombre, activar/desactivar o poner nueva contraseña
+app.patch('/api/usuarios', async (req, res) => {
+  const ctx = await exigirAdmin(req, res); if (!ctx) return;
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Falta el correo' });
+    const cambios = {};
+    if (req.body.rol !== undefined) {
+      if (!PERFILES_VALIDOS.includes(req.body.rol)) return res.status(400).json({ error: 'Perfil no válido' });
+      cambios.rol = req.body.rol;
+    }
+    if (req.body.nombre !== undefined) cambios.nombre = String(req.body.nombre || '').trim() || null;
+    if (req.body.activo !== undefined) cambios.activo = !!req.body.activo;
+    if (email === ctx.email && ((cambios.rol && cambios.rol !== 'admin') || cambios.activo === false)) {
+      return res.status(400).json({ error: 'No puedes quitarte el perfil admin ni desactivarte a ti mismo' });
+    }
+    if (Object.keys(cambios).length) {
+      const { error } = await ctx.sb.from('panel_roles').update(cambios).ilike('email', email);
+      if (error) return res.status(500).json({ error: error.message });
+    }
+    const u = (cambios.activo !== undefined || req.body.clave) ? await buscarUsuarioAuth(ctx.sb, email) : null;
+    if (cambios.activo !== undefined && u) {
+      const { error } = await ctx.sb.auth.admin.updateUserById(u.id, { ban_duration: cambios.activo ? 'none' : '876000h' });
+      if (error) return res.status(500).json({ error: error.message });
+    }
+    if (req.body.clave) {
+      if (String(req.body.clave).length < 8) return res.status(400).json({ error: 'La contraseña debe tener mínimo 8 caracteres' });
+      if (!u) return res.status(404).json({ error: 'Ese correo no existe en Supabase' });
+      const { error } = await ctx.sb.auth.admin.updateUserById(u.id, { password: String(req.body.clave) });
+      if (error) return res.status(500).json({ error: error.message });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('editar usuario:', err);
+    res.status(500).json({ error: err.message || 'No se pudo actualizar' });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`Servidor de Daniela (Gómez Legal Abogados) escuchando en http://localhost:${PORT}`);
 });

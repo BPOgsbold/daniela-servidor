@@ -45,35 +45,134 @@ const sesiones = new Map();
 // Se guarda en Supabase (tabla `conocimiento`) para que sobreviva reinicios
 // del servidor, y se mantiene en memoria (con una actualización cada vez que
 // se agrega algo nuevo) para no consultar la base de datos en cada mensaje.
-let conocimientoCacheTexto = '';
-let conocimientoCacheAt = 0;
+// Conocimiento con BÚSQUEDA: en vez de pasarle a Claude TODO lo enseñado en
+// cada duda, se indexa en trozos y solo se envían los que se parecen a la
+// pregunta. Lo corto que se enseña a mano ("principios", avisos) se sigue
+// enviando siempre, como antes; lo largo o cargado en lote (la guía) se busca.
+let conocimientoCache = { siempre: [], trozos: [], idf: new Map(), at: 0 };
 const CONOCIMIENTO_TTL_MS = 60 * 1000;
+const MAX_SIEMPRE = 20;          // entradas manuales cortas que siempre van
+const MAX_TROZOS_RESPUESTA = 6;  // trozos de la guía que se envían por duda
+const MAX_CARACTERES_BUSQUEDA = 12000;
+const UMBRAL_LARGO = 4000;       // desde aquí una entrada manual se busca en vez de enviarse completa
+const TAM_TROZO = 1800;
+
+const STOP = new Set(('de la el los las un una unos unas y o u e a al del en con por para que se su sus lo le les me mi mis te tu tus es son ser fue era soy eres este esta estos estas ese esa esos esas eso esto como mas pero si no ya muy hay han ha he tiene tienen tengo puede pueden quiero cual cuales cuando donde quien quienes cuanto cuantos cuanta cuantas sobre entre desde hasta tambien solo sin ni nos ante bajo cada otro otra otros otras alguno alguna algun todo toda todos todas'.split(' ')));
+
+function tokensBusqueda(t) {
+  return String(t || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9ñ ]+/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !STOP.has(w))
+    .map((w) => (w.length > 6 ? w.slice(0, 6) : w.replace(/(es|s)$/, '')));
+}
+
+function trocearTexto(texto, tam = TAM_TROZO) {
+  const bloques = String(texto).split(/\n{2,}/);
+  const trozos = [];
+  let actual = '';
+  for (const b of bloques) {
+    if (actual && (actual.length + b.length + 2) > tam) { trozos.push(actual); actual = ''; }
+    actual += (actual ? '\n\n' : '') + b;
+    while (actual.length > tam * 1.6) { trozos.push(actual.slice(0, tam)); actual = actual.slice(tam); }
+  }
+  if (actual.trim()) trozos.push(actual);
+  return trozos;
+}
+
+function esDeBusqueda(e) {
+  const autor = String(e.agregado_por || '');
+  if (/^principios/i.test(autor)) return false;           // siempre se envían
+  return /^gu[ií]a/i.test(autor) || String(e.texto || '').length > UMBRAL_LARGO;
+}
+
+function etiquetaEntrada(e) {
+  const fecha = e.created_at ? new Date(e.created_at).toLocaleDateString('es-CO') : '';
+  return [e.titulo, e.agregado_por, fecha].filter(Boolean).join(' · ');
+}
 
 function formatearConocimiento(entradas) {
   if (!entradas || entradas.length === 0) return '';
   return entradas
     .map((e) => {
-      const fecha = e.created_at ? new Date(e.created_at).toLocaleDateString('es-CO') : '';
-      const encabezado = [e.titulo, e.agregado_por, fecha].filter(Boolean).join(' · ');
+      const encabezado = etiquetaEntrada(e);
       return encabezado ? `### ${encabezado}\n${e.texto}` : e.texto;
     })
     .join('\n\n');
 }
 
-async function obtenerConocimientoTexto(forzar = false) {
-  const ahora = Date.now();
-  if (!forzar && ahora - conocimientoCacheAt < CONOCIMIENTO_TTL_MS) {
-    return conocimientoCacheTexto;
+async function cargarConocimientoCache() {
+  const { createClient } = require('@supabase/supabase-js');
+  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  const { data, error } = await sb
+    .from('conocimiento')
+    .select('id, titulo, texto, agregado_por, created_at')
+    .eq('activo', true)
+    .order('created_at', { ascending: false })
+    .limit(3000);
+  if (error) throw error;
+  const siempre = [];
+  const trozos = [];
+  for (const e of data || []) {
+    if (!esDeBusqueda(e)) { if (siempre.length < MAX_SIEMPRE) siempre.push(e); continue; }
+    const titulo = e.titulo || '';
+    trocearTexto(e.texto).forEach((t, i, arr) => {
+      const tk = tokensBusqueda(titulo + ' ' + titulo + ' ' + titulo + ' ' + t); // el título pesa x3
+      const tf = new Map();
+      tk.forEach((w) => tf.set(w, (tf.get(w) || 0) + 1));
+      trozos.push({ titulo: titulo + (arr.length > 1 ? ` (parte ${i + 1})` : ''), texto: t, tf, autor: e.agregado_por, created_at: e.created_at });
+    });
   }
-  try {
-    const entradas = await obtenerConocimientoReciente(30);
-    conocimientoCacheTexto = formatearConocimiento(entradas);
-    conocimientoCacheAt = ahora;
-  } catch (err) {
-    console.error('No se pudo cargar el conocimiento adicional:', err.message);
-    // Si falla, seguimos con lo último que teníamos en caché en vez de tumbar el chat.
+  const df = new Map();
+  trozos.forEach((t) => t.tf.forEach((_, w) => df.set(w, (df.get(w) || 0) + 1)));
+  const N = Math.max(trozos.length, 1);
+  const idf = new Map();
+  df.forEach((n, w) => idf.set(w, Math.log(1 + N / n)));
+  conocimientoCache = { siempre, trozos, idf, at: Date.now() };
+}
+
+// Devuelve el texto de conocimiento para esta duda: lo "siempre" + los trozos
+// de la guía más parecidos a la pregunta. Sin pregunta, solo lo "siempre".
+async function obtenerConocimientoTexto(pregunta = '', forzar = false) {
+  if (typeof pregunta === 'boolean') { forzar = pregunta; pregunta = ''; }
+  if (forzar || Date.now() - conocimientoCache.at > CONOCIMIENTO_TTL_MS) {
+    try {
+      await cargarConocimientoCache();
+    } catch (err) {
+      console.error('No se pudo cargar el conocimiento adicional:', err.message);
+      // seguimos con lo último que había en caché
+    }
   }
-  return conocimientoCacheTexto;
+  const { siempre, trozos, idf } = conocimientoCache;
+  let texto = formatearConocimiento(siempre);
+  const q = [...new Set(tokensBusqueda(pregunta))];
+  if (q.length && trozos.length) {
+    const puntuados = trozos
+      .map((t) => {
+        let sc = 0;
+        for (const w of q) { const f = t.tf.get(w); if (f) sc += (idf.get(w) || 0) * (1 + Math.log(f)); }
+        return { t, sc };
+      })
+      .filter((x) => x.sc > 0)
+      .sort((a, b) => b.sc - a.sc);
+    if (puntuados.length) {
+      const corte = puntuados[0].sc * 0.4;
+      let total = 0;
+      const elegidos = [];
+      for (const { t, sc } of puntuados) {
+        if (elegidos.length >= MAX_TROZOS_RESPUESTA || sc < corte) break;
+        if (total + t.texto.length > MAX_CARACTERES_BUSQUEDA) break;
+        elegidos.push(t); total += t.texto.length;
+      }
+      if (elegidos.length) {
+        const bloque = elegidos.map((t) => `### ${t.titulo}${t.autor ? ' · ' + t.autor : ''}\n${t.texto}`).join('\n\n');
+        texto += (texto ? '\n\n' : '') + '## Respuestas de la guía más parecidas a la pregunta\n' + bloque;
+      }
+    }
+  }
+  return texto;
 }
 
 function nuevaSesion() {
@@ -939,10 +1038,45 @@ app.post('/api/conocimiento', async (req, res) => {
       });
     }
     const registro = await guardarConocimiento(titulo, texto.trim(), agregadoPor);
-    await obtenerConocimientoTexto(true); // refresca el caché de una vez
+    await obtenerConocimientoTexto('', true); // refresca el caché de una vez
     res.json({ ok: true, id: registro.id });
   } catch (err) {
     console.error('Error guardando conocimiento:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+// --- Carga en lote (ej. la guía de respuestas partida en ~78 entradas) ---
+// Body: { entradas: [{titulo, texto}], agregadoPor: 'Guía V4', reemplazar: true }
+// Con reemplazar=true se desactivan las entradas anteriores del mismo
+// "agregadoPor", así se puede volver a cargar la guía sin duplicarla.
+app.use('/api/conocimiento/lote', express.json({ limit: '10mb' }));
+app.post('/api/conocimiento/lote', async (req, res) => {
+  try {
+    const { entradas, agregadoPor, reemplazar } = req.body || {};
+    if (!Array.isArray(entradas) || entradas.length === 0) {
+      return res.status(400).json({ error: 'Faltan las entradas a cargar' });
+    }
+    if (entradas.length > 1000) return res.status(400).json({ error: 'Máximo 1.000 entradas por lote' });
+    const autor = (agregadoPor || '').toString().trim() || null;
+    const filas = entradas
+      .filter((e) => e && e.texto && String(e.texto).trim())
+      .map((e) => ({ titulo: e.titulo ? String(e.titulo).slice(0, 200) : null, texto: String(e.texto).trim(), agregado_por: autor, activo: true }));
+    if (filas.length === 0) return res.status(400).json({ error: 'Ninguna entrada tiene texto' });
+    const { createClient } = require('@supabase/supabase-js');
+    const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+    let desactivadas = 0;
+    if (reemplazar && autor) {
+      const { data: prev, error: e1 } = await sb.from('conocimiento').update({ activo: false }).eq('agregado_por', autor).eq('activo', true).select('id');
+      if (e1) throw e1;
+      desactivadas = (prev || []).length;
+    }
+    const { error: e2 } = await sb.from('conocimiento').insert(filas);
+    if (e2) throw e2;
+    await obtenerConocimientoTexto('', true);
+    res.json({ ok: true, cargadas: filas.length, desactivadas });
+  } catch (err) {
+    console.error('Error cargando conocimiento en lote:', err);
     res.status(500).json({ error: err.message || 'Error interno' });
   }
 });
@@ -951,7 +1085,7 @@ app.post('/api/conocimiento', async (req, res) => {
 app.get('/api/conocimiento', async (req, res) => {
   try {
     const entradas = await obtenerConocimientoReciente(50);
-    res.json({ entradas });
+    res.json({ entradas, buscables: conocimientoCache.trozos.length, siempre: conocimientoCache.siempre.length });
   } catch (err) {
     console.error('Error listando conocimiento:', err);
     res.status(500).json({ error: err.message || 'Error interno' });
@@ -1172,7 +1306,7 @@ app.post('/api/chat', async (req, res) => {
 
       const esDuda = pareceDuda(message);
       if (esDuda) {
-        const conocimiento = await obtenerConocimientoTexto();
+        const conocimiento = await obtenerConocimientoTexto(message);
         const respuesta = await responderAyuda(
           SOP_TEXT,
           OBJECIONES_TEXT,
@@ -1480,7 +1614,7 @@ app.post('/api/chat', async (req, res) => {
         // pregunta pendiente — no lo dejamos "atascado" teniendo que elegir
         // una línea antes de poder preguntar algo.
         if (pareceDuda(message)) {
-          const conocimiento = await obtenerConocimientoTexto();
+          const conocimiento = await obtenerConocimientoTexto(message);
           const respuestaDuda = await responderAyuda(
             SOP_TEXT,
             OBJECIONES_TEXT,
@@ -1640,7 +1774,7 @@ app.post('/api/chat', async (req, res) => {
       // referencia, igual que la primera vez que se captura el vehículo.
       if (sesion.pendienteReferenciaVehiculo) {
         if (pareceDuda(message)) {
-          const conocimiento = await obtenerConocimientoTexto();
+          const conocimiento = await obtenerConocimientoTexto(message);
           const respuestaDuda = await responderAyuda(
             SOP_TEXT,
             OBJECIONES_TEXT,
@@ -1761,7 +1895,7 @@ app.post('/api/chat', async (req, res) => {
 
       const esDuda = pareceDuda(message);
       if (esDuda) {
-        const conocimiento = await obtenerConocimientoTexto();
+        const conocimiento = await obtenerConocimientoTexto(message);
         const respuesta = await responderAyuda(
           SOP_TEXT,
           OBJECIONES_TEXT,
@@ -2345,7 +2479,7 @@ app.post('/api/chat', async (req, res) => {
 
       const esDuda = pareceDuda(message);
       if (esDuda) {
-        const conocimiento = await obtenerConocimientoTexto();
+        const conocimiento = await obtenerConocimientoTexto(message);
         const respuesta = await responderAyuda(
           SOP_TEXT,
           OBJECIONES_TEXT,
@@ -2413,7 +2547,7 @@ app.post('/api/chat', async (req, res) => {
     }
 
     // --- Mensaje libre fuera de una captura activa: dudas de proceso ---
-    const conocimientoLibre = await obtenerConocimientoTexto();
+    const conocimientoLibre = await obtenerConocimientoTexto(message);
     const respuesta = await responderAyuda(
       SOP_TEXT,
       OBJECIONES_TEXT,

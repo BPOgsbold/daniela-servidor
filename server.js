@@ -1191,9 +1191,7 @@ app.post('/api/adjuntar', async (req, res) => {
     if (!cedula || !nombre) {
       return res.status(400).json({ error: 'Primero necesito el nombre y la cédula del cliente para crear su carpeta. Termina de registrarlos y vuelve a adjuntar.' });
     }
-    if (tipo === 'certificado_upme' && datos.tiene_certificado_upme && datos.tiene_certificado_upme !== 'Sí tiene certificado') {
-      return res.status(400).json({ error: 'Este cliente no está registrado con certificado UPME.' });
-    }
+    // (Se quitó el bloqueo por "no tiene certificado UPME": si el asesor adjunta el certificado, es porque ya lo tiene.)
     const buffer = Buffer.from(base64, 'base64');
     if (buffer.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'El archivo pesa más de 25 MB.' });
     const r = await subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer, esCliente: esClienteDefinitivo(datos) });

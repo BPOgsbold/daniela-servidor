@@ -346,6 +346,40 @@ function formatearResultadosBusqueda(casos, termino) {
   return `${intro}\n\n${bloques.join('\n\n')}\n\nAsí evitamos duplicar: si es el mismo trámite, sigue gestionando ese caso en vez de crear uno nuevo.`;
 }
 
+// Arma la respuesta de una búsqueda de cliente. Si hay una coincidencia exacta
+// por cédula/NIT o placa, se queda solo con esa. Si quedan varios, ofrece un
+// botón por cada uno para ELEGIR (antes no había forma de escoger).
+function resolverBusqueda(sesion, termino, resultados) {
+  const t = String(termino || '').trim();
+  const tPlaca = t.toUpperCase().replace(/[\s-]+/g, '');
+  const exactos = (resultados || []).filter(
+    (c) =>
+      (c.numero_identificacion && String(c.numero_identificacion).trim() === t) ||
+      (c.placa && String(c.placa).toUpperCase().replace(/[\s-]+/g, '') === tPlaca)
+  );
+  const lista = exactos.length > 0 ? exactos : resultados || [];
+  sesion.candidatoRetomar = null;
+  sesion.candidatosLista = null;
+  const reply = formatearResultadosBusqueda(lista, termino);
+  if (lista.length === 1) {
+    sesion.candidatoRetomar = lista[0];
+    return { reply, opciones: ['Retomar este caso', 'Mismo cliente, otro vehículo'] };
+  }
+  if (lista.length > 1) {
+    sesion.candidatosLista = lista.slice(0, 5);
+    const opciones = sesion.candidatosLista.map((c, i) => {
+      const dato = c.numero_identificacion || c.placa || '';
+      return `Elegir ${i + 1}: ${c.nombre_cliente || 'Sin nombre'}${dato ? ' · ' + dato : ''}`;
+    });
+    return {
+      reply: reply.replace(/\n\nAsí evitamos duplicar[^]*$/, '') +
+        '\n\nToca el cliente que buscas (o escríbeme su cédula/placa exacta) para retomarlo.',
+      opciones,
+    };
+  }
+  return { reply };
+}
+
 function siguienteIndicePendiente(campos, data) {
   const idx = campos.findIndex((c) => !(c.id in data));
   return idx === -1 ? campos.length : idx;
@@ -1189,6 +1223,48 @@ app.post('/api/chat', async (req, res) => {
       sesiones.set(sessionId, sesion);
     }
 
+    // --- Elegir un cliente de la lista de coincidencias ---
+    const mElegir = message.trim().match(/^elegir\s+(\d+)\b/i);
+    if (mElegir) {
+      const elegido = (sesion.candidatosLista || [])[Number(mElegir[1]) - 1];
+      if (!elegido) {
+        return res.json({ reply: 'Ya no tengo esa lista a mano — dime "buscar cliente" y lo buscamos de nuevo.' });
+      }
+      sesion.candidatoRetomar = elegido;
+      sesion.candidatosLista = null;
+      return res.json({
+        reply: formatearResultadosBusqueda([elegido], elegido.nombre_cliente || ''),
+        opciones: ['Retomar este caso', 'Mismo cliente, otro vehículo'],
+      });
+    }
+
+    // --- Cédula/NIT o placa suelta (o "cédula del cliente 123") fuera de la
+    // captura de un caso: se busca directo, sin preguntar qué quiere hacer. ---
+    {
+      const enCaptura = /^capturando|^negociacion/.test(String(sesion.estado || ''));
+      const m = message.trim();
+      let terminoDirecto = null;
+      if (!enCaptura) {
+        if (/^\d{6,12}$/.test(m) || /^[a-z]{3}[-\s]?\d{2}[a-z0-9]$/i.test(m)) terminoDirecto = m;
+        else {
+          const mc = m.match(/(?:c[eé]dula|\bcc\b|\bnit\b|placa)\D{0,20}?([a-z0-9]{5,12})\s*$/i);
+          if (mc && /\d/.test(mc[1])) terminoDirecto = mc[1];
+        }
+      }
+      if (terminoDirecto) {
+        try {
+          const resultados = await buscarCasoPorTermino(terminoDirecto);
+          if (resultados.length === 0) {
+            return res.json({ reply: `No encontré ningún caso con "${terminoDirecto}". Si es un cliente nuevo, dime "tengo un cliente nuevo".`, opciones: ['Tengo un cliente nuevo', 'Buscar cliente'] });
+          }
+          const r = resolverBusqueda(sesion, terminoDirecto, resultados);
+          return res.json(r.opciones ? { reply: r.reply, opciones: r.opciones } : { reply: r.reply });
+        } catch (dbError) {
+          return res.json({ reply: `No pude consultar la base de datos (${dbError.message}). Intenta de nuevo.` });
+        }
+      }
+    }
+
     // --- Retomar un caso ya existente (botón que aparece cuando una
     // búsqueda encuentra exactamente un cliente): en vez de seguir pidiendo
     // datos para un caso nuevo (que duplicaría al cliente), cargamos lo que
@@ -1436,13 +1512,9 @@ app.post('/api/chat', async (req, res) => {
         let opcionesBusqueda;
         try {
           const resultados = await buscarCasoPorTermino(terminoInline);
-          reply = formatearResultadosBusqueda(resultados, terminoInline);
-          if (resultados.length === 1) {
-            sesion.candidatoRetomar = resultados[0];
-            opcionesBusqueda = ['Retomar este caso', 'Mismo cliente, otro vehículo'];
-          } else {
-            sesion.candidatoRetomar = null;
-          }
+          const r = resolverBusqueda(sesion, terminoInline, resultados);
+          reply = r.reply;
+          opcionesBusqueda = r.opciones;
         } catch (dbError) {
           console.error('Error buscando cliente en Supabase:', dbError);
           reply = `No pude consultar la base de datos en este momento (${dbError.message}). Intenta de nuevo en un momento.`;
@@ -1467,13 +1539,9 @@ app.post('/api/chat', async (req, res) => {
       let opcionesBusqueda;
       try {
         const resultados = await buscarCasoPorTermino(termino);
-        reply = formatearResultadosBusqueda(resultados, termino);
-        if (resultados.length === 1) {
-          sesion.candidatoRetomar = resultados[0];
-          opcionesBusqueda = ['Retomar este caso', 'Mismo cliente, otro vehículo'];
-        } else {
-          sesion.candidatoRetomar = null;
-        }
+        const r = resolverBusqueda(sesion, termino, resultados);
+        reply = r.reply;
+        opcionesBusqueda = r.opciones;
       } catch (dbError) {
         console.error('Error buscando cliente en Supabase:', dbError);
         reply = `No pude consultar la base de datos en este momento (${dbError.message}). Intenta de nuevo en un momento.`;

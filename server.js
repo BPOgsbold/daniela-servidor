@@ -2687,9 +2687,27 @@ app.post('/api/chat', async (req, res) => {
       }
 
       if (neg.sub === 'contrato_docs') {
-        // "Crear contrato" lo atiende el manejador global; aquí solo "Lo hago después".
-        neg.sub = 'escalar';
-        return res.json({ reply: '👍 Cuando tengas los documentos, usa "Generar contrato" en el inicio.\n\n¿Cómo quedan los documentos para escalar este caso?', opciones: OPCIONES_ESCALAR_DOCUMENTOS });
+        // "Crear contrato" (botón) lo atiende el manejador global. Aquí: "Lo hago después"
+        // o frases como "listo, ya están los documentos" (que también crean la solicitud).
+        const ent = normalizarTexto(message).trim();
+        if (/despues|luego|mas tarde|^no\b/.test(ent)) {
+          neg.sub = 'escalar';
+          return res.json({ reply: '👍 Cuando tengas los documentos, usa "Generar contrato" en el inicio.\n\n¿Cómo quedan los documentos para escalar este caso?', opciones: OPCIONES_ESCALAR_DOCUMENTOS });
+        }
+        if (/listo|ya (est|sub|carg|adjunt)|document|sub[i]|cargu|^si\b|contrato/.test(ent) || interpretarSiNo(message) === 'sí') {
+          try {
+            const r = await crearSolicitudContrato(sesion, asesor);
+            neg.sub = 'escalar';
+            const aviso = r.yaExiste
+              ? '⏳ Ya hay una solicitud en proceso para este cliente.'
+              : '✅ Listo, mandé la solicitud. El sistema revisa los documentos y arma el contrato (2 a 4 minutos). Luego toca "Ver estado del contrato".';
+            return res.json({ reply: `${aviso}\n\nMientras tanto, sigamos: ¿cómo quedan los documentos para escalar este caso?`, opciones: OPCIONES_ESCALAR_DOCUMENTOS });
+          } catch (e) {
+            console.error('Error creando solicitud de contrato:', e);
+            return res.json({ reply: `⚠️ No pude enviar la solicitud (${e.message}). Intenta con el botón "Crear contrato".`, opciones: ['Crear contrato', 'Lo hago después'] });
+          }
+        }
+        return res.json({ reply: 'Adjunta cédula, RUT y factura con el clip 📎 y toca "Crear contrato" (o "Lo hago después").', opciones: ['Crear contrato', 'Lo hago después'] });
       }
 
       if (neg.sub === 'escalar') {

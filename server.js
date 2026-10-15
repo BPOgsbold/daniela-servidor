@@ -1041,6 +1041,112 @@ function campoActualDe(sesion) {
   return null;
 }
 
+// ===================== GENERACIÓN DE CONTRATO =====================
+// Daniela NO genera el contrato: deja una solicitud en la tabla
+// "solicitudes_contrato" de Supabase. El programa OCR del PC de la oficina
+// (worker_contratos.py) la toma, revisa los documentos en SharePoint, crea el
+// contrato y escribe aquí el resultado (listo / faltan documentos / error).
+function clienteSupabaseAdmin() {
+  const { createClient } = require('@supabase/supabase-js');
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
+
+const OPC_INICIO = ['Tengo un cliente nuevo', 'Buscar cliente', 'Generar contrato'];
+
+const TEXTO_DOCS_CONTRATO =
+  'Para crear el contrato necesito en la carpeta del cliente (SharePoint):\n' +
+  '• 📎 Cédula\n• 📎 RUT\n• 📎 Factura de compra del vehículo\n\n' +
+  'Adjúntalos con el clip 📎 (elige el tipo de documento). Cuando estén todos, toca "Crear contrato".';
+
+// Busca por celular (10 dígitos) o, si no, por cédula/NIT/placa/nombre.
+async function buscarParaContrato(termino) {
+  const t = String(termino || '').trim();
+  const digitos = t.replace(/\D/g, '');
+  const cel = digitos.length === 12 && digitos.startsWith('57') ? digitos.slice(2) : digitos;
+  if (/^3\d{9}$/.test(cel)) {
+    const sb = clienteSupabaseAdmin();
+    const { data, error } = await sb
+      .from('Perfilamiento_y_ventas_GLA')
+      .select('*')
+      .ilike('telefono', `%${cel}%`)
+      .order('updated_at', { ascending: false, nullsFirst: false })
+      .limit(5);
+    if (error) throw error;
+    if (data && data.length) return data;
+  }
+  return buscarCasoPorTermino(t);
+}
+
+function seleccionarCasoParaContrato(sesion, caso) {
+  sesion.estado = 'caso_abierto';
+  sesion.tipo = null;
+  sesion.casoId = caso.id;
+  sesion.data = datosDeCasoExistente(caso);
+  sesion.negociacion = null;
+  sesion.pendienteBusqueda = false;
+  sesion.pendienteContrato = null;
+  sesion.modoContrato = false;
+  sesion.candidatosLista = null;
+  sesion.candidatoRetomar = null;
+  const nombre = caso.nombre_cliente || 'el cliente';
+  if (!caso.numero_identificacion) {
+    return {
+      reply: `Encontré a ${nombre}, pero no tiene cédula registrada y la necesito para su carpeta. Dime "buscar cliente", retoma el caso y completa la cédula.`,
+      opciones: OPC_INICIO,
+    };
+  }
+  return {
+    reply: `✅ Cliente: ${nombre} (cédula ${caso.numero_identificacion}).\n\n${TEXTO_DOCS_CONTRATO}`,
+    opciones: ['Crear contrato', 'Ver estado del contrato'],
+  };
+}
+
+async function crearSolicitudContrato(sesion, asesor) {
+  const sb = clienteSupabaseAdmin();
+  const cedula = String(sesion.data.numero_identificacion || '').trim();
+  const nombre = String(sesion.data.nombre_cliente || '').trim();
+  const { data: previas } = await sb
+    .from('solicitudes_contrato')
+    .select('id, estado, creado_en')
+    .eq('caso_id', sesion.casoId)
+    .in('estado', ['pendiente', 'procesando'])
+    .order('creado_en', { ascending: false })
+    .limit(1);
+  if (previas && previas.length && Date.now() - new Date(previas[0].creado_en).getTime() < 30 * 60 * 1000) {
+    return { yaExiste: true };
+  }
+  const { error } = await sb.from('solicitudes_contrato').insert({
+    caso_id: sesion.casoId,
+    cedula,
+    nombre_cliente: nombre,
+    servicio: sesion.data.servicio_contratado || null,
+    asesor: asesor || null,
+  });
+  if (error) throw error;
+  return { yaExiste: false };
+}
+
+async function textoEstadoContrato(casoId) {
+  const sb = clienteSupabaseAdmin();
+  const { data, error } = await sb
+    .from('solicitudes_contrato')
+    .select('*')
+    .eq('caso_id', casoId)
+    .order('creado_en', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  const r = data && data[0];
+  if (!r) return { reply: 'Todavía no hay una solicitud de contrato para este cliente. Toca "Crear contrato" cuando estén los documentos.', opciones: ['Crear contrato'] };
+  if (r.estado === 'pendiente') return { reply: '⏳ Tu solicitud está en cola. El sistema la toma en 1 a 2 minutos.', opciones: ['Ver estado del contrato'] };
+  if (r.estado === 'procesando') return { reply: '⚙️ Estoy leyendo los documentos y armando el contrato. Pregúntame de nuevo en un minuto.', opciones: ['Ver estado del contrato'] };
+  if (r.estado === 'listo') {
+    const arch = (r.archivos || []).join(', ');
+    return { reply: `✅ ¡Contrato listo! Quedó en la carpeta del cliente en SharePoint${arch ? `: ${arch}` : ''}.${r.mensaje ? `\n\n${r.mensaje}` : ''}${r.link_carpeta ? `\n\n📁 ${r.link_carpeta}` : ''}\n\nRevísalo y envíaselo al cliente para que confirme que todo está bien.` };
+  }
+  if (r.estado === 'falta_documentos') return { reply: `📎 Faltan documentos para el contrato: ${r.mensaje || 'revisa cédula, RUT y factura'}.\n\nAdjúntalos con el clip y toca "Crear contrato" otra vez.`, opciones: ['Crear contrato'] };
+  return { reply: `⚠️ No se pudo crear el contrato: ${r.mensaje || 'error desconocido'}. Avisa a soporte o intenta de nuevo.`, opciones: ['Crear contrato'] };
+}
+
 const MENSAJE_INICIAL =
   'Soy Daniela, tu asistente experta en beneficios tributarios por compra de ' +
   'vehículos eléctricos e híbridos 🙌. Solo cuéntame cómo vas y yo te voy guiando: ' +
@@ -1228,12 +1334,83 @@ app.post('/api/chat', async (req, res) => {
       if (!elegido) {
         return res.json({ reply: 'Ya no tengo esa lista a mano — dime "buscar cliente" y lo buscamos de nuevo.' });
       }
+      if (sesion.modoContrato) {
+        const rc = seleccionarCasoParaContrato(sesion, elegido);
+        return res.json({ reply: rc.reply, opciones: rc.opciones });
+      }
       sesion.candidatoRetomar = elegido;
       sesion.candidatosLista = null;
       return res.json({
         reply: formatearResultadosBusqueda([elegido], elegido.nombre_cliente || ''),
         opciones: ['Retomar este caso', 'Mismo cliente, otro vehículo'],
       });
+    }
+
+    // --- Generación de contrato ---
+    {
+      const tn = normalizarTexto(message).trim();
+      if (tn === normalizarTexto('Generar contrato')) {
+        sesion.pendienteContrato = 'buscar';
+        sesion.pendienteBusqueda = false;
+        return res.json({ reply: 'Claro 📄 Dime el celular o la cédula del cliente y lo busco.' });
+      }
+      if (sesion.pendienteContrato === 'buscar') {
+        try {
+          const lista = await buscarParaContrato(message.trim());
+          if (!lista || lista.length === 0) {
+            return res.json({ reply: 'No encontré ese cliente. Revisa el número e inténtalo de nuevo (celular o cédula), o dime "tengo un cliente nuevo" para registrarlo.', opciones: OPC_INICIO });
+          }
+          const exactos = lista.filter((c) => String(c.numero_identificacion || '').trim() === message.trim());
+          const l = exactos.length ? exactos : lista;
+          if (l.length === 1) {
+            const rc = seleccionarCasoParaContrato(sesion, l[0]);
+            return res.json({ reply: rc.reply, opciones: rc.opciones });
+          }
+          sesion.modoContrato = true;
+          sesion.pendienteContrato = null;
+          sesion.candidatosLista = l.slice(0, 5);
+          return res.json({
+            reply: 'Encontré varios clientes. Toca el que necesitas:',
+            opciones: sesion.candidatosLista.map((c, i) => `Elegir ${i + 1}: ${c.nombre_cliente || 'Sin nombre'}${c.numero_identificacion ? ' · ' + c.numero_identificacion : ''}`),
+          });
+        } catch (e) {
+          console.error('Error buscando cliente para contrato:', e);
+          return res.json({ reply: `No pude consultar la base de datos (${e.message}). Intenta de nuevo.` });
+        }
+      }
+      if (/^crear contrato\b/.test(tn)) {
+        if (!sesion.casoId || !sesion.data || !sesion.data.numero_identificacion || !sesion.data.nombre_cliente) {
+          sesion.pendienteContrato = 'buscar';
+          return res.json({ reply: 'Primero dime el celular o la cédula del cliente para saber de quién es el contrato.' });
+        }
+        try {
+          const r = await crearSolicitudContrato(sesion, asesor);
+          let reply = r.yaExiste
+            ? '⏳ Ya hay una solicitud en proceso para este cliente. Toca "Ver estado del contrato" en un par de minutos.'
+            : '✅ Listo, mandé la solicitud. El sistema revisa los documentos y arma el contrato (toma 2 a 4 minutos). Toca "Ver estado del contrato" para saber cómo va.';
+          const neg = sesion.negociacion;
+          if (neg && neg.sub === 'contrato_docs') {
+            neg.sub = 'escalar';
+            return res.json({ reply: `${reply}\n\nMientras tanto, sigamos: ¿cómo quedan los documentos para escalar este caso?`, opciones: OPCIONES_ESCALAR_DOCUMENTOS });
+          }
+          return res.json({ reply, opciones: ['Ver estado del contrato'] });
+        } catch (e) {
+          console.error('Error creando solicitud de contrato:', e);
+          return res.json({ reply: `⚠️ No pude enviar la solicitud (${e.message}). Avisa a soporte si se repite.` });
+        }
+      }
+      if (/^(ver )?estado (del )?contrato$/.test(tn)) {
+        if (!sesion.casoId) {
+          sesion.pendienteContrato = 'buscar';
+          return res.json({ reply: 'Dime el celular o la cédula del cliente y reviso su contrato.' });
+        }
+        try {
+          const r = await textoEstadoContrato(sesion.casoId);
+          return res.json(r.opciones ? { reply: r.reply, opciones: r.opciones } : { reply: r.reply });
+        } catch (e) {
+          return res.json({ reply: `No pude consultar el estado (${e.message}).` });
+        }
+      }
     }
 
     // --- Cédula/NIT o placa suelta (o "cédula del cliente 123") fuera de la
@@ -1557,7 +1734,7 @@ app.post('/api/chat', async (req, res) => {
       const saludo = asesor ? `¡Hola, ${asesor}! ` : '¡Hola! ';
       return res.json({
         reply: `${saludo}${MENSAJE_INICIAL}`,
-        opciones: ['Tengo un cliente nuevo', 'Buscar cliente'],
+        opciones: OPC_INICIO,
       });
     }
 
@@ -2488,11 +2665,31 @@ app.post('/api/chat', async (req, res) => {
             console.error('Error guardando el servicio contratado en Supabase:', dbError);
           }
         }
-        neg.sub = 'escalar';
+        sesion.data.servicio_contratado = match;
+        neg.sub = 'contrato_pregunta';
         return res.json({
-          reply: `✅ Anotado el servicio: "${match}".\n\n¿Cómo quedan los documentos para escalar este caso?`,
-          opciones: OPCIONES_ESCALAR_DOCUMENTOS,
+          reply: `✅ Anotado el servicio: "${match}".\n\n📄 ¿Se necesita generar el contrato?`,
+          opciones: ['Sí, generar contrato', 'No, seguir'],
         });
+      }
+
+      if (neg.sub === 'contrato_pregunta') {
+        const ent = normalizarTexto(message).trim();
+        if (ent === normalizarTexto('Sí, generar contrato') || interpretarSiNo(message) === 'sí') {
+          neg.sub = 'contrato_docs';
+          return res.json({ reply: TEXTO_DOCS_CONTRATO, opciones: ['Crear contrato', 'Lo hago después'] });
+        }
+        if (ent === normalizarTexto('No, seguir') || interpretarSiNo(message) === 'no') {
+          neg.sub = 'escalar';
+          return res.json({ reply: '👍 Sin contrato por ahora (después puedes usar "Generar contrato" en el inicio).\n\n¿Cómo quedan los documentos para escalar este caso?', opciones: OPCIONES_ESCALAR_DOCUMENTOS });
+        }
+        return res.json({ reply: '⚠️ Selecciona una opción.', opciones: ['Sí, generar contrato', 'No, seguir'] });
+      }
+
+      if (neg.sub === 'contrato_docs') {
+        // "Crear contrato" lo atiende el manejador global; aquí solo "Lo hago después".
+        neg.sub = 'escalar';
+        return res.json({ reply: '👍 Cuando tengas los documentos, usa "Generar contrato" en el inicio.\n\n¿Cómo quedan los documentos para escalar este caso?', opciones: OPCIONES_ESCALAR_DOCUMENTOS });
       }
 
       if (neg.sub === 'escalar') {

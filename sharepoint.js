@@ -83,47 +83,113 @@ async function obtenerItem(siteId, ruta) {
   }
 }
 
-// Mueve la carpeta de un prospecto (Clientes/00. En proceso/<cédula - nombre>)
-// a su lugar definitivo (Clientes/<cédula - nombre>). No borra archivos: si la
-// carpeta definitiva ya existe, pasa los archivos uno a uno (sin pisar) y solo
-// borra la carpeta vieja si quedó vacía.
+const soloDigitos = (t) => String(t || '').replace(/\D/g, '');
+
+// Lista las subcarpetas de una carpeta (con paginación).
+async function listarCarpetas(siteId, ruta) {
+  const enc = ruta.split('/').map(encodeURIComponent).join('/');
+  let url = `/sites/${siteId}/drive/root:/${enc}:/children?$top=500`;
+  const salida = [];
+  try {
+    while (url) {
+      const d = await graph(url);
+      for (const it of d.value || []) if (it.folder) salida.push(it);
+      url = d['@odata.nextLink'] || null;
+    }
+  } catch (e) {
+    if (/404|itemNotFound/i.test(e.message)) return [];
+    throw e;
+  }
+  return salida;
+}
+
+// Busca TODAS las carpetas de esa cédula (da igual cómo esté escrito el nombre):
+// en Clientes/ (definitivas) y en Clientes/00. En proceso/ (prospectos).
+async function carpetasPorCedula(siteId, cedula) {
+  const ced = soloDigitos(cedula);
+  if (ced.length < 5) return [];
+  const lugares = [
+    { ruta: rutaBase(), enRoot: true },
+    { ruta: `${rutaBase()}/${rutaProspectos()}`, enRoot: false },
+  ];
+  const hallazgos = [];
+  for (const l of lugares) {
+    for (const it of await listarCarpetas(siteId, l.ruta)) {
+      if (soloDigitos(String(it.name).split('-')[0]) === ced) hallazgos.push({ item: it, enRoot: l.enRoot });
+    }
+  }
+  // Primero las definitivas y, dentro de cada grupo, la más antigua.
+  return hallazgos.sort((x, y) => (y.enRoot - x.enRoot) || String(x.item.createdDateTime).localeCompare(String(y.item.createdDateTime)));
+}
+
+const patchPadre = (siteId, id, parentId) => graph(`/sites/${siteId}/drive/items/${id}`, {
+  method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ parentReference: { id: parentId }, '@microsoft.graph.conflictBehavior': 'rename' }),
+});
+
+// Junta una carpeta repetida dentro de la principal (sin pisar archivos) y la borra solo si quedó vacía.
+async function fusionar(siteId, origen, destino) {
+  const hijos = await graph(`/sites/${siteId}/drive/items/${origen.id}/children?$top=500`);
+  for (const h of hijos.value || []) await patchPadre(siteId, h.id, destino.id);
+  const quedan = await graph(`/sites/${siteId}/drive/items/${origen.id}/children?$top=1`);
+  if (!(quedan.value || []).length) await graph(`/sites/${siteId}/drive/items/${origen.id}`, { method: 'DELETE' });
+}
+
+// Cola por cédula: si llegan 3 documentos a la vez, se procesan de a uno (evita crear carpetas dobles).
+const colas = new Map();
+function enCola(clave, fn) {
+  const previo = colas.get(clave) || Promise.resolve();
+  const actual = previo.catch(() => {}).then(fn);
+  colas.set(clave, actual);
+  actual.finally(() => { if (colas.get(clave) === actual) colas.delete(clave); }).catch(() => {});
+  return actual;
+}
+
+// Devuelve la ruta de la UNA carpeta del cliente (la reutiliza si ya existe, aunque el nombre esté
+// escrito distinto) y junta las repetidas. Si no existe ninguna, devuelve la ruta donde se creará.
+async function resolverCarpeta(siteId, cedula, nombre, esCliente) {
+  const base = rutaBase();
+  const nuevaRuta = () => esCliente ? `${base}/${nombreCarpeta(cedula, nombre)}`
+    : `${base}/${rutaProspectos()}/${nombreCarpeta(cedula, nombre)}`;
+  const hallazgos = await carpetasPorCedula(siteId, cedula);
+  if (!hallazgos.length) return { ruta: nuevaRuta(), nombre: nombreCarpeta(cedula, nombre), enRoot: !!esCliente, creada: true };
+  const [principal, ...otras] = hallazgos;
+  for (const o of otras) {
+    try { await fusionar(siteId, o.item, principal.item); }
+    catch (e) { console.error('No se pudo juntar la carpeta repetida', o.item.name, e.message); }
+  }
+  let enRoot = principal.enRoot;
+  if (esCliente && !enRoot) {
+    try {
+      const raiz = await obtenerItem(siteId, base);
+      if (raiz) { await patchPadre(siteId, principal.item.id, raiz.id); enRoot = true; }
+    } catch (e) { console.error('No se pudo mover la carpeta a Cliente:', e.message); }
+  }
+  const nombreReal = principal.item.name;
+  return { ruta: enRoot ? `${base}/${nombreReal}` : `${base}/${rutaProspectos()}/${nombreReal}`, nombre: nombreReal, enRoot, creada: false };
+}
+
+// Mueve la carpeta de un prospecto a su lugar definitivo (Clientes/<cédula - nombre>) sin duplicar.
 async function moverACliente(cedula, nombre) {
   const siteId = await obtenerSite();
-  const carpeta = nombreCarpeta(cedula, nombre);
-  const origen = await obtenerItem(siteId, `${rutaBase()}/${rutaProspectos()}/${carpeta}`);
-  if (!origen) return { movida: false, motivo: 'no tenía carpeta en proceso' };
-  const base = await obtenerItem(siteId, rutaBase());
-  if (!base) throw new Error('No encuentro la carpeta base en SharePoint.');
-  const destino = await obtenerItem(siteId, `${rutaBase()}/${carpeta}`);
-  const patch = (id, parentId) => graph(`/sites/${siteId}/drive/items/${id}`, {
-    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ parentReference: { id: parentId }, '@microsoft.graph.conflictBehavior': 'rename' }),
+  return enCola(soloDigitos(cedula), async () => {
+    const r = await resolverCarpeta(siteId, cedula, nombre, true);
+    return { movida: !r.creada, modo: 'carpeta unica por cedula' };
   });
-  if (!destino) {
-    await patch(origen.id, base.id);
-    return { movida: true, modo: 'carpeta completa' };
-  }
-  const hijos = await graph(`/sites/${siteId}/drive/items/${origen.id}/children?$top=200`);
-  for (const h of hijos.value || []) await patch(h.id, destino.id);
-  const quedan = await graph(`/sites/${siteId}/drive/items/${origen.id}/children?$top=1`);
-  if (!(quedan.value || []).length) {
-    await graph(`/sites/${siteId}/drive/items/${origen.id}`, { method: 'DELETE' });
-  }
-  return { movida: true, modo: 'archivos combinados' };
 }
 
 // Sube el archivo. Prospectos: Clientes/00. En proceso/<cédula - nombre>/.
 // Clientes definitivos: Clientes/<cédula - nombre>/ (y, si todavía tenía su
 // carpeta en proceso, primero se mueve). Si ya hay un archivo con ese nombre
 // no lo pisa (renombra).
-async function subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer, esCliente }) {
+async function subirDocumento(args) {
   const siteId = await obtenerSite();
-  const base = rutaBase();
-  const carpeta = nombreCarpeta(cedula, nombre);
-  if (esCliente) {
-    try { await moverACliente(cedula, nombre); } catch (e) { console.error('No se pudo mover la carpeta a Cliente:', e.message); }
-  }
-  const rutaCarpeta = esCliente ? `${base}/${carpeta}` : `${base}/${rutaProspectos()}/${carpeta}`;
+  return enCola(soloDigitos(args.cedula), () => subirDocumentoSeguro(siteId, args));
+}
+
+async function subirDocumentoSeguro(siteId, { cedula, nombre, tipo, nombreArchivo, buffer, esCliente }) {
+  const carpetaInfo = await resolverCarpeta(siteId, cedula, nombre, esCliente);
+  const rutaCarpeta = carpetaInfo.ruta;
   const ext = (String(nombreArchivo || '').match(/\.[A-Za-z0-9]{1,6}$/) || [''])[0].toLowerCase();
   const fecha = new Date().toISOString().slice(0, 10);
   const archivo = `${TIPOS_DOC[tipo]} ${fecha}${ext}`;
@@ -152,7 +218,7 @@ async function subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer, esC
     const c = await obtenerItem(siteId, rutaCarpeta);
     linkCarpeta = c && c.webUrl;
   } catch (e) {}
-  return { carpeta: esCliente ? carpeta : `${rutaProspectos()}/${carpeta}`, archivo: item.name || archivo, linkArchivo: item.webUrl, linkCarpeta };
+  return { carpeta: carpetaInfo.enRoot ? carpetaInfo.nombre : `${rutaProspectos()}/${carpetaInfo.nombre}`, archivo: item.name || archivo, linkArchivo: item.webUrl, linkCarpeta };
 }
 
 module.exports = { TIPOS_DOC, configurado, subirDocumento, nombreCarpeta, moverACliente, esClienteDefinitivo };

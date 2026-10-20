@@ -6,7 +6,7 @@ const cors = require('cors');
 
 const { responderAyuda } = require('./claude');
 const {
-  crearCaso,
+  crearCaso: crearCasoBase,
   actualizarCaso,
   guardarEscalamientoJuridico,
   guardarConocimiento,
@@ -15,8 +15,32 @@ const {
   obtenerVehiculosReferencia,
   guardarVehiculoNoListado,
 } = require('./supabase');
+const { buscarDuplicados, eliminarCasoDeSesion } = require('./duplicados');
 
 const { TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento, moverACliente, esClienteDefinitivo } = require('./sharepoint');
+
+
+// Todas las creaciones de casos pasan por aquí: si ya existe un cliente con ese
+// teléfono o cédula/NIT NO se crea otro (solo se permite con "Mismo cliente, otro vehículo").
+async function crearCaso(sessionId, asesor, datos) {
+  const ses = sesiones.get(sessionId);
+  if (!(ses && ses.otroVehiculo)) {
+    let dup = { casos: [], campo: null };
+    try {
+      dup = await buscarDuplicados({ telefono: datos.telefono, numero_identificacion: datos.numero_identificacion });
+    } catch (errDup) {
+      console.error('No se pudo verificar duplicados (se sigue):', errDup.message);
+    }
+    if (dup.casos.length) {
+      const e = new Error(`Ya existe un cliente con ese ${dup.campo === 'telefono' ? 'teléfono' : 'número de documento'} (${dup.casos[0].nombre_cliente || 'sin nombre'}). No se crea otro: retómalo con "buscar cliente".`);
+      e.code = 'DUPLICADO';
+      throw e;
+    }
+  }
+  const registro = await crearCasoBase(sessionId, asesor, datos);
+  if (ses) ses.casoCreadoEnSesion = registro.id;
+  return registro;
+}
 
 const app = express();
 app.use(cors());
@@ -185,6 +209,8 @@ function nuevaSesion() {
     pendienteEscalamiento: null,
     pendienteBusqueda: false,
     avisoDuplicadoMostrado: false,
+    otroVehiculo: false,
+    casoCreadoEnSesion: null,
     // Cuando el asesor responde "No" a "¿lograste el contacto?", le
     // preguntamos si quiere cerrar la interacción con ese cliente ahí mismo
     // (ya quedó guardado como "Contacto") o seguir igual con las preguntas.
@@ -1491,6 +1517,7 @@ app.post('/api/chat', async (req, res) => {
       sesion.tipo = null;
       sesion.casoId = null;
       sesion.data = datosClienteExistente(casoBase);
+      sesion.otroVehiculo = true; // el único caso en que se permite repetir cédula/teléfono
       sesion.avisoDuplicadoMostrado = true;
       sesion.pendienteCierre = false;
       sesion.pendienteBusqueda = false;
@@ -1744,6 +1771,8 @@ app.post('/api/chat', async (req, res) => {
       sesion.stepIndex = 0;
       sesion.data = {};
       sesion.casoId = null;
+      sesion.otroVehiculo = false;
+      sesion.casoCreadoEnSesion = null;
       sesion.avisoDuplicadoMostrado = false;
       sesion.pendienteCierre = false;
       const primerCampo = CAMPOS.caso_nuevo[0];
@@ -2156,6 +2185,32 @@ app.post('/api/chat', async (req, res) => {
       const resultadoCampo = validarYNormalizarCampo(campo, message);
       if (!resultadoCampo.ok) {
         return res.json(conOpciones({ reply: `⚠️ ${campo.errorMessage}\n\n${campo.prompt}` }, campo));
+      }
+
+      // BLOQUEO DE DUPLICADOS: si el teléfono o la cédula/NIT ya existen en otro caso,
+      // no se sigue creando un cliente nuevo; se ofrece retomar el existente.
+      if (['telefono', 'numero_identificacion'].includes(campo.id) && resultadoCampo.valor && !sesion.otroVehiculo) {
+        let dup = { casos: [], campo: null };
+        try {
+          dup = await buscarDuplicados({ [campo.id]: resultadoCampo.valor, excluirId: sesion.casoId });
+        } catch (dupError) {
+          console.error('Error verificando duplicados (bloqueo):', dupError);
+        }
+        if (dup.casos.length) {
+          // Si esta sesión ya había creado un caso vacío (al responder "contacto logrado"), se descarta.
+          if (sesion.casoId && sesion.casoCreadoEnSesion === sesion.casoId) {
+            try { await eliminarCasoDeSesion(sesion.casoId, sessionId); } catch (e) { console.error('No se pudo descartar el caso repetido:', e.message); }
+            sesion.casoId = null;
+            sesion.casoCreadoEnSesion = null;
+          }
+          const etiqueta = campo.id === 'telefono' ? 'teléfono' : 'número de documento';
+          const r = resolverBusqueda(sesion, resultadoCampo.valor, dup.casos);
+          sesion.candidatoRetomar = dup.casos[0];
+          return res.json({
+            reply: `⛔ Ese ${etiqueta} ya está registrado, así que no puedo crear otro cliente.\n\n${r.reply}\n\nSi es el mismo trámite, retómalo. Si es otro vehículo del mismo cliente, elige "Mismo cliente, otro vehículo". Si te equivocaste al escribir el dato, envíalo de nuevo.`,
+            opciones: dup.casos.length === 1 ? ['Retomar este caso', 'Mismo cliente, otro vehículo'] : r.opciones,
+          });
+        }
       }
 
       sesion.data[campo.id] = resultadoCampo.valor;

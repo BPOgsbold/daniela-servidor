@@ -247,14 +247,10 @@ async function hijosDeItem(siteId, itemId) {
   return salida;
 }
 
-// Lista los archivos de la carpeta del cliente (la busca por cédula, en Clientes y en 00. En proceso).
-async function listarDocumentosPorCedula(cedula) {
-  const siteId = await obtenerSite();
-  const hallazgos = await carpetasPorCedula(siteId, cedula);
-  if (!hallazgos.length) return { encontrada: false, archivos: [] };
-  const p = hallazgos[0];
+// Archivos de una carpeta de cliente (incluye un nivel de subcarpetas).
+async function archivosDeCarpeta(siteId, carpetaItem) {
   const archivos = [];
-  for (const it of await hijosDeItem(siteId, p.item.id)) {
+  for (const it of await hijosDeItem(siteId, carpetaItem.id)) {
     const grupo = it.folder ? await hijosDeItem(siteId, it.id) : [it];
     for (const f of grupo) {
       if (!f.file || String(f.name).startsWith('~')) continue;
@@ -265,7 +261,49 @@ async function listarDocumentosPorCedula(cedula) {
     }
   }
   archivos.sort((a, b) => String(b.modificado).localeCompare(String(a.modificado)));
-  return { encontrada: true, carpeta: p.item.name, enClientes: p.enRoot, webUrl: p.item.webUrl, archivos };
+  return archivos;
+}
+
+// Lista los archivos de la carpeta del cliente (la busca por cédula, en Clientes y en 00. En proceso).
+async function listarDocumentosPorCedula(cedula) {
+  const siteId = await obtenerSite();
+  const hallazgos = await carpetasPorCedula(siteId, cedula);
+  if (!hallazgos.length) return { encontrada: false, archivos: [] };
+  const p = hallazgos[0];
+  return { encontrada: true, carpeta: p.item.name, enClientes: p.enRoot, webUrl: p.item.webUrl, carpetaId: p.item.id, archivos: await archivosDeCarpeta(siteId, p.item) };
+}
+
+// Igual, pero abriendo una carpeta concreta por su id (para cuando se navega por las carpetas).
+async function listarDocumentosDeCarpeta(carpetaId) {
+  if (!/^[A-Za-z0-9!_-]{10,}$/.test(String(carpetaId || ''))) throw new Error('Identificador de carpeta no válido.');
+  const siteId = await obtenerSite();
+  const it = await graph(`/sites/${siteId}/drive/items/${carpetaId}`);
+  const ruta = decodeURIComponent(String((it.parentReference && it.parentReference.path) || ''));
+  if (!it.folder || !ruta.includes(`/${rutaBase()}`)) throw new Error('Esa carpeta no está en la carpeta de clientes.');
+  return { encontrada: true, carpeta: it.name, webUrl: it.webUrl, carpetaId: it.id, archivos: await archivosDeCarpeta(siteId, it) };
+}
+
+// Todas las carpetas de clientes (Clientes/ y cualquier agrupadora como "00. En proceso"), para buscar o navegar.
+let cacheCarpetas = { en: 0, datos: null };
+async function listarCarpetasClientes() {
+  if (cacheCarpetas.datos && Date.now() - cacheCarpetas.en < 60000) return cacheCarpetas.datos;
+  const siteId = await obtenerSite();
+  const base = rutaBase();
+  const raiz = await listarCarpetas(siteId, base);
+  const lugares = [{ items: raiz, etiqueta: 'Clientes' }];
+  for (const it of raiz) {
+    if (/^\d{1,3}\.\s/.test(it.name)) lugares.push({ items: await listarCarpetas(siteId, `${base}/${it.name}`), etiqueta: it.name });
+  }
+  const datos = [];
+  for (const l of lugares) {
+    for (const it of l.items) {
+      if (/^\d{1,3}\.\s/.test(it.name)) continue;
+      datos.push({ id: it.id, nombre: it.name, cedula: soloDigitos(String(it.name).split('-')[0]), ubicacion: l.etiqueta, modificado: it.lastModifiedDateTime || null, webUrl: it.webUrl });
+    }
+  }
+  datos.sort((a, b) => String(b.modificado).localeCompare(String(a.modificado)));
+  cacheCarpetas = { en: Date.now(), datos };
+  return datos;
 }
 
 // Enlace temporal (~1 hora) para abrir/ver un archivo de SharePoint sin descargarlo a mano.
@@ -278,4 +316,4 @@ async function enlaceDeArchivo(itemId) {
   if (!it.file || !ruta.includes(`/${rutaBase()}/`) && !ruta.endsWith(`/${rutaBase()}`)) throw new Error('Ese archivo no está en la carpeta de clientes.');
   return { url: it['@microsoft.graph.downloadUrl'] || it.webUrl, nombre: it.name, webUrl: it.webUrl, mime: (it.file && it.file.mimeType) || null };
 }
-module.exports = { listarDocumentosPorCedula, enlaceDeArchivo, tipoDeArchivo, TIPOS_DOC, configurado, subirDocumento, nombreCarpeta, moverACliente, esClienteDefinitivo };
+module.exports = { listarDocumentosPorCedula, listarDocumentosDeCarpeta, listarCarpetasClientes, enlaceDeArchivo, tipoDeArchivo, TIPOS_DOC, configurado, subirDocumento, nombreCarpeta, moverACliente, esClienteDefinitivo };

@@ -17,7 +17,7 @@ const {
 } = require('./supabase');
 const { buscarDuplicados, eliminarCasoDeSesion } = require('./duplicados');
 
-const { TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento, moverACliente, esClienteDefinitivo, listarDocumentosPorCedula, enlaceDeArchivo } = require('./sharepoint');
+const { TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento, moverACliente, esClienteDefinitivo, listarDocumentosPorCedula, listarDocumentosDeCarpeta, listarCarpetasClientes, enlaceDeArchivo } = require('./sharepoint');
 
 
 // Todas las creaciones de casos pasan por aquí: si ya existe un cliente con ese
@@ -2980,11 +2980,23 @@ app.get('/api/sp/documentos', async (req, res) => {
   const ctx = await exigirEquipo(req, res); if (!ctx) return;
   try {
     if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    if (req.query.carpeta) return res.json(await listarDocumentosDeCarpeta(String(req.query.carpeta)));
     const cedula = String(req.query.cedula || '').replace(/\D/g, '');
     if (cedula.length < 5) return res.status(400).json({ error: 'Escribe una cédula válida.' });
     res.json(await listarDocumentosPorCedula(cedula));
   } catch (err) {
     console.error('Error listando documentos de SharePoint:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+app.get('/api/sp/clientes', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    res.json({ carpetas: await listarCarpetasClientes() });
+  } catch (err) {
+    console.error('Error listando carpetas de clientes:', err);
     res.status(500).json({ error: err.message || 'Error interno' });
   }
 });

@@ -228,8 +228,8 @@ function tipoDeArchivo(nombre) {
   const n = norm(nombre);
   if (/CERTIFICACION BANCARIA|BANCARIA/.test(n)) return 'Certificación bancaria';
   if (/SOPORTE DE PAGO|PAGO/.test(n)) return 'Soporte de pago';
-  if (/CERTIFICADO UPME|UPME/.test(n)) return 'Certificado UPME';
   if (/CONTRATO/.test(n)) return 'Contrato';
+  if (/CERTIFICADO UPME|UPME/.test(n)) return 'Certificado UPME';
   if (/FACTURA/.test(n)) return 'Factura';
   if (/\bRUT\b/.test(n)) return 'RUT';
   if (/CEDULA|\bCC\b/.test(n)) return 'Cédula';

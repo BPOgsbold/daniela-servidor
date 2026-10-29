@@ -17,7 +17,7 @@ const {
 } = require('./supabase');
 const { buscarDuplicados, eliminarCasoDeSesion } = require('./duplicados');
 
-const { TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento, moverACliente, esClienteDefinitivo } = require('./sharepoint');
+const { TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento, moverACliente, esClienteDefinitivo, listarDocumentosPorCedula, enlaceDeArchivo } = require('./sharepoint');
 
 
 // Todas las creaciones de casos pasan por aquí: si ya existe un cliente con ese
@@ -2953,6 +2953,52 @@ async function buscarUsuarioAuth(sb, email) {
   }
   return null;
 }
+
+
+// ============ Documentos de SharePoint para el panel (Creación de caso UPME) ============
+// El panel pide aquí la lista de archivos de un cliente y un enlace temporal para verlos: nadie
+// tiene que descargar y volver a subir. Solo con sesión válida y perfil Admin o Back Office.
+async function exigirEquipo(req, res) {
+  try {
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    if (!token) { res.status(401).json({ error: 'Falta iniciar sesión' }); return null; }
+    const sb = sbServicio();
+    const { data, error } = await sb.auth.getUser(token);
+    if (error || !data || !data.user || !data.user.email) { res.status(401).json({ error: 'Sesión no válida' }); return null; }
+    const email = data.user.email.toLowerCase();
+    const { data: fila } = await sb.from('panel_roles').select('rol, activo').ilike('email', email).maybeSingle();
+    if (fila && (fila.rol === 'cliente' || fila.activo === false)) { res.status(403).json({ error: 'Tu perfil no tiene acceso a los documentos' }); return null; }
+    return { sb, email };
+  } catch (err) {
+    console.error('exigirEquipo:', err);
+    res.status(500).json({ error: 'No se pudo validar el usuario' });
+    return null;
+  }
+}
+
+app.get('/api/sp/documentos', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    const cedula = String(req.query.cedula || '').replace(/\D/g, '');
+    if (cedula.length < 5) return res.status(400).json({ error: 'Escribe una cédula válida.' });
+    res.json(await listarDocumentosPorCedula(cedula));
+  } catch (err) {
+    console.error('Error listando documentos de SharePoint:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+app.get('/api/sp/enlace', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    res.json(await enlaceDeArchivo(String(req.query.id || '')));
+  } catch (err) {
+    console.error('Error generando enlace de SharePoint:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
 
 app.get('/api/usuarios', async (req, res) => {
   const ctx = await exigirAdmin(req, res); if (!ctx) return;

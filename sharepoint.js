@@ -221,4 +221,61 @@ async function subirDocumentoSeguro(siteId, { cedula, nombre, tipo, nombreArchiv
   return { carpeta: carpetaInfo.enRoot ? carpetaInfo.nombre : `${rutaProspectos()}/${carpetaInfo.nombre}`, archivo: item.name || archivo, linkArchivo: item.webUrl, linkCarpeta };
 }
 
-module.exports = { TIPOS_DOC, configurado, subirDocumento, nombreCarpeta, moverACliente, esClienteDefinitivo };
+
+// ---------- Documentos del cliente (para el panel: ver sin descargar a mano) ----------
+const norm = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase();
+function tipoDeArchivo(nombre) {
+  const n = norm(nombre);
+  if (/CERTIFICACION BANCARIA|BANCARIA/.test(n)) return 'Certificación bancaria';
+  if (/SOPORTE DE PAGO|PAGO/.test(n)) return 'Soporte de pago';
+  if (/CERTIFICADO UPME|UPME/.test(n)) return 'Certificado UPME';
+  if (/CONTRATO/.test(n)) return 'Contrato';
+  if (/FACTURA/.test(n)) return 'Factura';
+  if (/\bRUT\b/.test(n)) return 'RUT';
+  if (/CEDULA|\bCC\b/.test(n)) return 'Cédula';
+  return 'Otro';
+}
+
+async function hijosDeItem(siteId, itemId) {
+  let url = `/sites/${siteId}/drive/items/${itemId}/children?$top=200`;
+  const salida = [];
+  while (url) {
+    const d = await graph(url);
+    salida.push(...(d.value || []));
+    url = d['@odata.nextLink'] || null;
+  }
+  return salida;
+}
+
+// Lista los archivos de la carpeta del cliente (la busca por cédula, en Clientes y en 00. En proceso).
+async function listarDocumentosPorCedula(cedula) {
+  const siteId = await obtenerSite();
+  const hallazgos = await carpetasPorCedula(siteId, cedula);
+  if (!hallazgos.length) return { encontrada: false, archivos: [] };
+  const p = hallazgos[0];
+  const archivos = [];
+  for (const it of await hijosDeItem(siteId, p.item.id)) {
+    const grupo = it.folder ? await hijosDeItem(siteId, it.id) : [it];
+    for (const f of grupo) {
+      if (!f.file || String(f.name).startsWith('~')) continue;
+      archivos.push({
+        id: f.id, nombre: f.name, tipo: tipoDeArchivo(f.name), tamano: f.size || 0,
+        modificado: f.lastModifiedDateTime || null, subcarpeta: it.folder ? it.name : null, mime: (f.file && f.file.mimeType) || null,
+      });
+    }
+  }
+  archivos.sort((a, b) => String(b.modificado).localeCompare(String(a.modificado)));
+  return { encontrada: true, carpeta: p.item.name, enClientes: p.enRoot, webUrl: p.item.webUrl, archivos };
+}
+
+// Enlace temporal (~1 hora) para abrir/ver un archivo de SharePoint sin descargarlo a mano.
+// Solo sirve para archivos que estén dentro de la carpeta de clientes.
+async function enlaceDeArchivo(itemId) {
+  if (!/^[A-Za-z0-9!_-]{10,}$/.test(String(itemId || ''))) throw new Error('Identificador de archivo no válido.');
+  const siteId = await obtenerSite();
+  const it = await graph(`/sites/${siteId}/drive/items/${itemId}`);
+  const ruta = decodeURIComponent(String((it.parentReference && it.parentReference.path) || ''));
+  if (!it.file || !ruta.includes(`/${rutaBase()}/`) && !ruta.endsWith(`/${rutaBase()}`)) throw new Error('Ese archivo no está en la carpeta de clientes.');
+  return { url: it['@microsoft.graph.downloadUrl'] || it.webUrl, nombre: it.name, webUrl: it.webUrl, mime: (it.file && it.file.mimeType) || null };
+}
+module.exports = { listarDocumentosPorCedula, enlaceDeArchivo, tipoDeArchivo, TIPOS_DOC, configurado, subirDocumento, nombreCarpeta, moverACliente, esClienteDefinitivo };

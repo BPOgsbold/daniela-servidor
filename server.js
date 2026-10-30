@@ -46,6 +46,7 @@ const app = express();
 app.use(cors());
 // Los documentos adjuntos llegan en base64: este endpoint admite hasta ~25mb.
 app.use('/api/adjuntar', express.json({ limit: '35mb' }));
+app.use('/api/sp/subir', express.json({ limit: '35mb' }));
 // Límite subido de 100kb (default de Express) a 2mb: una entrada de
 // conocimiento larga (ej. un Excel convertido a texto) puede pesar más de
 // 100kb y Express la rechazaría con un error 413 antes de llegar a la
@@ -2975,6 +2976,30 @@ async function exigirEquipo(req, res) {
     return null;
   }
 }
+
+// Crear cliente / subir documentos desde el panel: una sola carpeta por cédula (si ya existe, se usa esa;
+// si no, se crea en "00. En proceso"). Solo equipo (no perfil Cliente).
+app.post('/api/sp/subir', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    const { cedula, nombre, tipo, nombreArchivo, base64 } = req.body || {};
+    const ced = String(cedula || '').replace(/\D/g, '');
+    const nom = String(nombre || '').replace(/\s+/g, ' ').trim();
+    if (ced.length < 5 || ced.length > 12) return res.status(400).json({ error: 'La cédula debe tener entre 5 y 12 números.' });
+    if (nom.length < 3) return res.status(400).json({ error: 'Falta el nombre del cliente.' });
+    if (!TIPOS_DOC[tipo]) return res.status(400).json({ error: 'Tipo de documento no válido.' });
+    if (!base64) return res.status(400).json({ error: 'No llegó el archivo.' });
+    const buffer = Buffer.from(base64, 'base64');
+    if (buffer.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'El archivo pesa más de 25 MB.' });
+    const r = await subirDocumento({ cedula: ced, nombre: nom, tipo, nombreArchivo, buffer, esCliente: false });
+    console.log(`[sp/subir] ${ctx.email} subió ${TIPOS_DOC[tipo]} de ${ced}`);
+    res.json({ ok: true, carpeta: r.carpeta, archivo: r.archivo, link: r.linkCarpeta || null });
+  } catch (err) {
+    console.error('Error en /api/sp/subir:', err);
+    res.status(500).json({ error: 'No pude guardar el archivo en SharePoint. ' + (err.message || '') });
+  }
+});
 
 app.get('/api/sp/documentos', async (req, res) => {
   const ctx = await exigirEquipo(req, res); if (!ctx) return;

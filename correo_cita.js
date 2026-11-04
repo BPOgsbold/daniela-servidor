@@ -23,7 +23,7 @@ function htmlCorreo({ cli, archivos }) {
   const fecha = new Date().toLocaleDateString('es-CO', { dateStyle: 'long', timeZone: 'America/Bogota' });
   return `<div style="background:#f2f6f4;padding:24px 10px;font-family:Segoe UI,Helvetica,Arial,sans-serif">
 <div style="max-width:660px;margin:0 auto;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 6px 24px rgba(15,58,49,.12)">
- <div style="background:linear-gradient(135deg,#0f3a31,#1f6a5b);padding:26px 30px;color:#fff">
+ <div style="background-color:#0f3a31;background-image:linear-gradient(135deg,#0f3a31,#1f6a5b);padding:26px 30px;color:#ffffff">
   <div style="font-size:12px;letter-spacing:.3em;opacity:.8">GÓMEZ LEGAL ABOGADOS</div>
   <div style="font-size:26px;font-weight:700;margin-top:8px">Solicitud de cita DIAN</div>
   <div style="font-size:14px;opacity:.9;margin-top:4px">Beneficio tributario vehículos eléctricos e híbridos · ${esc(fecha)}</div>

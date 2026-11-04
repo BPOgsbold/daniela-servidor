@@ -38,7 +38,7 @@ async function obtenerToken() {
   return tokenCache.valor;
 }
 
-async function graph(ruta, opciones = {}) {
+async function graph(ruta, opciones = {}, reintento = false) {
   const token = await obtenerToken();
   const r = await fetch(ruta.startsWith('http') ? ruta : `https://graph.microsoft.com/v1.0${ruta}`, {
     ...opciones,
@@ -47,7 +47,9 @@ async function graph(ruta, opciones = {}) {
   const texto = await r.text();
   let d = {};
   try { d = texto ? JSON.parse(texto) : {}; } catch (e) { d = { raw: texto }; }
-  if (!r.ok) throw new Error(`Graph ${r.status}: ${(d.error && d.error.message) || texto.slice(0, 200)}`);
+  // 401/403: el token guardado puede ser anterior a un permiso nuevo en Azure. Se descarta y se reintenta una vez.
+  if ((r.status === 401 || r.status === 403) && !reintento) { tokenCache = { valor: null, vence: 0 }; return graph(ruta, opciones, true); }
+  if (!r.ok) throw new Error(`Graph ${r.status}: ${(d.error && d.error.message) || texto.slice(0, 200)}${r.status === 403 ? ' [buzón: ' + String(ruta).split('/')[2] + ']' : ''}`);
   return d;
 }
 

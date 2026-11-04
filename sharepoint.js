@@ -38,6 +38,14 @@ async function obtenerToken() {
   return tokenCache.valor;
 }
 
+// Diagnóstico: qué app y qué permisos trae el token (sin mostrar el token).
+function infoToken(t) {
+  try {
+    const p = JSON.parse(Buffer.from(String(t).split('.')[1], 'base64').toString('utf8'));
+    return `${p.appid || '?'} · permisos: ${(p.roles || []).join(',') || 'NINGUNO'}`;
+  } catch (e) { return 'no pude leer el token'; }
+}
+
 async function graph(ruta, opciones = {}, reintento = false) {
   const token = await obtenerToken();
   const r = await fetch(ruta.startsWith('http') ? ruta : `https://graph.microsoft.com/v1.0${ruta}`, {
@@ -49,7 +57,7 @@ async function graph(ruta, opciones = {}, reintento = false) {
   try { d = texto ? JSON.parse(texto) : {}; } catch (e) { d = { raw: texto }; }
   // 401/403: el token guardado puede ser anterior a un permiso nuevo en Azure. Se descarta y se reintenta una vez.
   if ((r.status === 401 || r.status === 403) && !reintento) { tokenCache = { valor: null, vence: 0 }; return graph(ruta, opciones, true); }
-  if (!r.ok) throw new Error(`Graph ${r.status}: ${(d.error && d.error.message) || texto.slice(0, 200)}${r.status === 403 ? ' [buzón: ' + String(ruta).split('/')[2] + ']' : ''}`);
+  if (!r.ok) throw new Error(`Graph ${r.status}: ${(d.error && d.error.message) || texto.slice(0, 200)}${r.status === 403 ? ' [buzón: ' + decodeURIComponent(String(ruta).split('/')[2]) + ' | app: ' + infoToken(token) + ']' : ''}`);
   return d;
 }
 

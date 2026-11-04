@@ -259,7 +259,7 @@ const GATES_NEGOCIACION = [
     motivoCampo: 'motivo_rechazo',
     motivos: ['No confía en el proceso', 'Precio', 'Tiempo limitado para el proceso'],
     siguientePasoOpciones: ['Pendiente de contrato', 'Pendiente de firma', 'Pendiente de pago', 'Proceso completado'],
-    servicioOpciones: ['Solo DIAN', 'Servicio completo', 'Solo UPME'],
+    servicioOpciones: ['Solo DIAN', 'Solo cita DIAN', 'Servicio completo', 'Solo UPME'],
   },
 ];
 

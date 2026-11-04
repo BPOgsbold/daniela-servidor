@@ -17,7 +17,8 @@ const {
 } = require('./supabase');
 const { buscarDuplicados, eliminarCasoDeSesion } = require('./duplicados');
 
-const { TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento, moverACliente, esClienteDefinitivo, listarDocumentosPorCedula, listarDocumentosDeCarpeta, listarCarpetasClientes, enlaceDeArchivo } = require('./sharepoint');
+const { htmlCorreo, REMITENTE, DESTINOS, ES_REAL, mb: mbCorreo } = require('./correo_cita');
+const { descargarArchivo, enviarCorreo, TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento, moverACliente, esClienteDefinitivo, listarDocumentosPorCedula, listarDocumentosDeCarpeta, listarCarpetasClientes, enlaceDeArchivo } = require('./sharepoint');
 
 
 // Todas las creaciones de casos pasan por aquí: si ya existe un cliente con ese
@@ -29,7 +30,10 @@ async function crearCaso(sessionId, asesor, datos) {
     try {
       dup = await buscarDuplicados({ telefono: datos.telefono, numero_identificacion: datos.numero_identificacion });
     } catch (errDup) {
-      console.error('No se pudo verificar duplicados (se sigue):', errDup.message);
+      console.error('No se pudo verificar duplicados (se BLOQUEA por seguridad):', errDup.message);
+      const e0 = new Error('No pude verificar si el cliente ya existe. Intenta de nuevo en un momento (no se creó nada).');
+      e0.code = 'DUPLICADO';
+      throw e0;
     }
     if (dup.casos.length) {
       const e = new Error(`Ya existe un cliente con ese ${dup.campo === 'telefono' ? 'teléfono' : 'número de documento'} (${dup.casos[0].nombre_cliente || 'sin nombre'}). No se crea otro: retómalo con "buscar cliente".`);
@@ -3034,6 +3038,53 @@ app.get('/api/sp/enlace', async (req, res) => {
   } catch (err) {
     console.error('Error generando enlace de SharePoint:', err);
     res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+
+// ---- Correo "Solicitud cita DIAN" (cuando el cliente pasa de Certificado UPME emitido a Pendiente cita DIAN) ----
+app.post('/api/solicitud-cita-dian', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  const { clienteId, reenviar } = req.body || {};
+  const sbx = ctx.sb;
+  let reclamado = false;
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    const { data: cli, error } = await sbx.from('BD_Cliente_GLA').select('*').eq('id', clienteId).maybeSingle();
+    if (error || !cli) return res.status(404).json({ error: 'No encontré el cliente.' });
+    if (!cli.fecha_certificado_upme_emitido) return res.status(400).json({ error: 'El cliente aún no tiene "Certificado UPME emitido".' });
+    if (String(cli.resultado_certificado_upme || '').toLowerCase() === 'rechazado') return res.status(400).json({ error: 'El certificado UPME quedó Rechazado: no se solicita cita DIAN.' });
+    if (cli.correo_cita_dian_enviado_en && !reenviar) return res.json({ ok: true, yaEnviado: true, enviado_en: cli.correo_cita_dian_enviado_en });
+    // Reserva atómica: evita que dos clics/pestañas manden el mismo correo dos veces.
+    const ahora = new Date().toISOString();
+    if (!reenviar) {
+      const { data: tomado } = await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: ahora }).eq('id', cli.id).is('correo_cita_dian_enviado_en', null).select('id');
+      if (!tomado || !tomado.length) return res.json({ ok: true, yaEnviado: true });
+      reclamado = true;
+    }
+    const ced = String(cli.numero_identificacion || '').replace(/\D/g, '');
+    const lista = await listarDocumentosPorCedula(ced);
+    if (!lista.encontrada) throw new Error('No encontré la carpeta del cliente en SharePoint (cédula ' + ced + ').');
+    const archivos = lista.archivos.filter((a) => a.tipo !== 'Contrato' && !/CONTRATO|BORRADOR/i.test(a.nombre));
+    if (!archivos.length) throw new Error('La carpeta del cliente no tiene documentos para adjuntar.');
+    const adjuntos = [];
+    let total = 0;
+    for (const a of archivos) {
+      const d = await descargarArchivo(a.id);
+      total += d.buffer.length;
+      adjuntos.push(d);
+    }
+    if (total > 33 * 1024 * 1024) throw new Error('Los documentos pesan ' + mbCorreo(total) + ' en total (el máximo del correo es ~33 MB).');
+    const asunto = (ES_REAL() ? '' : '[PRUEBA] ') + `Solicitud cita DIAN – ${cli.nombre_cliente || ''} (CC ${ced})`;
+    await enviarCorreo({ remitente: REMITENTE(), destinatarios: DESTINOS(), asunto, html: htmlCorreo({ cli, archivos }), adjuntos });
+    await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: ahora }).eq('id', cli.id);
+    if (cli.caso_id) await sbx.from('panel_historial').insert({ caso_id: cli.caso_id, campo: 'correo_cita_dian', valor_anterior: null, valor_nuevo: `Enviado a ${DESTINOS().length} destinatarios con ${adjuntos.length} adjuntos`, usuario_email: ctx.email }).then(() => {}, () => {});
+    console.log(`[cita-dian] ${ctx.email} → correo de ${ced} con ${adjuntos.length} adjuntos`);
+    res.json({ ok: true, adjuntos: adjuntos.length, destinatarios: DESTINOS().length });
+  } catch (err) {
+    if (reclamado) await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: null }).eq('id', clienteId).then(() => {}, () => {});
+    console.error('Error en /api/solicitud-cita-dian:', err);
+    res.status(500).json({ error: 'No pude enviar el correo. ' + (err.message || '') });
   }
 });
 

@@ -316,4 +316,41 @@ async function enlaceDeArchivo(itemId) {
   if (!it.file || !ruta.includes(`/${rutaBase()}/`) && !ruta.endsWith(`/${rutaBase()}`)) throw new Error('Ese archivo no está en la carpeta de clientes.');
   return { url: it['@microsoft.graph.downloadUrl'] || it.webUrl, nombre: it.name, webUrl: it.webUrl, mime: (it.file && it.file.mimeType) || null };
 }
-module.exports = { listarDocumentosPorCedula, listarDocumentosDeCarpeta, listarCarpetasClientes, enlaceDeArchivo, tipoDeArchivo, TIPOS_DOC, configurado, subirDocumento, nombreCarpeta, moverACliente, esClienteDefinitivo };
+
+// Descarga el contenido de un archivo de la carpeta de clientes.
+async function descargarArchivo(itemId) {
+  const e = await enlaceDeArchivo(itemId);
+  const r = await fetch(e.url);
+  if (!r.ok) throw new Error(`No pude descargar ${e.nombre} (${r.status})`);
+  return { nombre: e.nombre, buffer: Buffer.from(await r.arrayBuffer()), mime: e.mime };
+}
+
+// Envía un correo con adjuntos desde un buzón (Graph: borrador + adjuntos + enviar).
+// Permite adjuntos grandes (sesión de carga por pedazos). Requiere el permiso Mail.Send de aplicación.
+async function enviarCorreo({ remitente, destinatarios, asunto, html, adjuntos }) {
+  const u = `/users/${encodeURIComponent(remitente)}`;
+  const borrador = await graph(`${u}/messages`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ subject: asunto, importance: 'high', body: { contentType: 'HTML', content: html },
+      toRecipients: destinatarios.map((a) => ({ emailAddress: { address: a } })) }),
+  });
+  const id = borrador.id;
+  for (const a of adjuntos || []) {
+    if (a.buffer.length <= 2.5 * 1024 * 1024) {
+      await graph(`${u}/messages/${id}/attachments`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ '@odata.type': '#microsoft.graph.fileAttachment', name: a.nombre, contentType: a.mime || 'application/octet-stream', contentBytes: a.buffer.toString('base64') }) });
+    } else {
+      const ses = await graph(`${u}/messages/${id}/attachments/createUploadSession`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ AttachmentItem: { attachmentType: 'file', name: a.nombre, size: a.buffer.length, contentType: a.mime || 'application/octet-stream' } }) });
+      const TAM = 327680 * 12; // múltiplo de 320 KiB
+      for (let ini = 0; ini < a.buffer.length; ini += TAM) {
+        const fin = Math.min(ini + TAM, a.buffer.length);
+        const r = await fetch(ses.uploadUrl, { method: 'PUT', headers: { 'Content-Length': String(fin - ini), 'Content-Range': `bytes ${ini}-${fin - 1}/${a.buffer.length}` }, body: a.buffer.subarray(ini, fin) });
+        if (!r.ok) throw new Error(`No pude subir el adjunto ${a.nombre} (${r.status})`);
+      }
+    }
+  }
+  await graph(`${u}/messages/${id}/send`, { method: 'POST' });
+}
+
+module.exports = { descargarArchivo, enviarCorreo, listarDocumentosPorCedula, listarDocumentosDeCarpeta, listarCarpetasClientes, enlaceDeArchivo, tipoDeArchivo, TIPOS_DOC, configurado, subirDocumento, nombreCarpeta, moverACliente, esClienteDefinitivo };

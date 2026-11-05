@@ -26,11 +26,13 @@
         "WhatsApp Cliente",
         "Referido",
         "RRSS",
-        "Referix"
+        "Referix",
+        "EPM",
+        "Familia"
       ],
       "prompt": "¿Cuál fue la fuente de este cliente?",
       "regex": "^.{2,}$",
-      "errorMessage": "Selecciona uno de los botones, o escribe la fuente exacta (Cita Sura, WhatsApp Sura, WhatsApp Cliente, Referido, RRSS o Referix)."
+      "errorMessage": "Selecciona uno de los botones, o escribe la fuente exacta (Cita Sura, WhatsApp Sura, WhatsApp Cliente, Referido, RRSS, Referix, EPM o Familia)."
     },
     {
       "id": "nombre_cliente",

@@ -3277,6 +3277,8 @@ app.patch('/api/usuarios', async (req, res) => {
   }
 });
 
+require('./wasapi')(app, { obtenerConocimientoTexto, sbServicio });
+
 app.listen(PORT, () => {
   console.log(`Servidor de Daniela (Gómez Legal Abogados) escuchando en http://localhost:${PORT}`);
 });

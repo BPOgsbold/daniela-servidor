@@ -3062,6 +3062,11 @@ app.post('/api/solicitud-cita-dian', async (req, res) => {
       if (!tomado || !tomado.length) return res.json({ ok: true, yaEnviado: true });
       reclamado = true;
     }
+    // Ciudad del cliente (define la seccional DIAN): del cliente o, si falta, de su caso.
+    if (cli.caso_id && (!cli.ciudad || !cli.seccional)) {
+      const { data: caso } = await sbx.from('Perfilamiento_y_ventas_GLA').select('*').eq('id', cli.caso_id).maybeSingle();
+      if (caso) { cli.ciudad = cli.ciudad || caso.ciudad || caso.municipio || null; cli.seccional = cli.seccional || caso.seccional || null; }
+    }
     const ced = String(cli.numero_identificacion || '').replace(/\D/g, '');
     const lista = await listarDocumentosPorCedula(ced);
     if (!lista.encontrada) throw new Error('No encontré la carpeta del cliente en SharePoint (cédula ' + ced + ').');
@@ -3084,7 +3089,7 @@ app.post('/api/solicitud-cita-dian', async (req, res) => {
       adjuntos.push(d);
     }
     if (total > 33 * 1024 * 1024) throw new Error('Los documentos pesan ' + mbCorreo(total) + ' en total (el máximo del correo es ~33 MB).');
-    const asunto = (ES_REAL() ? '' : '[PRUEBA] ') + `Solicitud cita DIAN – ${cli.nombre_cliente || ''} (CC ${ced}${cli.placa ? ' · placa ' + cli.placa : ''})`;
+    const asunto = (ES_REAL() ? '' : '[PRUEBA] ') + `Solicitud cita DIAN – ${cli.nombre_cliente || ''} (CC ${ced}${cli.placa ? ' · placa ' + cli.placa : ''}${cli.ciudad ? ' · ' + cli.ciudad : ''})`;
     await enviarCorreo({ remitente: REMITENTE(), destinatarios: DESTINOS(), asunto, html: htmlCorreo({ cli, archivos }), adjuntos });
     await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: ahora }).eq('id', cli.id);
     if (cli.caso_id) await sbx.from('panel_historial').insert({ caso_id: cli.caso_id, campo: 'correo_cita_dian', valor_anterior: null, valor_nuevo: `Enviado a ${DESTINOS().length} destinatarios con ${adjuntos.length} adjuntos`, usuario_email: ctx.email }).then(() => {}, () => {});

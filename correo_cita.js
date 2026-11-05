@@ -34,7 +34,7 @@ function htmlCorreo({ cli, archivos }) {
   Solicitamos amablemente el <b>agendamiento de la cita ante la DIAN</b> para continuar con la solicitud de devolución del IVA.</p>
   <div style="font-size:13px;font-weight:700;letter-spacing:.06em;color:#1f6a5b;margin:22px 0 8px">DATOS DEL CLIENTE</div>
   <table style="width:100%;border-collapse:collapse;background:#f8fbfa;border-radius:10px;overflow:hidden">
-   ${fila('Nombre', cli.nombre_cliente)}${fila('Cédula / NIT', cli.numero_identificacion)}${fila('Teléfono', cli.telefono)}${fila('Correo', cli.email || cli.correo)}${fila('Placa', cli.placa)}${fila('Código de registro UPME', cli.codigo_registro_upme)}${fila('Resultado certificado UPME', cli.resultado_certificado_upme)}
+   ${fila('Nombre', cli.nombre_cliente)}${fila('Cédula / NIT', cli.numero_identificacion)}${fila('Teléfono', cli.telefono)}${fila('Correo', cli.email || cli.correo)}${fila('Ciudad (define la seccional DIAN)', cli.ciudad)}${fila('Seccional DIAN', cli.seccional)}${fila('Placa', cli.placa)}${fila('Código de registro UPME', cli.codigo_registro_upme)}${fila('Resultado certificado UPME', cli.resultado_certificado_upme)}
   </table>
   <div style="font-size:13px;font-weight:700;letter-spacing:.06em;color:#1f6a5b;margin:22px 0 8px">DOCUMENTACIÓN ADJUNTA (${archivos.length})</div>
   <table style="width:100%;border-collapse:collapse;background:#f8fbfa;border-radius:10px;overflow:hidden">${docs || '<tr><td style="padding:10px 14px;font-size:13px">No se encontraron documentos en la carpeta del cliente.</td></tr>'}</table>

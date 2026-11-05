@@ -15,13 +15,13 @@ MEMORIA Y ARCHIVOS (muy importante)
 - Recibes la conversación completa y la ficha del cliente ya recopilada. NUNCA vuelvas a preguntar un dato que ya está en la ficha o que el cliente ya dijo; confírmalo solo si es dudoso.
 - Si el cliente envía un PDF o una imagen, léelo: extrae nombre, marca, modelo, fecha, valor, IVA, etc. y llena la ficha. Agradece y pregunta solo lo que falte.
 - Si manda un archivo que no puedes leer, dile que lo revisará un consultor y sigue con la siguiente pregunta pendiente.
-- La guía de conocimiento puede traer precios, honorarios o tarifas: IGNÓRALOS por completo; jamás menciones cifras de dinero (solo el 5 % del IVA como beneficio, sin montos calculados). Si preguntan costos, aplica la regla de PRECIOS.
+- La guía de conocimiento puede traer precios, honorarios o tarifas: IGNÓRALOS. Los únicos valores que puedes decir son los de la ETAPA 3 del prompt (según origen), y solo en esa etapa.
 - Suena como un abogado cercano asesorando, no como un formulario.
 - Si el cliente manda varios mensajes seguidos, respóndelos juntos en un solo mensaje corto.
 SALIDA: responde SOLO un JSON válido, sin texto fuera de él:
-{"respuesta":"texto para el cliente, plano, 1 a 3 frases","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"documentos_recibidos":[],"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null}
-En "perfil" pon solo lo que sepas (conserva lo anterior). "traspasar":true SOLO cuando ya tengas TODA la ficha (nombre, marca_modelo, tipo_vehiculo, compro_nuevo, fecha_compra, titular_factura, tiene_certificado_upme, ciudad, origen) y la factura recibida o confirmado qué falta; entonces "motivo_traspaso":"completo" y "respuesta":"" (el sistema pide el momento y entrega al agente). Si es un caso de TRASPASA A HUMANO (empresa, leasing, molestia, contrato, pago, etc.) usa "motivo_traspaso":"escalamiento". Mientras falten datos, NO traspases: sigue perfilando con la siguiente pregunta pendiente.`;
-const CAMPOS_CLAVE = ['nombre', 'marca_modelo', 'tipo_vehiculo', 'compro_nuevo', 'fecha_compra', 'titular_factura', 'tiene_certificado_upme', 'ciudad', 'origen'];
+{"respuesta":"texto para el cliente, plano (puede tener 2 o 3 mensajes cortos separados por una línea en blanco)","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"saldos_dian":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"documentos_recibidos":[],"objeciones":null,"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null,"causa_escalamiento":null}
+En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula". "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, acepta_avanzar=true y documentos factura, rut y cedula recibidos (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
+const CAMPOS_CLAVE = ['nombre', 'marca_modelo', 'tipo_vehiculo', 'compro_nuevo', 'fecha_compra', 'titular_factura', 'tiene_certificado_upme', 'ciudad', 'saldos_dian', 'origen'];
 
 const pendientes = new Map(); // wa_id -> { timer, items, from_id }
 const vistos = new Set();     // wam_id ya procesados (dedupe en memoria)
@@ -178,10 +178,16 @@ async function procesar(waId, deps) {
     let partes = respuesta ? respuesta.split(/\n\s*\n/).slice(0, 3) : [];
     if (j && j.traspasar) {
       const falta = CAMPOS_CLAVE.filter((k) => !perfil[k]);
-      const escala = j.motivo_traspaso === 'escalamiento';
+      const docs = (Array.isArray(perfil.documentos_recibidos) ? perfil.documentos_recibidos : []).join(' ').toLowerCase();
+      if (!perfil.acepta_avanzar) falta.push('acepta_avanzar');
+      if (!/factura/.test(docs)) falta.push('doc_factura');
+      if (!/rut/.test(docs)) falta.push('doc_rut');
+      if (!/c[eé]dula|cedula/.test(docs)) falta.push('doc_cedula');
+      const CAUSAS = ['empresa','dos_propietarios','apoderado','rut_42_48','leasing','iva_19','error_certificado','cuenta_digital','inadmision','plazo_critico','cliente_molesto','pide_contrato','pide_estado','pide_llamada'];
+      const escala = j.motivo_traspaso === 'escalamiento' && CAUSAS.includes(j.causa_escalamiento);
       if (!escala && falta.length) {
         // Aún no está completa la ficha: no se entrega al agente, se sigue perfilando.
-        if (!partes.length) partes = ['Con gusto. Para dejar todo listo, ¿me confirma su ' + falta[0].replace(/_/g, ' ') + '?'];
+        if (!partes.length) partes = [({ acepta_avanzar: 'Para dejar todo listo, ¿avanzamos con su caso?', saldos_dian: 'Una última consulta para validar su beneficio: ¿tiene saldos pendientes por pagar ante la DIAN?', origen: '¿Cómo llegó con nosotros? ¿Fue por SURA, por EPM, Grupo Confamilia u otro medio?', doc_factura: '¿Me puede enviar la factura de compra en PDF o imagen?', doc_rut: '¿Me puede enviar su RUT actualizado, de menos de 30 días?', doc_cedula: '¿Me envía también una copia de su cédula por ambas caras?' })[falta[0]] || ('Para dejar todo listo, ¿me confirma su ' + falta[0].replace(/_/g, ' ') + '?')];
       } else {
         estado = 'humano';
         const n = perfil.nombre ? ', ' + String(perfil.nombre).split(' ')[0] : '';

@@ -40,11 +40,31 @@ async function enviarTexto(waId, fromId, texto) {
 // Intenta obtener el archivo adjunto. La documentación pública de Wasapi no
 // publica un campo con la URL; probamos los nombres habituales y, si no hay,
 // dejamos el payload guardado (raw) para ajustarlo.
-function urlDeArchivo(d) {
-  for (const k of ['media_url', 'url', 'link', 'file_url', 'attachment_url']) {
-    if (typeof d[k] === 'string' && /^https?:\/\//.test(d[k])) return d[k];
+function buscarURL(o, prof = 0) {
+  if (!o || prof > 4) return null;
+  if (typeof o === 'string') return /^https?:\/\/\S+$/.test(o) ? o : null;
+  if (typeof o === 'object') {
+    for (const k of ['media_url', 'url', 'link', 'file_url', 'attachment_url', 'download_url', 'path']) {
+      const u = buscarURL(o[k], prof + 1); if (u) return u;
+    }
+    for (const v of Object.values(o)) { const u = buscarURL(v, prof + 1); if (u) return u; }
   }
-  if (typeof d.data === 'string' && /^https?:\/\//.test(d.data)) return d.data;
+  return null;
+}
+async function urlDeArchivo(d) {
+  const directa = buscarURL(d);
+  if (directa) return directa;
+  // Plan B: pedir el detalle del mensaje a Wasapi y buscar ahí un enlace.
+  for (const id of [d.wam_id, d.id]) {
+    if (!id) continue;
+    try {
+      const r = await fetch(API + '/whatsapp-messages/detail/' + encodeURIComponent(id), { headers: { Authorization: 'Bearer ' + process.env.WASAPI_API_KEY, Accept: 'application/json' } });
+      const j = await r.json().catch(() => null);
+      console.log('wasapi detalle', id, r.status, JSON.stringify(j).slice(0, 600));
+      d.__detalle = j;
+      const u = buscarURL(j); if (u) return u;
+    } catch (e) { console.error('wasapi detalle:', e.message); }
+  }
   return null;
 }
 async function bajarArchivo(url) {
@@ -114,14 +134,14 @@ async function procesar(waId, deps) {
       else if (d.caption) textos.push(d.caption);
       if (['image', 'document', 'sticker'].includes(d.message_type)) {
         archivos.push(d.filename || d.message_type);
-        const url = urlDeArchivo(d);
+        const url = await urlDeArchivo(d);
         let leido = false;
         if (url) {
           try { const f = await bajarArchivo(url); const b = bloqueArchivo(f.buf, f.tipo, d.filename); if (b) { bloques.push(b); leido = true; } } catch (e) { console.error('wasapi archivo:', e.message); }
         }
         if (!leido) {
           textos.push('[El cliente envió un archivo (' + (d.filename || d.message_type) + ') que no pude abrir]');
-          conv.ultimo_payload_archivo = d; // para ajustar la lectura de adjuntos
+          conv.ultimo_payload_archivo = d; console.log('wasapi archivo sin URL:', JSON.stringify(d).slice(0, 1500)); // para ajustar la lectura de adjuntos
         }
       } else if (['audio', 'video'].includes(d.message_type)) {
         textos.push('[El cliente envió un ' + d.message_type + ' que no se puede escuchar; pídele amablemente que lo escriba]');

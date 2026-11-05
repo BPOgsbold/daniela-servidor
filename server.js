@@ -3065,7 +3065,16 @@ app.post('/api/solicitud-cita-dian', async (req, res) => {
     const ced = String(cli.numero_identificacion || '').replace(/\D/g, '');
     const lista = await listarDocumentosPorCedula(ced);
     if (!lista.encontrada) throw new Error('No encontré la carpeta del cliente en SharePoint (cédula ' + ced + ').');
-    const archivos = lista.archivos.filter((a) => a.tipo !== 'Contrato' && !/CONTRATO|BORRADOR/i.test(a.nombre));
+    let archivos = lista.archivos.filter((a) => a.tipo !== 'Contrato' && !/CONTRATO|BORRADOR/i.test(a.nombre));
+    // Cliente con varios vehículos: solo viajan los documentos del vehículo de ESTA tarjeta (su placa)
+    // más los comunes (sin ninguna placa en el nombre: cédula, RUT, certificación bancaria...).
+    const normPl = (t) => String(t || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const miPlaca = normPl(cli.placa);
+    if (miPlaca.length >= 5) {
+      const { data: otros } = await sbx.from('BD_Cliente_GLA').select('placa').eq('numero_identificacion', cli.numero_identificacion).neq('id', cli.id);
+      const otrasPlacas = (otros || []).map((o) => normPl(o.placa)).filter((x) => x.length >= 5 && x !== miPlaca);
+      if (otrasPlacas.length) archivos = archivos.filter((a) => { const n = normPl(a.nombre); return !otrasPlacas.some((pl) => n.includes(pl)); });
+    }
     if (!archivos.length) throw new Error('La carpeta del cliente no tiene documentos para adjuntar.');
     const adjuntos = [];
     let total = 0;
@@ -3075,7 +3084,7 @@ app.post('/api/solicitud-cita-dian', async (req, res) => {
       adjuntos.push(d);
     }
     if (total > 33 * 1024 * 1024) throw new Error('Los documentos pesan ' + mbCorreo(total) + ' en total (el máximo del correo es ~33 MB).');
-    const asunto = (ES_REAL() ? '' : '[PRUEBA] ') + `Solicitud cita DIAN – ${cli.nombre_cliente || ''} (CC ${ced})`;
+    const asunto = (ES_REAL() ? '' : '[PRUEBA] ') + `Solicitud cita DIAN – ${cli.nombre_cliente || ''} (CC ${ced}${cli.placa ? ' · placa ' + cli.placa : ''})`;
     await enviarCorreo({ remitente: REMITENTE(), destinatarios: DESTINOS(), asunto, html: htmlCorreo({ cli, archivos }), adjuntos });
     await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: ahora }).eq('id', cli.id);
     if (cli.caso_id) await sbx.from('panel_historial').insert({ caso_id: cli.caso_id, campo: 'correo_cita_dian', valor_anterior: null, valor_nuevo: `Enviado a ${DESTINOS().length} destinatarios con ${adjuntos.length} adjuntos`, usuario_email: ctx.email }).then(() => {}, () => {});
@@ -3085,6 +3094,97 @@ app.post('/api/solicitud-cita-dian', async (req, res) => {
     if (reclamado) await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: null }).eq('id', clienteId).then(() => {}, () => {});
     console.error('Error en /api/solicitud-cita-dian:', err);
     res.status(500).json({ error: 'No pude enviar el correo. ' + (err.message || '') });
+  }
+});
+
+// ============ Análisis de conversaciones (Chattigo) con IA ============
+async function llamarIA(sistema, mensajes, maxTokens) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) throw new Error('Falta ANTHROPIC_API_KEY en el servidor.');
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: process.env.CHAT_ANALISIS_MODELO || 'claude-sonnet-4-5', max_tokens: maxTokens || 1200, system: sistema, messages: mensajes }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((j.error && j.error.message) || ('IA error ' + r.status));
+  return (j.content || []).map((b) => b.text || '').join('').trim();
+}
+const CAMPOS_CLIENTE_IA = ['nombre_cliente', 'placa', 'numero_identificacion', 'estado', 'estado_caso', 'etapa', 'tipo_servicio', 'servicio', 'vehiculo', 'asesor', 'observaciones'];
+function resumenClienteIA(fila) {
+  if (!fila) return null;
+  const o = {};
+  for (const k of CAMPOS_CLIENTE_IA) if (fila[k] != null && fila[k] !== '') o[k] = fila[k];
+  for (const k of Object.keys(fila)) if (/^fecha_/.test(k) && fila[k]) o[k] = String(fila[k]).slice(0, 10);
+  return o;
+}
+function textoChatIA(c, max) {
+  const ms = (c.mensajes || []).slice(-(max || 60));
+  return ms.map((m) => `[${String(m.fecha || '').slice(0, 16).replace('T', ' ')}] ${m.tipo === 'INBOUND' ? 'CLIENTE' : (m.tipo === 'OUTBOUND' ? 'AGENTE ' + (m.remitente || '') : (m.tipo === 'MASSIVE' ? 'PLANTILLA' : 'SISTEMA'))}: ${String(m.texto || '').replace(/\s+/g, ' ').slice(0, 500)}`).join('\n');
+}
+async function datosCruzadosIA(sbx, convs) {
+  const cIds = [...new Set(convs.map((c) => c.cliente_id).filter(Boolean))];
+  const kIds = [...new Set(convs.map((c) => c.caso_id).filter(Boolean))];
+  const [a, b] = await Promise.all([
+    cIds.length ? sbx.from('BD_Cliente_GLA').select('*').in('id', cIds) : { data: [] },
+    kIds.length ? sbx.from('Perfilamiento_y_ventas_GLA').select('*').in('id', kIds) : { data: [] },
+  ]);
+  const mc = new Map((a.data || []).map((x) => [String(x.id), x]));
+  const mk = new Map((b.data || []).map((x) => [String(x.id), x]));
+  return (c) => ({ cliente: resumenClienteIA(mc.get(String(c.cliente_id))), caso: resumenClienteIA(mk.get(String(c.caso_id))) });
+}
+const ESTADOS_CHAT_IA = ['Sin respuesta del cliente', 'Interesado / pidiendo información', 'Reagendar llamada', 'Cotización / precio enviado', 'Aceptó, en trámite', 'No interesado / cerrado', 'Requiere atención humana'];
+
+app.post('/api/chats/analizar', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    const ids = (Array.isArray(req.body && req.body.ids) ? req.body.ids : []).map(String).slice(0, 5);
+    if (!ids.length) return res.json({ ok: true, hechos: 0 });
+    const { data: convs, error } = await ctx.sb.from('chat_conversaciones').select('*').in('id_chat', ids);
+    if (error) throw error;
+    const cruz = await datosCruzadosIA(ctx.sb, convs || []);
+    let hechos = 0; const errores = [];
+    for (const c of convs || []) {
+      try {
+        const extra = cruz(c);
+        const sistema = 'Eres analista comercial de Gómez Legal Abogados (devolución de IVA en vehículos eléctricos/híbridos, alianza con SURA; el trámite incluye certificado UPME y cita DIAN). Analizas conversaciones de WhatsApp (Chattigo) entre clientes y agentes. Responde SOLO un JSON válido, sin texto extra, con las claves: estado (uno de: ' + ESTADOS_CHAT_IA.join(' | ') + '), resumen (máx 3 frases, en español), sentimiento (positivo|neutral|negativo), siguiente_paso (acción concreta para el equipo, 1 frase), alerta (true si hay riesgo: cliente molesto, sin respuesta del equipo, pidió reagendar y nadie respondió, o lleva días sin atención), motivo_alerta (texto corto o ""), tema (2-4 palabras). Los mensajes tipo PLANTILLA son envíos masivos automáticos; SISTEMA son asignaciones de chat. Sé fiel a lo que dice la conversación; no inventes.';
+        const usuario = `Contacto: ${c.contacto || 'sin nombre'} (tel ${c.telefono10 || '—'}). Agente actual: ${c.agente || 'sin asignar'}.\nDatos que ya tenemos del cliente: ${JSON.stringify(extra)}\n\nConversación:\n${textoChatIA(c, 80)}`;
+        let t = await llamarIA(sistema, [{ role: 'user', content: usuario }], 700);
+        t = t.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+        const a = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1));
+        await ctx.sb.from('chat_conversaciones').update({ analisis: a, analizado_en: new Date().toISOString(), msgs_analizados: (c.mensajes || []).length }).eq('id_chat', c.id_chat);
+        hechos++;
+      } catch (e1) { errores.push(c.id_chat + ': ' + (e1.message || e1)); }
+    }
+    res.json({ ok: true, hechos, errores });
+  } catch (err) {
+    console.error('Error en /api/chats/analizar:', err);
+    res.status(500).json({ error: err.message || 'No pude analizar las conversaciones' });
+  }
+});
+
+app.post('/api/chats/preguntar', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    const pregunta = String((req.body && req.body.pregunta) || '').slice(0, 1500).trim();
+    if (!pregunta) return res.status(400).json({ error: 'Escribe una pregunta.' });
+    const hist = (Array.isArray(req.body.historial) ? req.body.historial : []).slice(-6).map((h) => ({ role: h.rol === 'ia' ? 'assistant' : 'user', content: String(h.texto || '').slice(0, 2000) }));
+    const { data: convs, error } = await ctx.sb.from('chat_conversaciones').select('*').order('ultimo_mensaje', { ascending: false }).limit(400);
+    if (error) throw error;
+    const cruz = await datosCruzadosIA(ctx.sb, convs || []);
+    const ahora = Date.now();
+    const bloques = (convs || []).map((c) => {
+      const a = c.analisis || {};
+      const dias = c.ultimo_mensaje ? Math.floor((ahora - new Date(c.ultimo_mensaje).getTime()) / 86400000) : null;
+      const ult = (c.mensajes || []).filter((m) => m.tipo === 'INBOUND' || m.tipo === 'OUTBOUND').slice(-3).map((m) => (m.tipo === 'INBOUND' ? 'CLIENTE: ' : 'AGENTE: ') + String(m.texto || '').replace(/\s+/g, ' ').slice(0, 200)).join(' | ');
+      return `#chat:${c.id_chat} | ${c.contacto || 'sin nombre'} | tel ${c.telefono10 || '—'} | agente ${c.agente || '—'} | último mensaje hace ${dias == null ? '?' : dias} d | estado IA: ${a.estado || 'sin analizar'} | resumen: ${a.resumen || '—'} | siguiente paso: ${a.siguiente_paso || '—'} | alerta: ${a.alerta ? 'SÍ ' + (a.motivo_alerta || '') : 'no'} | en panel: ${JSON.stringify(cruz(c))} | últimos mensajes: ${ult}`;
+    }).join('\n');
+    const sistema = 'Eres el asistente de análisis de conversaciones de Gómez Legal Abogados (canal WhatsApp/Chattigo, campaña de beneficio tributario SURA). Respondes en español, claro y breve, SOLO con base en las conversaciones listadas abajo. Cada vez que menciones a un cliente, cita su conversación con el formato exacto [[chat:ID]] (el ID aparece como #chat:ID) para que el panel ponga un enlace a la conversación. Si no hay datos suficientes, dilo. Si piden listas, usa viñetas cortas con nombre, estado y [[chat:ID]]. Hoy es ' + new Date().toISOString().slice(0, 10) + '.\n\nCONVERSACIONES:\n' + (bloques || '(no hay conversaciones cargadas)');
+    const respuesta = await llamarIA(sistema, [...hist, { role: 'user', content: pregunta }], 1500);
+    res.json({ ok: true, respuesta });
+  } catch (err) {
+    console.error('Error en /api/chats/preguntar:', err);
+    res.status(500).json({ error: err.message || 'No pude responder' });
   }
 });
 

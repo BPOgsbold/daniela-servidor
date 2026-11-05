@@ -3138,7 +3138,7 @@ async function datosCruzadosIA(sbx, convs) {
   const mk = new Map((b.data || []).map((x) => [String(x.id), x]));
   return (c) => ({ cliente: resumenClienteIA(mc.get(String(c.cliente_id))), caso: resumenClienteIA(mk.get(String(c.caso_id))) });
 }
-const ESTADOS_CHAT_IA = ['Sin respuesta del cliente', 'Interesado / pidiendo información', 'Reagendar llamada', 'Cotización / precio enviado', 'Aceptó, en trámite', 'No interesado / cerrado', 'Requiere atención humana'];
+const ESTADOS_CHAT_IA = ['Sin clasificar / fuera de alcance', 'Sin respuesta del cliente', 'Interesado / pidiendo información', 'Reagendar llamada', 'Cotización / precio enviado', 'Aceptó, en trámite', 'No interesado / cerrado', 'Requiere atención humana'];
 
 app.post('/api/chats/analizar', async (req, res) => {
   const ctx = await exigirEquipo(req, res); if (!ctx) return;
@@ -3152,11 +3152,22 @@ app.post('/api/chats/analizar', async (req, res) => {
     for (const c of convs || []) {
       try {
         const extra = cruz(c);
-        const sistema = 'Eres analista comercial de Gómez Legal Abogados (devolución de IVA en vehículos eléctricos/híbridos, alianza con SURA; el trámite incluye certificado UPME y cita DIAN). Analizas conversaciones de WhatsApp (Chattigo) entre clientes y agentes. Responde SOLO un JSON válido, sin texto extra, con las claves: estado (uno de: ' + ESTADOS_CHAT_IA.join(' | ') + '), resumen (máx 3 frases, en español), sentimiento (positivo|neutral|negativo), siguiente_paso (acción concreta para el equipo, 1 frase), alerta (true si hay riesgo: cliente molesto, sin respuesta del equipo, pidió reagendar y nadie respondió, o lleva días sin atención), motivo_alerta (texto corto o ""), tema (2-4 palabras). Los mensajes tipo PLANTILLA son envíos masivos automáticos; SISTEMA son asignaciones de chat. Sé fiel a lo que dice la conversación; no inventes.';
-        const usuario = `Contacto: ${c.contacto || 'sin nombre'} (tel ${c.telefono10 || '—'}). Agente actual: ${c.agente || 'sin asignar'}.\nDatos que ya tenemos del cliente: ${JSON.stringify(extra)}\n\nConversación:\n${textoChatIA(c, 80)}`;
-        let t = await llamarIA(sistema, [{ role: 'user', content: usuario }], 700);
+        const sistema = 'Eres analista comercial y de calidad de Gómez Legal Abogados (devolución de IVA en vehículos eléctricos/híbridos, alianza con SURA; el trámite incluye certificado UPME y cita DIAN). Analizas conversaciones de WhatsApp (Chattigo) entre clientes, el bot/agentes de SURA y nuestros agentes. Responde SOLO un JSON válido, sin texto extra, con estas claves: ' +
+          'estado (uno de: ' + ESTADOS_CHAT_IA.join(' | ') + '; usa "Sin clasificar / fuera de alcance" si el chat no trata de nuestro servicio, p.ej. citas médicas de SURA, o si no hay información suficiente), ' +
+          'tipificacion (etiqueta corta de 2-5 palabras, p.ej. "Pide reagendar llamada", "Sin dinero por ahora", "Duda de gratuidad con SURA"), confianza (alta|media|baja: qué tan seguro estás del estado), ' +
+          'resumen (máx 3 frases), sentimiento (positivo|neutral|negativo), temperatura (caliente|tibio|frio: probabilidad de comprar/continuar), probabilidad (entero 0-100 de que el cliente contrate), ' +
+          'intencion (qué quiere el cliente, 1 frase), objeciones (lista de strings cortos: precio, desconfianza, no tiene tiempo, falta documentos, etc.; [] si no hay), ' +
+          'documentos_pendientes (lista de documentos que se le pidieron y no ha enviado; []), datos_detectados (objeto con nombre, cedula, placa, vehiculo, ciudad, correo: solo lo que aparezca en el chat, si no null), ' +
+          'calidad_atencion (objeto {puntaje: 1-5, nota: 1 frase sobre cómo atendimos: rapidez, claridad, empatía}), mejora_bot (1 frase: qué falló o se puede mejorar en el flujo automático/bot o agente; "" si nada), ' +
+          'siguiente_paso (acción concreta para el equipo, 1 frase), mensaje_sugerido (texto listo para enviar por WhatsApp al cliente, cordial, máx 350 caracteres, en español, sin inventar precios distintos a los del chat), ' +
+          'alerta (true si hay riesgo: cliente molesto, sin respuesta del equipo, pidió reagendar y nadie respondió, o varios días sin atención), motivo_alerta (texto corto o ""), tema (2-4 palabras). ' +
+          'Los mensajes PLANTILLA son envíos masivos automáticos; SISTEMA son asignaciones de chat. Sé fiel a la conversación; no inventes datos.';
+        const usuario = `Contacto: ${c.contacto || 'sin nombre'} (tel ${c.telefono10 || '—'}). Agente actual: ${c.agente || 'sin asignar'}.\nDatos que ya tenemos del cliente en el panel: ${JSON.stringify(extra)}\n\nConversación:\n${textoChatIA(c, 80)}`;
+        let t = await llamarIA(sistema, [{ role: 'user', content: usuario }], 1500);
         t = t.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
         const a = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1));
+        a.v = 2;
+        if (c.analisis && c.analisis.estado_manual) a.estado_manual = c.analisis.estado_manual;
         await ctx.sb.from('chat_conversaciones').update({ analisis: a, analizado_en: new Date().toISOString(), msgs_analizados: (c.mensajes || []).length }).eq('id_chat', c.id_chat);
         hechos++;
       } catch (e1) { errores.push(c.id_chat + ': ' + (e1.message || e1)); }
@@ -3182,7 +3193,7 @@ app.post('/api/chats/preguntar', async (req, res) => {
       const a = c.analisis || {};
       const dias = c.ultimo_mensaje ? Math.floor((ahora - new Date(c.ultimo_mensaje).getTime()) / 86400000) : null;
       const ult = (c.mensajes || []).filter((m) => m.tipo === 'INBOUND' || m.tipo === 'OUTBOUND').slice(-3).map((m) => (m.tipo === 'INBOUND' ? 'CLIENTE: ' : 'AGENTE: ') + String(m.texto || '').replace(/\s+/g, ' ').slice(0, 200)).join(' | ');
-      return `#chat:${c.id_chat} | ${c.contacto || 'sin nombre'} | tel ${c.telefono10 || '—'} | agente ${c.agente || '—'} | último mensaje hace ${dias == null ? '?' : dias} d | estado IA: ${a.estado || 'sin analizar'} | resumen: ${a.resumen || '—'} | siguiente paso: ${a.siguiente_paso || '—'} | alerta: ${a.alerta ? 'SÍ ' + (a.motivo_alerta || '') : 'no'} | en panel: ${JSON.stringify(cruz(c))} | últimos mensajes: ${ult}`;
+      return `#chat:${c.id_chat} | ${c.contacto || 'sin nombre'} | tel ${c.telefono10 || '—'} | agente ${c.agente || '—'} | último mensaje hace ${dias == null ? '?' : dias} d | estado: ${a.estado_manual || a.estado || 'sin analizar'} | resumen: ${a.resumen || '—'} | siguiente paso: ${a.siguiente_paso || '—'} | tipificación: ${a.tipificacion || '—'} | temperatura: ${a.temperatura || '—'} | prob. cierre: ${a.probabilidad == null ? '—' : a.probabilidad + '%'} | objeciones: ${(a.objeciones || []).join(', ') || '—'} | docs pendientes: ${(a.documentos_pendientes || []).join(', ') || '—'} | alerta: ${a.alerta ? 'SÍ ' + (a.motivo_alerta || '') : 'no'} | en panel: ${JSON.stringify(cruz(c))} | últimos mensajes: ${ult}`;
     }).join('\n');
     const sistema = 'Eres el asistente de análisis de conversaciones de Gómez Legal Abogados (canal WhatsApp/Chattigo, campaña de beneficio tributario SURA). Respondes en español, claro y breve, SOLO con base en las conversaciones listadas abajo. Cada vez que menciones a un cliente, cita su conversación con el formato exacto [[chat:ID]] (el ID aparece como #chat:ID) para que el panel ponga un enlace a la conversación. Si no hay datos suficientes, dilo. Si piden listas, usa viñetas cortas con nombre, estado y [[chat:ID]]. Hoy es ' + new Date().toISOString().slice(0, 10) + '.\n\nCONVERSACIONES:\n' + (bloques || '(no hay conversaciones cargadas)');
     const respuesta = await llamarIA(sistema, [...hist, { role: 'user', content: pregunta }], 1500);

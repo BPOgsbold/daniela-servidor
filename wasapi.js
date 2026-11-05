@@ -15,10 +15,13 @@ MEMORIA Y ARCHIVOS (muy importante)
 - Recibes la conversación completa y la ficha del cliente ya recopilada. NUNCA vuelvas a preguntar un dato que ya está en la ficha o que el cliente ya dijo; confírmalo solo si es dudoso.
 - Si el cliente envía un PDF o una imagen, léelo: extrae nombre, marca, modelo, fecha, valor, IVA, etc. y llena la ficha. Agradece y pregunta solo lo que falte.
 - Si manda un archivo que no puedes leer, dile que lo revisará un consultor y sigue con la siguiente pregunta pendiente.
+- La guía de conocimiento puede traer precios, honorarios o tarifas: IGNÓRALOS por completo; jamás menciones cifras de dinero (solo el 5 % del IVA como beneficio, sin montos calculados). Si preguntan costos, aplica la regla de PRECIOS.
+- Suena como un abogado cercano asesorando, no como un formulario.
 - Si el cliente manda varios mensajes seguidos, respóndelos juntos en un solo mensaje corto.
 SALIDA: responde SOLO un JSON válido, sin texto fuera de él:
 {"respuesta":"texto para el cliente, plano, 1 a 3 frases","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"documentos_recibidos":[],"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null}
-En "perfil" pon solo lo que sepas (conserva lo anterior). "traspasar":true cuando aplique TRASPASA A HUMANO o el cliente quiera avanzar; en ese caso "respuesta" debe ser exactamente: ${FRASE_TRASPASO}`;
+En "perfil" pon solo lo que sepas (conserva lo anterior). "traspasar":true SOLO cuando ya tengas TODA la ficha (nombre, marca_modelo, tipo_vehiculo, compro_nuevo, fecha_compra, titular_factura, tiene_certificado_upme, ciudad, origen) y la factura recibida o confirmado qué falta; entonces "motivo_traspaso":"completo" y "respuesta":"" (el sistema pide el momento y entrega al agente). Si es un caso de TRASPASA A HUMANO (empresa, leasing, molestia, contrato, pago, etc.) usa "motivo_traspaso":"escalamiento". Mientras falten datos, NO traspases: sigue perfilando con la siguiente pregunta pendiente.`;
+const CAMPOS_CLAVE = ['nombre', 'marca_modelo', 'tipo_vehiculo', 'compro_nuevo', 'fecha_compra', 'titular_factura', 'tiene_certificado_upme', 'ciudad', 'origen'];
 
 const pendientes = new Map(); // wa_id -> { timer, items, from_id }
 const vistos = new Set();     // wam_id ya procesados (dedupe en memoria)
@@ -152,11 +155,24 @@ async function procesar(waId, deps) {
     if (j && j.datos_archivo) historial[historial.length - 1].texto += '\n[Lectura del archivo: ' + j.datos_archivo + ']';
 
     let estado = 'bot';
-    if (j && j.traspasar) { estado = 'humano'; respuesta = FRASE_TRASPASO; }
+    let partes = respuesta ? respuesta.split(/\n\s*\n/).slice(0, 3) : [];
+    if (j && j.traspasar) {
+      const falta = CAMPOS_CLAVE.filter((k) => !perfil[k]);
+      const escala = j.motivo_traspaso === 'escalamiento';
+      if (!escala && falta.length) {
+        // Aún no está completa la ficha: no se entrega al agente, se sigue perfilando.
+        if (!partes.length) partes = ['Con gusto. Para dejar todo listo, ¿me confirma su ' + falta[0].replace(/_/g, ' ') + '?'];
+      } else {
+        estado = 'humano';
+        const n = perfil.nombre ? ', ' + String(perfil.nombre).split(' ')[0] : '';
+        partes = escala ? [FRASE_TRASPASO] : ['Muchas gracias por toda la información' + n + '. Permítame un momento mientras organizo su caso.', FRASE_TRASPASO];
+        respuesta = partes.join('\n\n');
+      }
+    }
 
-    if (respuesta) {
-      for (const parte of respuesta.split(/\n\s*\n/).slice(0, 3)) { if (parte.trim()) { await enviarTexto(waId, p.from_id, parte.trim()); await new Promise((r) => setTimeout(r, 1200)); } }
-      historial.push({ rol: 'daniela', texto: respuesta, ts: new Date().toISOString() });
+    if (partes.length) {
+      for (const parte of partes) { if (parte.trim()) { await enviarTexto(waId, p.from_id, parte.trim()); await new Promise((r) => setTimeout(r, 1200)); } }
+      historial.push({ rol: 'daniela', texto: partes.join('\n\n'), ts: new Date().toISOString() });
     }
     await sb.from('wasapi_conversaciones').upsert({
       wa_id: waId, mensajes: historial.slice(-200), perfil, estado,

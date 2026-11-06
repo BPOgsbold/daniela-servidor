@@ -18,6 +18,7 @@ MEMORIA Y ARCHIVOS (muy importante)
 - La guía de conocimiento puede traer precios, honorarios o tarifas: IGNÓRALOS. Los únicos valores que puedes decir son los de la ETAPA 3 del prompt (según origen), y solo en esa etapa.
 - Suena como un abogado cercano asesorando, no como un formulario.
 - Si el cliente manda varios mensajes seguidos, respóndelos juntos en un solo mensaje corto.
+FORMATO: texto plano. NUNCA uses asteriscos, negritas, guiones de lista ni Markdown; WhatsApp los muestra mal.
 SALIDA: responde SOLO un JSON válido, sin texto fuera de él:
 {"respuesta":"texto para el cliente, plano (puede tener 2 o 3 mensajes cortos separados por una línea en blanco)","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"saldos_dian":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"documentos_recibidos":[],"objeciones":null,"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null,"causa_escalamiento":null}
 En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula". "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, acepta_avanzar=true y documentos factura, rut y cedula recibidos (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
@@ -26,6 +27,10 @@ const CAMPOS_CLAVE = ['nombre', 'marca_modelo', 'tipo_vehiculo', 'compro_nuevo',
 const pendientes = new Map(); // wa_id -> { timer, items, from_id }
 const vistos = new Set();     // wam_id ya procesados (dedupe en memoria)
 
+// WhatsApp muestra los asteriscos tal cual si no cierran bien: dejamos texto plano.
+function limpiarTexto(t) {
+  return String(t || '').replace(/[*`~]/g, '').replace(/(^|\s)_+([^_\n]+)_+(?=\s|[.,;:!?]|$)/g, '$1$2').replace(/^\s{0,3}#{1,6}\s+/gm, '').replace(/^\s*[-•]\s+/gm, '').replace(/[ \t]+\n/g, '\n').trim();
+}
 function esperaMs() { return parseInt(process.env.WASAPI_ESPERA_MS || '6000', 10); }
 
 async function enviarTexto(waId, fromId, texto) {
@@ -165,17 +170,19 @@ async function procesar(waId, deps) {
     const msgsIA = mensajesParaClaude(historial.slice(0, -1), bloques, textoCliente);
     const bruto = await llamarClaude(sistema, msgsIA);
     const j = parsearJSON(bruto);
-    let respuesta = j && typeof j.respuesta === 'string' ? j.respuesta.trim() : '';
+    let respuesta = j && typeof j.respuesta === 'string' ? limpiarTexto(j.respuesta) : '';
     if (!respuesta) {
       // Nunca enviar JSON ni etiquetas al cliente.
-      respuesta = j ? '' : bruto.replace(/[<{][\s\S]*$/, '').trim();
+      respuesta = j ? '' : limpiarTexto(bruto.replace(/[<{][\s\S]*$/, ''));
     }
     const perfil = Object.assign({}, conv.perfil || {});
     if (j && j.perfil) for (const [k, v] of Object.entries(j.perfil)) if (v !== null && v !== undefined && !(Array.isArray(v) && !v.length) && v !== '') perfil[k] = v;
     if (j && j.datos_archivo) historial[historial.length - 1].texto += '\n[Lectura del archivo: ' + j.datos_archivo + ']';
 
     let estado = 'bot';
-    let partes = respuesta ? respuesta.split(/\n\s*\n/).slice(0, 3) : [];
+    let partes = respuesta ? respuesta.split(/\n\s*\n/).filter((x) => x.trim()) : [];
+    // Nunca se pierde texto: si hay más de 5 partes, las últimas se unen en una sola.
+    if (partes.length > 5) partes = partes.slice(0, 4).concat([partes.slice(4).join('\n')]);
     if (j && j.traspasar) {
       const falta = CAMPOS_CLAVE.filter((k) => !perfil[k]);
       const docs = (Array.isArray(perfil.documentos_recibidos) ? perfil.documentos_recibidos : []).join(' ').toLowerCase();

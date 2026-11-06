@@ -286,8 +286,6 @@ module.exports = function montarWasapi(app, deps) {
       if (event !== 'receive_message' || !data || data.type !== 'in' || !data.wa_id) return;
       if (data.wam_id) { if (vistos.has(data.wam_id)) return; vistos.add(data.wam_id); if (vistos.size > 5000) vistos.clear(); }
       const waId = String(data.wa_id);
-      const ag = traeAgente(data);
-      if (ag) { console.log('wasapi: chat con agente asignado (' + ag + '), no se toma'); tomarHumano(waId, { from_id: data.from_id }, deps); return; }
       const p = pendientes.get(waId) || { items: [], from_id: data.from_id, timer: null };
       p.items.push(data); p.from_id = data.from_id;
       clearTimeout(p.timer);

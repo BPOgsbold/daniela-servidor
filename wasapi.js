@@ -91,7 +91,7 @@ async function llamarClaude(sistema, mensajes) {
   const r = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: process.env.WASAPI_MODELO || process.env.CHAT_ANALISIS_MODELO || 'claude-sonnet-4-5', max_tokens: 900, system: sistema, messages: mensajes }),
+    body: JSON.stringify({ model: process.env.WASAPI_MODELO || process.env.CHAT_ANALISIS_MODELO || 'claude-sonnet-4-5', max_tokens: 3000, system: sistema, messages: mensajes }),
   });
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error((j.error && j.error.message) || 'IA ' + r.status);
@@ -99,8 +99,11 @@ async function llamarClaude(sistema, mensajes) {
 }
 function parsearJSON(t) {
   const m = t.match(/\{[\s\S]*\}/);
-  if (!m) return null;
-  try { return JSON.parse(m[0]); } catch (_) { return null; }
+  if (m) { try { return JSON.parse(m[0]); } catch (_) { /* se intenta rescatar abajo */ } }
+  // JSON cortado o mal formado: se rescata al menos el texto para el cliente.
+  const r = t.match(/"respuesta"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (r) { try { return { respuesta: JSON.parse('"' + r[1] + '"') }; } catch (_) { return { respuesta: r[1].replace(/\\n/g, '\n').replace(/\\"/g, '"') }; } }
+  return null;
 }
 
 function mensajesParaClaude(historial, bloquesNuevos, textoNuevo) {
@@ -186,6 +189,8 @@ async function procesar(waId, deps) {
       // Nunca enviar JSON ni etiquetas al cliente.
       respuesta = j ? '' : limpiarTexto(bruto.replace(/[<{][\s\S]*$/, ''));
     }
+    // Nunca enviar basura (por ejemplo la palabra "json" de un bloque de código vacío).
+    if (!j || !j.respuesta) { if (/^\s*(json|```)?\s*$/i.test(respuesta) || respuesta.length < 8) { console.log('wasapi: respuesta de la IA no utilizable, se pide reenviar. Bruto:', String(bruto).slice(0, 300)); respuesta = 'Disculpe, no alcancé a leer bien su mensaje o archivo. ¿Me lo puede enviar de nuevo, por favor?'; } }
     const perfil = Object.assign({}, conv.perfil || {});
     if (j && j.perfil) for (const [k, v] of Object.entries(j.perfil)) if (v !== null && v !== undefined && !(Array.isArray(v) && !v.length) && v !== '') perfil[k] = v;
     if (perfil.nombre) respuesta = soloPrimerNombre(respuesta, perfil.nombre);

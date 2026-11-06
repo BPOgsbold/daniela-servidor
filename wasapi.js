@@ -122,6 +122,15 @@ function mensajesParaClaude(historial, bloquesNuevos, textoNuevo) {
   return out;
 }
 
+// Dirigirse al cliente solo por su primer nombre: se quita el apellido de cualquier texto.
+function soloPrimerNombre(texto, nombreCompleto) {
+  const toks = String(nombreCompleto || '').trim().split(/\s+/).filter(Boolean);
+  if (toks.length < 2 || !texto) return texto;
+  const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp('(?<![\\p{L}])' + esc(toks[0]) + '(?:\\s+(?:' + toks.slice(1).map(esc).join('|') + '))+(?![\\p{L}])', 'giu');
+  return String(texto).replace(re, toks[0]);
+}
+
 async function procesar(waId, deps) {
   const p = pendientes.get(waId);
   if (!p) return;
@@ -165,9 +174,11 @@ async function procesar(waId, deps) {
     try { conocimiento = await deps.obtenerConocimientoTexto(textoCliente); } catch (_) {}
     const sistema = BASE_PROMPT + '\n' + REGLAS_EXTRA +
       '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(conv.perfil || {}) +
+      (conv.perfil && conv.perfil.nombre ? '\nNOMBRE DE PILA PARA DIRIGIRTE: ' + String(conv.perfil.nombre).trim().split(/\s+/)[0] + '. Nunca uses el apellido al hablar con el cliente.' : '') +
       (conocimiento ? '\n\nGUÍA DE CONOCIMIENTO (úsala para resolver dudas; no la copies tal cual ni menciones precios):\n' + String(conocimiento).slice(0, 14000) : '');
 
-    const msgsIA = mensajesParaClaude(historial.slice(0, -1), bloques, textoCliente);
+    const histLimpio = historial.slice(0, -1).map((m) => (m.rol === 'cliente' ? m : Object.assign({}, m, { texto: soloPrimerNombre(m.texto, (conv.perfil || {}).nombre) })));
+    const msgsIA = mensajesParaClaude(histLimpio, bloques, textoCliente);
     const bruto = await llamarClaude(sistema, msgsIA);
     const j = parsearJSON(bruto);
     let respuesta = j && typeof j.respuesta === 'string' ? limpiarTexto(j.respuesta) : '';
@@ -177,6 +188,7 @@ async function procesar(waId, deps) {
     }
     const perfil = Object.assign({}, conv.perfil || {});
     if (j && j.perfil) for (const [k, v] of Object.entries(j.perfil)) if (v !== null && v !== undefined && !(Array.isArray(v) && !v.length) && v !== '') perfil[k] = v;
+    if (perfil.nombre) respuesta = soloPrimerNombre(respuesta, perfil.nombre);
     if (j && j.datos_archivo) historial[historial.length - 1].texto += '\n[Lectura del archivo: ' + j.datos_archivo + ']';
 
     let estado = 'bot';
@@ -223,7 +235,7 @@ async function procesar(waId, deps) {
   }
 }
 
-const ORIGENES_AUTO = ['api', 'bot', 'chatbot', 'flow', 'flujo', 'automation', 'automatico', 'campaign', 'campana', 'template', 'broadcast', 'system', 'sistema', 'webhook', 'integration'];
+const ORIGENES_AUTO = ['api', 'bot', 'chatbot', 'flow', 'flujo', 'automation', 'automatico', 'campaign', 'campana', 'template', 'broadcast', 'system', 'sistema', 'webhook', 'integration', 'transfer', 'transferencia', 'assignment', 'asignacion', 'routing', 'auto', 'automatic', 'automatica', 'queue', 'cola', 'rule', 'regla'];
 const ultimosOrigenes = [];
 const esOrigenHumano = (o) => !!o && !ORIGENES_AUTO.includes(String(o).toLowerCase());
 // Si el mensaje trae señales de que ya hay un agente asignado, no se toma el chat.
@@ -265,6 +277,9 @@ module.exports = function montarWasapi(app, deps) {
       if (event === 'send_message' && data && data.wa_id && data.type === 'out') {
         console.log('wasapi send_message origin=' + data.origin + ' sender_id=' + data.sender_id);
         ultimosOrigenes.push({ origin: data.origin, sender_id: data.sender_id, ts: new Date().toISOString() }); if (ultimosOrigenes.length > 20) ultimosOrigenes.shift();
+        // Avisos del sistema (p. ej. 'Conversación transferida automáticamente') no son una persona escribiendo.
+        const esAviso = /transferid|asignad|reasignad|conversaci[oó]n (iniciada|cerrada)/i.test(String(data.message || ''));
+        if (esAviso) { console.log('wasapi: aviso del sistema ignorado'); return; }
         if (esOrigenHumano(data.origin)) tomarHumano(String(data.wa_id), data, deps);
         return;
       }

@@ -218,6 +218,22 @@ async function procesar(waId, deps) {
   }
 }
 
+async function tomarHumano(waId, d, deps) {
+  const p = pendientes.get(waId);
+  if (p) { clearTimeout(p.timer); pendientes.delete(waId); }
+  try {
+    const sb = deps.sbServicio();
+    const { data: fila } = await sb.from('wasapi_conversaciones').select('*').eq('wa_id', waId).maybeSingle();
+    const conv = fila || { wa_id: waId, mensajes: [], perfil: {} };
+    const hist = Array.isArray(conv.mensajes) ? conv.mensajes : [];
+    if (d.message) hist.push({ rol: 'agente', texto: String(d.message), ts: new Date().toISOString() });
+    await sb.from('wasapi_conversaciones').upsert({
+      wa_id: waId, from_id: d.from_id || conv.from_id || null, mensajes: hist.slice(-200), perfil: conv.perfil || {},
+      estado: 'humano', motivo_traspaso: 'agente_intervino', actualizado_en: new Date().toISOString(),
+    }, { onConflict: 'wa_id' });
+  } catch (e) { console.error('wasapi tomarHumano:', e); }
+}
+
 module.exports = function montarWasapi(app, deps) {
   app.post('/api/wasapi/webhook', (req, res) => {
     res.status(200).json({ ok: true }); // Wasapi solo espera 4 s
@@ -225,6 +241,12 @@ module.exports = function montarWasapi(app, deps) {
       const tokenOk = !process.env.WASAPI_WEBHOOK_TOKEN || req.query.token === process.env.WASAPI_WEBHOOK_TOKEN;
       if (!tokenOk) return;
       const { event, data } = req.body || {};
+      // Si una PERSONA escribe desde la plataforma/app, el bot se retira de esa conversación.
+      if (event === 'send_message' && data && data.wa_id && data.type === 'out') {
+        console.log('wasapi send_message origin=' + data.origin + ' sender_id=' + data.sender_id);
+        if (['web', 'app', 'wa_business'].includes(data.origin)) tomarHumano(String(data.wa_id), data, deps);
+        return;
+      }
       if (event !== 'receive_message' || !data || data.type !== 'in' || !data.wa_id) return;
       if (data.wam_id) { if (vistos.has(data.wam_id)) return; vistos.add(data.wam_id); if (vistos.size > 5000) vistos.clear(); }
       const waId = String(data.wa_id);

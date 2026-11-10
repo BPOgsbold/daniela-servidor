@@ -1,36 +1,19 @@
 // Atención por WhatsApp con Claude (Wasapi → este servidor → Claude → Wasapi).
 // Wasapi avisa con el webhook `receive_message`; aquí se guarda la conversación
 // completa (memoria), Claude lee texto/PDF/imagen y responde por la API de Wasapi.
+// El prompt, la lectura de archivos y la validación del traspaso están en
+// atencion_comun.js (Chattigo usa los mismos). El webhook y el envío siguen aquí.
 // Variables en Render: WASAPI_API_KEY, WASAPI_WEBHOOK_TOKEN, ANTHROPIC_API_KEY,
 // SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY. Opcional: WASAPI_MODELO, WASAPI_ESPERA_MS.
-const fs = require('fs');
-const path = require('path');
+const {
+  sistemaDe, llamarClaude, mensajesParaClaude, bloqueArchivo, buscarURL, bajarArchivo, interpretarSalida, soloPrimerNombre,
+} = require('./atencion_comun');
 
 const API = 'https://api-ws.wasapi.io/api/v1';
-const BASE_PROMPT = fs.readFileSync(path.join(__dirname, 'prompt_primer_contacto.txt'), 'utf8');
-const FRASE_TRASPASO = 'Voy a pasar su caso a un consultor del equipo para que continúe con usted por este chat. No tendrá que repetir nada.';
-
-const REGLAS_EXTRA = `
-MEMORIA Y ARCHIVOS (muy importante)
-- Recibes la conversación completa y la ficha del cliente ya recopilada. NUNCA vuelvas a preguntar un dato que ya está en la ficha o que el cliente ya dijo; confírmalo solo si es dudoso.
-- Si el cliente envía un PDF o una imagen, léelo: extrae nombre, marca, modelo, fecha, valor, IVA, etc. y llena la ficha. Agradece y pregunta solo lo que falte.
-- Si manda un archivo que no puedes leer, dile que lo revisará un consultor y sigue con la siguiente pregunta pendiente.
-- La guía de conocimiento puede traer precios, honorarios o tarifas: IGNÓRALOS. Los únicos valores que puedes decir son los de la ETAPA 3 del prompt (según origen), y solo en esa etapa.
-- Suena como un abogado cercano asesorando, no como un formulario.
-- Si el cliente manda varios mensajes seguidos, respóndelos juntos en un solo mensaje corto.
-FORMATO: texto plano. NUNCA uses asteriscos, negritas, guiones de lista ni Markdown; WhatsApp los muestra mal.
-SALIDA: responde SOLO un JSON válido, sin texto fuera de él:
-{"respuesta":"texto para el cliente, plano (puede tener 2 o 3 mensajes cortos separados por una línea en blanco)","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"saldos_dian":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"documentos_recibidos":[],"objeciones":null,"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null,"causa_escalamiento":null}
-En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula". "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, acepta_avanzar=true y documentos factura, rut y cedula recibidos (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
-const CAMPOS_CLAVE = ['nombre', 'marca_modelo', 'tipo_vehiculo', 'compro_nuevo', 'fecha_compra', 'titular_factura', 'tiene_certificado_upme', 'ciudad', 'saldos_dian', 'origen'];
 
 const pendientes = new Map(); // wa_id -> { timer, items, from_id }
 const vistos = new Set();     // wam_id ya procesados (dedupe en memoria)
 
-// WhatsApp muestra los asteriscos tal cual si no cierran bien: dejamos texto plano.
-function limpiarTexto(t) {
-  return String(t || '').replace(/[*`~]/g, '').replace(/(^|\s)_+([^_\n]+)_+(?=\s|[.,;:!?]|$)/g, '$1$2').replace(/^\s{0,3}#{1,6}\s+/gm, '').replace(/^\s*[-•]\s+/gm, '').replace(/[ \t]+\n/g, '\n').trim();
-}
 function esperaMs() { return parseInt(process.env.WASAPI_ESPERA_MS || '6000', 10); }
 
 async function enviarTexto(waId, fromId, texto) {
@@ -45,17 +28,6 @@ async function enviarTexto(waId, fromId, texto) {
 // Intenta obtener el archivo adjunto. La documentación pública de Wasapi no
 // publica un campo con la URL; probamos los nombres habituales y, si no hay,
 // dejamos el payload guardado (raw) para ajustarlo.
-function buscarURL(o, prof = 0) {
-  if (!o || prof > 4) return null;
-  if (typeof o === 'string') return /^https?:\/\/\S+$/.test(o) ? o : null;
-  if (typeof o === 'object') {
-    for (const k of ['media_url', 'url', 'link', 'file_url', 'attachment_url', 'download_url', 'path']) {
-      const u = buscarURL(o[k], prof + 1); if (u) return u;
-    }
-    for (const v of Object.values(o)) { const u = buscarURL(v, prof + 1); if (u) return u; }
-  }
-  return null;
-}
 async function urlDeArchivo(d) {
   const directa = buscarURL(d);
   if (directa) return directa;
@@ -72,66 +44,9 @@ async function urlDeArchivo(d) {
   }
   return null;
 }
-async function bajarArchivo(url) {
-  let r = await fetch(url, { headers: { Authorization: 'Bearer ' + process.env.WASAPI_API_KEY } });
-  if (!r.ok) r = await fetch(url);
-  if (!r.ok) throw new Error('descarga ' + r.status);
-  const buf = Buffer.from(await r.arrayBuffer());
-  if (buf.length > 20 * 1024 * 1024) throw new Error('archivo muy grande');
-  return { buf, tipo: (r.headers.get('content-type') || '').split(';')[0] };
-}
-function bloqueArchivo(buf, tipo, nombre) {
-  const b64 = buf.toString('base64');
-  if (/pdf/i.test(tipo) || /\.pdf$/i.test(nombre || '')) return { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: b64 } };
-  if (/^image\/(jpeg|png|gif|webp)$/i.test(tipo)) return { type: 'image', source: { type: 'base64', media_type: tipo.toLowerCase(), data: b64 } };
-  return null;
-}
-
-async function llamarClaude(sistema, mensajes) {
-  const r = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'x-api-key': process.env.ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
-    body: JSON.stringify({ model: process.env.WASAPI_MODELO || process.env.CHAT_ANALISIS_MODELO || 'claude-sonnet-4-5', max_tokens: 3000, system: sistema, messages: mensajes }),
-  });
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error((j.error && j.error.message) || 'IA ' + r.status);
-  return (j.content || []).map((b) => b.text || '').join('').trim();
-}
-function parsearJSON(t) {
-  const m = t.match(/\{[\s\S]*\}/);
-  if (m) { try { return JSON.parse(m[0]); } catch (_) { /* se intenta rescatar abajo */ } }
-  // JSON cortado o mal formado: se rescata al menos el texto para el cliente.
-  const r = t.match(/"respuesta"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-  if (r) { try { return { respuesta: JSON.parse('"' + r[1] + '"') }; } catch (_) { return { respuesta: r[1].replace(/\\n/g, '\n').replace(/\\"/g, '"') }; } }
-  return null;
-}
-
-function mensajesParaClaude(historial, bloquesNuevos, textoNuevo) {
-  const out = [];
-  const push = (role, content) => {
-    const ult = out[out.length - 1];
-    if (ult && ult.role === role && typeof ult.content === 'string' && typeof content === 'string') ult.content += '\n' + content;
-    else out.push({ role, content });
-  };
-  for (const m of historial.slice(-40)) push(m.rol === 'cliente' ? 'user' : 'assistant', m.texto);
-  const nuevo = [];
-  for (const b of bloquesNuevos) nuevo.push(b);
-  nuevo.push({ type: 'text', text: textoNuevo || '(el cliente envió un archivo)' });
-  if (out.length && out[out.length - 1].role === 'user') {
-    const u = out.pop();
-    out.push({ role: 'user', content: [{ type: 'text', text: u.content }, ...nuevo] });
-  } else out.push({ role: 'user', content: nuevo });
-  if (out[0].role !== 'user') out.unshift({ role: 'user', content: '(inicio de la conversación)' });
-  return out;
-}
-
-// Dirigirse al cliente solo por su primer nombre: se quita el apellido de cualquier texto.
-function soloPrimerNombre(texto, nombreCompleto) {
-  const toks = String(nombreCompleto || '').trim().split(/\s+/).filter(Boolean);
-  if (toks.length < 2 || !texto) return texto;
-  const esc = (x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp('(?<![\\p{L}])' + esc(toks[0]) + '(?:\\s+(?:' + toks.slice(1).map(esc).join('|') + '))+(?![\\p{L}])', 'giu');
-  return String(texto).replace(re, toks[0]);
+async function bajarDeWasapi(url) {
+  // Igual que antes: primero con la llave de Wasapi y, si falla, sin ella.
+  return bajarArchivo(url, 'Bearer ' + process.env.WASAPI_API_KEY);
 }
 
 async function procesar(waId, deps) {
@@ -154,7 +69,7 @@ async function procesar(waId, deps) {
         const url = await urlDeArchivo(d);
         let leido = false;
         if (url) {
-          try { const f = await bajarArchivo(url); const b = bloqueArchivo(f.buf, f.tipo, d.filename); if (b) { bloques.push(b); leido = true; } } catch (e) { console.error('wasapi archivo:', e.message); }
+          try { const f = await bajarDeWasapi(url); const b = bloqueArchivo(f.buf, f.tipo, d.filename); if (b) { bloques.push(b); leido = true; } } catch (e) { console.error('wasapi archivo:', e.message); }
         }
         if (!leido) {
           textos.push('[El cliente envió un archivo (' + (d.filename || d.message_type) + ') que no pude abrir]');
@@ -175,50 +90,13 @@ async function procesar(waId, deps) {
 
     let conocimiento = '';
     try { conocimiento = await deps.obtenerConocimientoTexto(textoCliente); } catch (_) {}
-    const sistema = BASE_PROMPT + '\n' + REGLAS_EXTRA +
-      '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(conv.perfil || {}) +
-      (conv.perfil && conv.perfil.nombre ? '\nNOMBRE DE PILA PARA DIRIGIRTE: ' + String(conv.perfil.nombre).trim().split(/\s+/)[0] + '. Nunca uses el apellido al hablar con el cliente.' : '') +
-      (conocimiento ? '\n\nGUÍA DE CONOCIMIENTO (úsala para resolver dudas; no la copies tal cual ni menciones precios):\n' + String(conocimiento).slice(0, 14000) : '');
+    const sistema = sistemaDe(conv.perfil, conocimiento);
 
     const histLimpio = historial.slice(0, -1).map((m) => (m.rol === 'cliente' ? m : Object.assign({}, m, { texto: soloPrimerNombre(m.texto, (conv.perfil || {}).nombre) })));
     const msgsIA = mensajesParaClaude(histLimpio, bloques, textoCliente);
-    const bruto = await llamarClaude(sistema, msgsIA);
-    const j = parsearJSON(bruto);
-    let respuesta = j && typeof j.respuesta === 'string' ? limpiarTexto(j.respuesta) : '';
-    if (!respuesta) {
-      // Nunca enviar JSON ni etiquetas al cliente.
-      respuesta = j ? '' : limpiarTexto(bruto.replace(/[<{][\s\S]*$/, ''));
-    }
-    // Nunca enviar basura (por ejemplo la palabra "json" de un bloque de código vacío).
-    if (!j || !j.respuesta) { if (/^\s*(json|```)?\s*$/i.test(respuesta) || respuesta.length < 8) { console.log('wasapi: respuesta de la IA no utilizable, se pide reenviar. Bruto:', String(bruto).slice(0, 300)); respuesta = 'Disculpe, no alcancé a leer bien su mensaje o archivo. ¿Me lo puede enviar de nuevo, por favor?'; } }
-    const perfil = Object.assign({}, conv.perfil || {});
-    if (j && j.perfil) for (const [k, v] of Object.entries(j.perfil)) if (v !== null && v !== undefined && !(Array.isArray(v) && !v.length) && v !== '') perfil[k] = v;
-    if (perfil.nombre) respuesta = soloPrimerNombre(respuesta, perfil.nombre);
+    const bruto = await llamarClaude(sistema, msgsIA, process.env.WASAPI_MODELO || process.env.CHAT_ANALISIS_MODELO || 'claude-sonnet-4-5');
+    const { j, perfil, partes, estado } = interpretarSalida({ bruto, perfilPrevio: conv.perfil, prefijo: 'wasapi' });
     if (j && j.datos_archivo) historial[historial.length - 1].texto += '\n[Lectura del archivo: ' + j.datos_archivo + ']';
-
-    let estado = 'bot';
-    let partes = respuesta ? respuesta.split(/\n\s*\n/).filter((x) => x.trim()) : [];
-    // Nunca se pierde texto: si hay más de 5 partes, las últimas se unen en una sola.
-    if (partes.length > 5) partes = partes.slice(0, 4).concat([partes.slice(4).join('\n')]);
-    if (j && j.traspasar) {
-      const falta = CAMPOS_CLAVE.filter((k) => !perfil[k]);
-      const docs = (Array.isArray(perfil.documentos_recibidos) ? perfil.documentos_recibidos : []).join(' ').toLowerCase();
-      if (!perfil.acepta_avanzar) falta.push('acepta_avanzar');
-      if (!/factura/.test(docs)) falta.push('doc_factura');
-      if (!/rut/.test(docs)) falta.push('doc_rut');
-      if (!/c[eé]dula|cedula/.test(docs)) falta.push('doc_cedula');
-      const CAUSAS = ['empresa','dos_propietarios','apoderado','rut_42_48','leasing','iva_19','error_certificado','cuenta_digital','inadmision','plazo_critico','cliente_molesto','pide_contrato','pide_estado','pide_llamada'];
-      const escala = j.motivo_traspaso === 'escalamiento' && CAUSAS.includes(j.causa_escalamiento);
-      if (!escala && falta.length) {
-        // Aún no está completa la ficha: no se entrega al agente, se sigue perfilando.
-        if (!partes.length) partes = [({ acepta_avanzar: 'Para dejar todo listo, ¿avanzamos con su caso?', saldos_dian: 'Una última consulta para validar su beneficio: ¿tiene saldos pendientes por pagar ante la DIAN?', origen: '¿Cómo llegó con nosotros? ¿Fue por SURA, por EPM, Grupo Confamilia u otro medio?', doc_factura: '¿Me puede enviar la factura de compra en PDF o imagen?', doc_rut: '¿Me puede enviar su RUT actualizado, de menos de 30 días?', doc_cedula: '¿Me envía también una copia de su cédula por ambas caras?' })[falta[0]] || ('Para dejar todo listo, ¿me confirma su ' + falta[0].replace(/_/g, ' ') + '?')];
-      } else {
-        estado = 'humano';
-        const n = perfil.nombre ? ', ' + String(perfil.nombre).split(' ')[0] : '';
-        partes = escala ? [FRASE_TRASPASO] : ['Muchas gracias por toda la información' + n + '. Permítame un momento mientras organizo su caso.', FRASE_TRASPASO];
-        respuesta = partes.join('\n\n');
-      }
-    }
 
     if (partes.length && await estaEnHumano(waId, deps)) {
       // Una persona tomó el chat mientras Claude pensaba: no se envía nada.

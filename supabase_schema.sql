@@ -50,3 +50,27 @@ create table if not exists conocimiento (
 );
 
 create index if not exists idx_conocimiento_activo on conocimiento(activo, created_at desc);
+
+-- Conversaciones de Daniela en Chattigo (API Bot). Tabla aparte de la de
+-- Wasapi para que el mismo celular no mezcle los dos canales. La clave es
+-- chattigo:{did}:{msisdn}. Ejecutar en el SQL Editor de Supabase antes de
+-- atender por Chattigo.
+create table if not exists chattigo_conversaciones (
+  id text primary key,
+  did text,
+  msisdn text,
+  id_chat text,
+  id_campana text,
+  canal text,
+  proveedor_canal text,
+  nombre text,
+  mensajes jsonb default '[]'::jsonb,
+  perfil jsonb default '{}'::jsonb,
+  estado text default 'bot',
+  motivo_traspaso text,
+  ultimo_payload_archivo jsonb,
+  actualizado_en timestamptz default now()
+);
+
+create index if not exists idx_chattigo_msisdn on chattigo_conversaciones(msisdn);
+create index if not exists idx_chattigo_estado on chattigo_conversaciones(estado);

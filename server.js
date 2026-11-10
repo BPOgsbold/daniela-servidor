@@ -17,7 +17,7 @@ const {
 } = require('./supabase');
 const { buscarDuplicados, eliminarCasoDeSesion } = require('./duplicados');
 
-const { htmlCorreo, REMITENTE, DESTINOS, ES_REAL, mb: mbCorreo } = require('./correo_cita');
+const { htmlCorreo, REMITENTE, DESTINOS, ES_REAL, mb: mbCorreo, ordenarArchivos, sinRepetidos, armarPaquete } = require('./correo_cita');
 const { descargarArchivo, enviarCorreo, TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento, moverACliente, esClienteDefinitivo, listarDocumentosPorCedula, listarDocumentosDeCarpeta, listarCarpetasClientes, enlaceDeArchivo } = require('./sharepoint');
 
 
@@ -3081,20 +3081,24 @@ app.post('/api/solicitud-cita-dian', async (req, res) => {
       if (otrasPlacas.length) archivos = archivos.filter((a) => { const n = normPl(a.nombre); return !otrasPlacas.some((pl) => n.includes(pl)); });
     }
     if (!archivos.length) throw new Error('La carpeta del cliente no tiene documentos para adjuntar.');
-    const adjuntos = [];
+    // Se ordena (sin duplicados), se descarga y se arma UNA carpeta .zip con todo numerado.
+    archivos = ordenarArchivos(archivos);
+    const descargados = [];
     let total = 0;
     for (const a of archivos) {
       const d = await descargarArchivo(a.id);
       total += d.buffer.length;
-      adjuntos.push(d);
+      descargados.push({ tipo: a.tipo, nombre: d.nombre || a.nombre, buffer: d.buffer });
     }
-    if (total > 33 * 1024 * 1024) throw new Error('Los documentos pesan ' + mbCorreo(total) + ' en total (el máximo del correo es ~33 MB).');
+    if (total > 30 * 1024 * 1024) throw new Error('Los documentos pesan ' + mbCorreo(total) + ' en total (el máximo del correo es ~30 MB).');
+    const paquete = armarPaquete(cli, sinRepetidos(descargados));
+    const adjuntos = [paquete.adjunto];
     const asunto = (ES_REAL() ? '' : '[PRUEBA] ') + `Solicitud cita DIAN – ${cli.nombre_cliente || ''} (CC ${ced}${cli.placa ? ' · placa ' + cli.placa : ''}${cli.ciudad ? ' · ' + cli.ciudad : ''})`;
-    await enviarCorreo({ remitente: REMITENTE(), destinatarios: DESTINOS(), asunto, html: htmlCorreo({ cli, archivos }), adjuntos });
+    await enviarCorreo({ remitente: REMITENTE(), destinatarios: DESTINOS(), asunto, html: htmlCorreo({ cli, archivos: paquete.lista, paquete: paquete.nombreZip }), adjuntos });
     await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: ahora }).eq('id', cli.id);
-    if (cli.caso_id) await sbx.from('panel_historial').insert({ caso_id: cli.caso_id, campo: 'correo_cita_dian', valor_anterior: null, valor_nuevo: `Enviado a ${DESTINOS().length} destinatarios con ${adjuntos.length} adjuntos`, usuario_email: ctx.email }).then(() => {}, () => {});
-    console.log(`[cita-dian] ${ctx.email} → correo de ${ced} con ${adjuntos.length} adjuntos`);
-    res.json({ ok: true, adjuntos: adjuntos.length, destinatarios: DESTINOS().length });
+    if (cli.caso_id) await sbx.from('panel_historial').insert({ caso_id: cli.caso_id, campo: 'correo_cita_dian', valor_anterior: null, valor_nuevo: `Enviado a ${DESTINOS().length} destinatarios con 1 carpeta (${paquete.lista.length} documentos)`, usuario_email: ctx.email }).then(() => {}, () => {});
+    console.log(`[cita-dian] ${ctx.email} → correo de ${ced} con carpeta de ${paquete.lista.length} documentos`);
+    res.json({ ok: true, adjuntos: paquete.lista.length, destinatarios: DESTINOS().length });
   } catch (err) {
     if (reclamado) await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: null }).eq('id', clienteId).then(() => {}, () => {});
     console.error('Error en /api/solicitud-cita-dian:', err);

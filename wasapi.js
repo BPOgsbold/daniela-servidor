@@ -183,7 +183,7 @@ async function procesar(waId, deps) {
     const histLimpio = historial.slice(0, -1).map((m) => (m.rol === 'cliente' ? m : Object.assign({}, m, { texto: soloPrimerNombre(m.texto, (conv.perfil || {}).nombre) })));
     const msgsIA = mensajesParaClaude(histLimpio, bloques, textoCliente);
     const bruto = await llamarClaude(sistema, msgsIA);
-    const j = parsearJSON(bruto);
+    let j = parsearJSON(bruto);
     let respuesta = j && typeof j.respuesta === 'string' ? limpiarTexto(j.respuesta) : '';
     if (!respuesta) {
       // Nunca enviar JSON ni etiquetas al cliente.
@@ -196,6 +196,14 @@ async function procesar(waId, deps) {
     if (perfil.nombre) respuesta = soloPrimerNombre(respuesta, perfil.nombre);
     if (j && j.datos_archivo) historial[historial.length - 1].texto += '\n[Lectura del archivo: ' + j.datos_archivo + ']';
 
+    // CLIENTE DE SURA: no se le interroga. Si Claude hace preguntas de perfilamiento (compra, etapa, certificado,
+    // documentos...), se descartan y el chat pasa de inmediato a un consultor.
+    const esSura = /sura/i.test(String(perfil.origen || '')) || historial.some((m) => m.rol === 'cliente' && /(atenci[oó]n al cliente de sura|vengo de sura)/i.test(String(m.texto || '')));
+    if (esSura && !(j && j.traspasar) && /(ya compr|en qu[eé] etapa|qu[eé] etapa|certificado|marca|modelo|fecha de compra|ciudad|saldos|documentos?|factura|\brut\b|c[eé]dula)/i.test(respuesta)) {
+      console.log('wasapi: cliente SURA, pregunta de perfilamiento descartada y traspaso inmediato. Era:', respuesta.slice(0, 200));
+      j = Object.assign({}, j || {}, { traspasar: true, motivo_traspaso: 'escalamiento', causa_escalamiento: 'sura_en_proceso' });
+      respuesta = '';
+    }
     let estado = 'bot';
     let partes = respuesta ? respuesta.split(/\n\s*\n/).filter((x) => x.trim()) : [];
     // Nunca se pierde texto: si hay más de 5 partes, las últimas se unen en una sola.

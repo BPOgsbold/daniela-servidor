@@ -54,7 +54,8 @@ function destinoSms(celReal) {
 }
 // Envío por Inalambria Express (modo síncrono: responde si salió o no; límite 30 envíos/minuto).
 async function enviarSms(numero, texto) {
-  const contenido = (ES_REAL() ? '' : '[PRUEBA] ') + sinTildes(texto);
+  // Sin prefijo [PRUEBA]: en modo prueba el SMS ya solo llega al celular de prueba, y el filtro antifraude lo penaliza.
+  const contenido = sinTildes(texto);
   const r = await fetch(INALAMBRIA_URL, {
     method: 'POST',
     headers: { Authorization: `Bearer ${process.env.INALAMBRIA_API_KEY}`, 'Content-Type': 'application/json' },
@@ -63,7 +64,8 @@ async function enviarSms(numero, texto) {
   const j = await r.json().catch(() => ({}));
   if (!r.ok || j.ok === false) {
     const cod = (j.data && j.data.errorCode) || j.code || ('HTTP ' + r.status);
-    throw new Error(`SMS no enviado (${cod})${j.detail || j.message ? ': ' + (j.detail || j.message) : ''}`);
+    const det = j.data && j.data.details ? ' Sugerencias: ' + JSON.stringify(j.data.details).slice(0, 400) : '';
+    throw new Error(`SMS no enviado (${cod})${j.detail || j.message ? ': ' + (j.detail || j.message) : ''}${det}`);
   }
   return j.consumptionId || j.jobId || null;
 }
@@ -312,7 +314,7 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
       }
       if (smsA) {
         const primer = String(ins.nombre || '').split(/\s+/)[0] || '';
-        try { await enviarSms(smsA, `Gomez Legal: ${primer}, tu contrato esta listo para firmar. Revisalo y firmalo aqui: ${enlace}`); enviados.push('SMS ' + mascaraCel(cel)); } catch (e) { fallas.push('SMS: ' + (e.message || e)); }
+        try { await enviarSms(smsA, `Gomez Legal Abogados: hola ${primer}, tu contrato de servicios ya esta disponible para revision. Consultalo en ${enlace}`); enviados.push('SMS ' + mascaraCel(cel)); } catch (e) { fallas.push('SMS: ' + (e.message || e)); }
       }
       if (!enviados.length) {
         await sb.from(TABLA).update({ estado: 'error', mensaje: fallas.join(' | ').slice(0, 300) }).eq('id', ins.id);
@@ -407,7 +409,7 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
       const codigo = String(crypto.randomInt(100000, 1000000));
       let smsId = null;
       try {
-        if (canal === 'sms') smsId = await enviarSms(smsA, `Gomez Legal: tu codigo para firmar el contrato es ${codigo}. Vence en ${VIGENCIA_CODIGO_MIN} minutos. No lo compartas con nadie.`);
+        if (canal === 'sms') smsId = await enviarSms(smsA, `Gomez Legal Abogados: tu codigo de verificacion es ${codigo}. Vence en ${VIGENCIA_CODIGO_MIN} minutos. No lo compartas.`);
         else await correoCodigo(f, codigo);
       } catch (e) {
         console.error('firma/codigo envío:', e);
@@ -478,7 +480,7 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
       let smsOk = false;
       const smsA = destinoSms(f.celular);
       if (smsA) {
-        try { await enviarSms(smsA, `Gomez Legal: tu contrato quedo firmado. Descarga tu copia y la constancia aqui: ${URL_FIRMA()}?t=${f.token}`); smsOk = true; } catch (e) { aviso.push('No se pudo enviar el SMS de confirmación: ' + String(e.message || e).slice(0, 150)); }
+        try { await enviarSms(smsA, `Gomez Legal Abogados: tu contrato quedo aceptado. Tu copia y la constancia estan en ${URL_FIRMA()}?t=${f.token}`); smsOk = true; } catch (e) { aviso.push('No se pudo enviar el SMS de confirmación: ' + String(e.message || e).slice(0, 150)); }
       }
       await sb.from(TABLA).update({ mensaje: aviso.length ? aviso.join(' | ') : null, copia_enviada: correoOk, guardado_sharepoint: guardado }).eq('id', f.id);
       if (f.caso_id) await sb.from('panel_historial').insert({ caso_id: f.caso_id, campo: 'contrato_firma', valor_anterior: 'Enviado a firma', valor_nuevo: `Contrato FIRMADO por el cliente (IP ${ip})${guardado ? '' : ' - falta guardarlo en SharePoint'}`, usuario_email: 'cliente (firma electrónica)' }).then(() => {}, () => {});

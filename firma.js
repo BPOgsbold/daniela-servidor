@@ -10,12 +10,16 @@
 //   FIRMA_SECRETO       texto cualquiera que se mezcla al guardar el código (más seguridad)
 //   INALAMBRIA_API_KEY  llave de Inalambria Express con permiso de ENVÍO (activa el SMS: enlace, código y copia)
 //   FIRMA_SMS_PRUEBA    celular que recibe los SMS mientras está el modo prueba (si no hay, en prueba no sale SMS)
-// Usa el mismo modo prueba del correo de cita DIAN: mientras MAIL_ENVIO_REAL no sea "si", todo correo llega solo a la
-// lista de prueba (DESTINOS) con el aviso [PRUEBA] e indicando a quién habría llegado.
+// Modo prueba propio: mientras FIRMA_ENVIO_REAL no sea "si", los correos van a FIRMA_CORREO_PRUEBA (o al buzón remitente)
+// con el aviso [PRUEBA], y los SMS solo a FIRMA_SMS_PRUEBA. No depende de MAIL_ENVIO_REAL (correo de cita DIAN).
 
 const crypto = require('crypto');
 const sp = require('./sharepoint');
-const { REMITENTE, DESTINOS, ES_REAL } = require('./correo_cita');
+const { REMITENTE } = require('./correo_cita');
+// Modo real de la FIRMA (independiente del correo de cita DIAN): en Render FIRMA_ENVIO_REAL=si.
+// Mientras no esté, correos y SMS de firma van solo a FIRMA_CORREO_PRUEBA / FIRMA_SMS_PRUEBA.
+const ES_REAL = () => String(process.env.FIRMA_ENVIO_REAL || '').toLowerCase() === 'si';
+const DESTINOS_PRUEBA = () => String(process.env.FIRMA_CORREO_PRUEBA || REMITENTE()).split(',').map((x) => x.trim()).filter(Boolean);
 
 const URL_FIRMA = () => process.env.FIRMA_URL_BASE || 'https://gomezlegal.netlify.app/firmar.html';
 const VIGENCIA_DIAS = () => Number(process.env.FIRMA_VIGENCIA_DIAS) > 0 ? Number(process.env.FIRMA_VIGENCIA_DIAS) : 7;
@@ -209,7 +213,7 @@ const boton = (href, texto) => `<p style="text-align:center;margin:26px 0"><a hr
 // En modo prueba el correo no sale al cliente: llega a la lista de prueba, avisando a quién habría llegado.
 function destinoCorreo(realA) {
   if (ES_REAL()) return { para: [realA], prefijo: '', aviso: '' };
-  return { para: DESTINOS(), prefijo: '[PRUEBA] ', aviso: `<p style="background:#fff6e0;border:1px solid #f0c36d;border-radius:8px;padding:8px 12px;font-size:13px;color:#7a5c10">MODO PRUEBA: este correo habría llegado a <b>${esc(realA)}</b>.</p>` };
+  return { para: DESTINOS_PRUEBA(), prefijo: '[PRUEBA] ', aviso: `<p style="background:#fff6e0;border:1px solid #f0c36d;border-radius:8px;padding:8px 12px;font-size:13px;color:#7a5c10">MODO PRUEBA: este correo habría llegado a <b>${esc(realA)}</b>.</p>` };
 }
 async function correoFirma(f, enlace) {
   const d = destinoCorreo(f.correo);

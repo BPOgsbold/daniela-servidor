@@ -23,7 +23,16 @@ const { descargarArchivo, enviarCorreo, TIPOS_DOC, configurado: sharepointConfig
 
 // Todas las creaciones de casos pasan por aquí: si ya existe un cliente con ese
 // teléfono o cédula/NIT NO se crea otro (solo se permite con "Mismo cliente, otro vehículo").
+// Si llegan dos solicitudes de crear caso casi al mismo tiempo desde la misma sesión (doble clic, reintento de red),
+// la segunda espera a la primera y recibe EL MISMO caso: no se crean dos.
+const creacionesEnCurso = new Map();
 async function crearCaso(sessionId, asesor, datos) {
+  if (creacionesEnCurso.has(sessionId)) return creacionesEnCurso.get(sessionId);
+  const p = crearCasoUnico(sessionId, asesor, datos);
+  creacionesEnCurso.set(sessionId, p);
+  try { return await p; } finally { creacionesEnCurso.delete(sessionId); }
+}
+async function crearCasoUnico(sessionId, asesor, datos) {
   const ses = sesiones.get(sessionId);
   if (!(ses && ses.otroVehiculo)) {
     let dup = { casos: [], campo: null };
@@ -2218,6 +2227,30 @@ app.post('/api/chat', async (req, res) => {
         }
       }
 
+      // BLOQUEO "MISMO CARRO": aunque se haya elegido "Mismo cliente, otro vehículo", si ese celular ya tiene
+      // un caso con la MISMA placa, es el mismo carro: no se crea otro caso, se retoma el que ya existe.
+      if (campo.id === 'placa' && resultadoCampo.valor && sesion.data.telefono) {
+        try {
+          const placaN = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+          const mismos = await buscarDuplicados({ telefono: sesion.data.telefono, excluirId: sesion.casoId });
+          const igual = (mismos.casos || []).filter((c) => placaN(c.placa) && placaN(c.placa) === placaN(resultadoCampo.valor));
+          if (igual.length) {
+            if (sesion.casoId && sesion.casoCreadoEnSesion === sesion.casoId) {
+              try { await eliminarCasoDeSesion(sesion.casoId, sessionId); } catch (e) { console.error('No se pudo descartar el caso repetido:', e.message); }
+              sesion.casoId = null;
+              sesion.casoCreadoEnSesion = null;
+            }
+            sesion.candidatoRetomar = igual[0];
+            return res.json({
+              reply: `⛔ Ese cliente ya tiene un caso con la placa ${resultadoCampo.valor} (${igual[0].vehiculo || 'sin vehículo'}, estado: ${igual[0].estado_pipeline || 'sin definir'}). Una placa es de un solo carro: si es el mismo trámite, retómalo; si es otro carro, escribe de nuevo la placa correcta.`,
+              opciones: ['Retomar este caso'],
+            });
+          }
+        } catch (placaError) {
+          console.error('Error verificando placa repetida:', placaError);
+        }
+      }
+
       sesion.data[campo.id] = resultadoCampo.valor;
 
       // Al responder el tipo de documento, derivamos solos si la cuenta es
@@ -3282,6 +3315,8 @@ app.patch('/api/usuarios', async (req, res) => {
 });
 
 require('./wasapi')(app, { obtenerConocimientoTexto, sbServicio });
+// Firma electrónica de contratos (envío a firma, código, aceptación y constancia).
+require('./firma')(app, { sbServicio, exigirEquipo });
 
 app.listen(PORT, () => {
   console.log(`Servidor de Daniela (Gómez Legal Abogados) escuchando en http://localhost:${PORT}`);

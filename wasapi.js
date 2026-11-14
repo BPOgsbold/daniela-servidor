@@ -20,8 +20,8 @@ MEMORIA Y ARCHIVOS (muy importante)
 - Si el cliente manda varios mensajes seguidos, respóndelos juntos en un solo mensaje corto.
 FORMATO: texto plano. NUNCA uses asteriscos, negritas, guiones de lista ni Markdown; WhatsApp los muestra mal.
 SALIDA: responde SOLO un JSON válido, sin texto fuera de él:
-{"respuesta":"texto para el cliente, plano (puede tener 2 o 3 mensajes cortos separados por una línea en blanco)","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"saldos_dian":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"documentos_recibidos":[],"objeciones":null,"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null,"causa_escalamiento":null}
-En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula". "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, acepta_avanzar=true y documentos factura, rut y cedula recibidos (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada, sura_en_proceso. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
+{"respuesta":"texto para el cliente, plano (puede tener 2 o 3 mensajes cortos separados por una línea en blanco)","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"saldos_dian":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"proceso_explicado":null,"acepta_avanzar":null,"documentos_recibidos":[],"bancaria_despues":null,"objeciones":null,"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null,"causa_escalamiento":null}
+En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula", "certificacion_bancaria". "precio_informado":true cuando ya le explicaste los honorarios (o, si es SURA u otro canal, que el consultor le confirma el valor). "proceso_explicado":true cuando ya le explicaste las etapas del proceso. "bancaria_despues":true solo si el cliente dice que la certificación bancaria la envía después. "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, honorarios y proceso explicados, acepta_avanzar=true y documentos factura, rut, cedula y certificacion_bancaria recibidos (o bancaria_despues=true) (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada, sura_en_proceso. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
 const CAMPOS_CLAVE = ['nombre', 'marca_modelo', 'tipo_vehiculo', 'compro_nuevo', 'fecha_compra', 'titular_factura', 'tiene_certificado_upme', 'ciudad', 'saldos_dian', 'origen'];
 
 const pendientes = new Map(); // wa_id -> { timer, items, from_id }
@@ -190,7 +190,8 @@ async function procesar(waId, deps) {
       respuesta = j ? '' : limpiarTexto(bruto.replace(/[<{][\s\S]*$/, ''));
     }
     // Nunca enviar basura (por ejemplo la palabra "json" de un bloque de código vacío).
-    if (!j || !j.respuesta) { if (/^\s*(json|```)?\s*$/i.test(respuesta) || respuesta.length < 8) { console.log('wasapi: respuesta de la IA no utilizable, se pide reenviar. Bruto:', String(bruto).slice(0, 300)); respuesta = 'Disculpe, no alcancé a leer bien su mensaje o archivo. ¿Me lo puede enviar de nuevo, por favor?'; } }
+    // (Si la IA pidió traspaso con respuesta vacía no es un error: lo resuelve el bloque de traspaso de abajo.)
+    if (!j || (!j.respuesta && !j.traspasar)) { if (/^\s*(json|```)?\s*$/i.test(respuesta) || respuesta.length < 8) { console.log('wasapi: respuesta de la IA no utilizable, se pide reenviar. Bruto:', String(bruto).slice(0, 300)); respuesta = 'Disculpe, no alcancé a leer bien su mensaje o archivo. ¿Me lo puede enviar de nuevo, por favor?'; } }
     const perfil = Object.assign({}, conv.perfil || {});
     if (j && j.perfil) for (const [k, v] of Object.entries(j.perfil)) if (v !== null && v !== undefined && !(Array.isArray(v) && !v.length) && v !== '') perfil[k] = v;
     if (perfil.nombre) respuesta = soloPrimerNombre(respuesta, perfil.nombre);
@@ -209,17 +210,33 @@ async function procesar(waId, deps) {
     // Nunca se pierde texto: si hay más de 5 partes, las últimas se unen en una sola.
     if (partes.length > 5) partes = partes.slice(0, 4).concat([partes.slice(4).join('\n')]);
     if (j && j.traspasar) {
-      const falta = CAMPOS_CLAVE.filter((k) => !perfil[k]);
+      // false o 'no' son respuestas válidas (p. ej. no tiene certificado UPME): solo falta lo vacío.
+      const falta = CAMPOS_CLAVE.filter((k) => perfil[k] === null || perfil[k] === undefined || perfil[k] === '');
       const docs = (Array.isArray(perfil.documentos_recibidos) ? perfil.documentos_recibidos : []).join(' ').toLowerCase();
+      // Proceso COMPLETO antes de entregar: honorarios, proceso, sí del cliente y el 100 % de los documentos.
+      if (!perfil.precio_informado) falta.push('precio_informado');
+      if (!perfil.proceso_explicado) falta.push('proceso_explicado');
       if (!perfil.acepta_avanzar) falta.push('acepta_avanzar');
       if (!/factura/.test(docs)) falta.push('doc_factura');
       if (!/rut/.test(docs)) falta.push('doc_rut');
       if (!/c[eé]dula|cedula/.test(docs)) falta.push('doc_cedula');
+      if (!/bancaria/.test(docs) && !perfil.bancaria_despues) falta.push('doc_bancaria');
       const CAUSAS = ['empresa','dos_propietarios','apoderado','rut_42_48','leasing','iva_19','error_certificado','cuenta_digital','inadmision','plazo_critico','cliente_molesto','pide_contrato','pide_estado','pide_llamada','sura_en_proceso'];
-      const escala = j.motivo_traspaso === 'escalamiento' && CAUSAS.includes(j.causa_escalamiento);
+      // Solo estas cortan la conversación al instante. Las demás (empresa, IVA 19, dos propietarios...) se MARCAN
+      // como alerta para el consultor y Daniela sigue recogiendo datos y documentos; se entrega al final con todo.
+      const INMEDIATAS = ['pide_llamada', 'cliente_molesto', 'sura_en_proceso', 'pide_contrato', 'pide_estado', 'plazo_critico'];
+      const escalaPedida = j.motivo_traspaso === 'escalamiento' && CAUSAS.includes(j.causa_escalamiento);
+      if (escalaPedida) {
+        perfil.alertas = Array.from(new Set([...(Array.isArray(perfil.alertas) ? perfil.alertas : []), j.causa_escalamiento]));
+        perfil.causa_escalamiento = j.causa_escalamiento;
+        console.log('wasapi: escalamiento pedido por la IA:', j.causa_escalamiento, '| faltan:', falta.join(','));
+      }
+      const escala = escalaPedida && INMEDIATAS.includes(j.causa_escalamiento);
       if (!escala && falta.length) {
+        // Si la IA ya se estaba despidiendo para entregar el caso, se descarta ese texto y se pide lo siguiente.
+        if (partes.some((x) => /(consultor|asesor|un momento|pasar su caso|organizo su caso|del equipo)/i.test(x))) partes = [];
         // Aún no está completa la ficha: no se entrega al agente, se sigue perfilando.
-        if (!partes.length) partes = [({ acepta_avanzar: 'Para dejar todo listo, ¿avanzamos con su caso?', saldos_dian: 'Una última consulta para validar su beneficio: ¿tiene saldos pendientes por pagar ante la DIAN?', origen: '¿Cómo llegó con nosotros? ¿Fue por SURA, por EPM, Grupo Confamilia u otro medio?', doc_factura: '¿Me puede enviar la factura de compra en PDF o imagen?', doc_rut: '¿Me puede enviar su RUT actualizado, de menos de 30 días?', doc_cedula: '¿Me envía también una copia de su cédula por ambas caras?' })[falta[0]] || ('Para dejar todo listo, ¿me confirma su ' + falta[0].replace(/_/g, ' ') + '?')];
+        if (!partes.length) partes = [({ nombre: '¿Con quién tengo el gusto de hablar?', marca_modelo: '¿Qué marca y modelo es su vehículo?', tipo_vehiculo: '¿Su vehículo es eléctrico, híbrido o híbrido enchufable?', compro_nuevo: '¿Lo compró nuevo y usted fue el primer dueño?', fecha_compra: '¿En qué fecha lo compró, más o menos?', titular_factura: '¿La factura quedó a su nombre, a nombre de dos personas o de una empresa?', tiene_certificado_upme: '¿Ya tiene el certificado de la UPME o todavía no?', ciudad: '¿En qué ciudad vive?', precio_informado: 'Ahora le cuento cómo funcionan nuestros honorarios. ¿Le parece?', proceso_explicado: '¿Le explico paso a paso cómo es el proceso para recuperar su IVA?', doc_bancaria: 'Por último, ¿me envía una certificación bancaria de una cuenta a su nombre? No sirven bancos digitales como Nu o Lulo.', acepta_avanzar: 'Para dejar todo listo, ¿avanzamos con su caso?', saldos_dian: 'Una última consulta para validar su beneficio: ¿tiene saldos pendientes por pagar ante la DIAN?', origen: '¿Cómo llegó con nosotros? ¿Fue por SURA, por EPM, Grupo Confamilia u otro medio?', doc_factura: '¿Me puede enviar la factura de compra en PDF o imagen?', doc_rut: '¿Me puede enviar su RUT actualizado, de menos de 30 días?', doc_cedula: '¿Me envía también una copia de su cédula por ambas caras?' })[falta[0]] || ('Para dejar todo listo, ¿me confirma su ' + falta[0].replace(/_/g, ' ') + '?')];
       } else {
         estado = 'humano';
         const n = perfil.nombre ? ', ' + String(perfil.nombre).split(' ')[0] : '';

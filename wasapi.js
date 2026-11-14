@@ -21,7 +21,7 @@ MEMORIA Y ARCHIVOS (muy importante)
 FORMATO: texto plano. NUNCA uses asteriscos, negritas, guiones de lista ni Markdown; WhatsApp los muestra mal.
 SALIDA: responde SOLO un JSON válido, sin texto fuera de él:
 {"respuesta":"texto para el cliente, plano (puede tener 2 o 3 mensajes cortos separados por una línea en blanco)","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"saldos_dian":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"proceso_explicado":null,"acepta_avanzar":null,"documentos_recibidos":[],"bancaria_despues":null,"objeciones":null,"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null,"causa_escalamiento":null}
-En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula", "certificacion_bancaria". "precio_informado":true cuando ya le explicaste los honorarios (o, si es SURA, Referix u otro canal, que el consultor le confirma el valor). "proceso_explicado":true cuando ya le explicaste las etapas del proceso. "bancaria_despues":true solo si el cliente dice que la certificación bancaria la envía después. "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, honorarios y proceso explicados, acepta_avanzar=true y documentos factura, rut, cedula y certificacion_bancaria recibidos (o bancaria_despues=true) (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada, sura_en_proceso. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
+En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula", "certificacion_bancaria". "precio_informado":true cuando ya le explicaste los honorarios (con el valor si es EPM, Confamilia o Referix; si es SURA u otro canal, que el consultor le confirma el valor). "proceso_explicado":true cuando ya le explicaste las etapas del proceso. "bancaria_despues":true solo si el cliente dice que la certificación bancaria la envía después. "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, honorarios y proceso explicados, acepta_avanzar=true y documentos factura, rut, cedula y certificacion_bancaria recibidos (o bancaria_despues=true) (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada, sura_en_proceso. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
 const CAMPOS_CLAVE = ['nombre', 'marca_modelo', 'tipo_vehiculo', 'compro_nuevo', 'fecha_compra', 'titular_factura', 'tiene_certificado_upme', 'ciudad', 'saldos_dian', 'origen'];
 
 const pendientes = new Map(); // wa_id -> { timer, items, from_id }
@@ -208,7 +208,7 @@ async function procesar(waId, deps) {
     let estado = 'bot';
     let partes = respuesta ? respuesta.split(/\n\s*\n/).filter((x) => x.trim()) : [];
     // Nunca se pierde texto: si hay más de 5 partes, las últimas se unen en una sola.
-    if (partes.length > 5) partes = partes.slice(0, 4).concat([partes.slice(4).join('\n')]);
+    if (partes.length > 3) partes = partes.slice(0, 2).concat([partes.slice(2).join('\n\n')]);
     if (j && j.traspasar) {
       // false o 'no' son respuestas válidas (p. ej. no tiene certificado UPME): solo falta lo vacío.
       const falta = CAMPOS_CLAVE.filter((k) => perfil[k] === null || perfil[k] === undefined || perfil[k] === '');
@@ -296,6 +296,16 @@ async function tomarHumano(waId, d, deps) {
   } catch (e) { console.error('wasapi tomarHumano:', e); }
 }
 
+// Un solo procesamiento a la vez por cliente: si escribe (o manda un archivo) mientras Daniela está respondiendo,
+// esos mensajes esperan a que termine y se responden juntos, ya con la conversación actualizada.
+const enCurso = new Map();
+function programar(waId, deps) {
+  const previo = enCurso.get(waId) || Promise.resolve();
+  const siguiente = previo.then(() => procesar(waId, deps)).catch((e) => console.error('wasapi cola:', e))
+    .finally(() => { if (enCurso.get(waId) === siguiente) enCurso.delete(waId); });
+  enCurso.set(waId, siguiente);
+}
+
 module.exports = function montarWasapi(app, deps) {
   app.post('/api/wasapi/webhook', (req, res) => {
     res.status(200).json({ ok: true }); // Wasapi solo espera 4 s
@@ -319,7 +329,7 @@ module.exports = function montarWasapi(app, deps) {
       const p = pendientes.get(waId) || { items: [], from_id: data.from_id, timer: null };
       p.items.push(data); p.from_id = data.from_id;
       clearTimeout(p.timer);
-      p.timer = setTimeout(() => procesar(waId, deps), esperaMs());
+      p.timer = setTimeout(() => programar(waId, deps), esperaMs());
       pendientes.set(waId, p);
     } catch (e) { console.error('wasapi webhook:', e); }
   });

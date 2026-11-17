@@ -316,7 +316,9 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
       if (mail) {
         try { await correoFirma(ins, enlace); enviados.push('correo ' + mascaraCorreo(mail)); } catch (e) { fallas.push('correo: ' + (e.message || e)); }
       }
-      if (smsA) {
+      // El SMS con enlace lo puede marcar el antifraude de Inalambria (y suspender la cuenta): solo se usa si el
+      // cliente NO tiene correo. El código de verificación sí sale por SMS siempre (no lleva enlace).
+      if (smsA && !mail) {
         const primer = String(ins.nombre || '').split(/\s+/)[0] || '';
         try { await enviarSms(smsA, `Gomez Legal Abogados: hola ${primer}, tu contrato de servicios ya esta disponible para revision. Consultalo en ${enlace}`); enviados.push('SMS ' + mascaraCel(cel)); } catch (e) { fallas.push('SMS: ' + (e.message || e)); }
       }
@@ -484,7 +486,9 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
       let smsOk = false;
       const smsA = destinoSms(f.celular);
       if (smsA) {
-        try { await enviarSms(smsA, `Gomez Legal Abogados: tu contrato quedo aceptado. Tu copia y la constancia estan en ${URL_FIRMA()}?t=${f.token}`); smsOk = true; } catch (e) { aviso.push('No se pudo enviar el SMS de confirmación: ' + String(e.message || e).slice(0, 150)); }
+        const txt = f.correo ? 'Gomez Legal Abogados: tu contrato quedo aceptado. Te enviamos la copia y la constancia a tu correo.'
+          : `Gomez Legal Abogados: tu contrato quedo aceptado. Tu copia y la constancia estan en ${URL_FIRMA()}?t=${f.token}`;
+        try { await enviarSms(smsA, txt); smsOk = true; } catch (e) { aviso.push('No se pudo enviar el SMS de confirmación: ' + String(e.message || e).slice(0, 150)); }
       }
       await sb.from(TABLA).update({ mensaje: aviso.length ? aviso.join(' | ') : null, copia_enviada: correoOk, guardado_sharepoint: guardado }).eq('id', f.id);
       if (f.caso_id) await sb.from('panel_historial').insert({ caso_id: f.caso_id, campo: 'contrato_firma', valor_anterior: 'Enviado a firma', valor_nuevo: `Contrato FIRMADO por el cliente (IP ${ip})${guardado ? '' : ' - falta guardarlo en SharePoint'}`, usuario_email: 'cliente (firma electrónica)' }).then(() => {}, () => {});

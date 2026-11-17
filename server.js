@@ -1155,16 +1155,61 @@ async function crearSolicitudContrato(sesion, asesor) {
   if (previas && previas.length && Date.now() - new Date(previas[0].creado_en).getTime() < 30 * 60 * 1000) {
     return { yaExiste: true };
   }
-  const { error } = await sb.from('solicitudes_contrato').insert({
+  const fila = {
     caso_id: sesion.casoId,
     cedula,
     nombre_cliente: nombre,
     servicio: sesion.data.servicio_contratado || null,
     asesor: asesor || null,
-  });
+    session_id: sesion.sessionId || null,
+  };
+  let { error } = await sb.from('solicitudes_contrato').insert(fila);
+  if (error && /session_id/.test(error.message || '')) {
+    // Si aún no se corrió el SQL nuevo, se guarda sin el aviso automático.
+    delete fila.session_id;
+    ({ error } = await sb.from('solicitudes_contrato').insert(fila));
+  }
   if (error) throw error;
   return { yaExiste: false };
 }
+
+function textoContratoListo(r) {
+  const borrador = (r.archivos || []).some((a) => /^BORRADOR_/i.test(a));
+  const lineas = [`${borrador ? '⚠️ Contrato generado como BORRADOR' : '✅ ¡Contrato listo!'} — ${r.nombre_cliente || 'cliente'}`];
+  if (r.mensaje) lineas.push(r.mensaje);
+  if (r.link_contrato) lineas.push(`📄 Contrato PDF: ${r.link_contrato}`);
+  if (r.link_word) lineas.push(`📝 Contrato Word (editable): ${r.link_word}`);
+  if (r.link_carpeta) lineas.push(`📁 Carpeta del cliente: ${r.link_carpeta}`);
+  if (!r.link_contrato && !r.link_word && (r.archivos || []).length) lineas.push(`Archivos: ${(r.archivos || []).join(', ')}`);
+  lineas.push(borrador ? 'Revisa lo marcado, corrígelo y toca "Crear contrato" de nuevo.' : 'Revísalo y, si está bien, envíalo a firma desde el panel (Casos → "Enviar contrato a firma").');
+  return lineas.join('\n\n');
+}
+
+// Avisos automáticos para la extensión del asesor: contratos de SU sesión que ya terminaron y no ha visto.
+app.get('/api/contrato/avisos', async (req, res) => {
+  // La extensión manda sus últimas sesiones (el asesor puede haber empezado otro caso mientras se generaba).
+  const ids = String(req.query.sessionIds || req.query.sessionId || '').split(',').map((x) => x.trim()).filter((x) => /^[A-Za-z0-9_-]{6,80}$/.test(x)).slice(0, 10);
+  if (!ids.length) return res.json({ avisos: [] });
+  try {
+    const sb = clienteSupabaseAdmin();
+    const { data, error } = await sb.from('solicitudes_contrato').select('*')
+      .in('session_id', ids).in('estado', ['listo', 'falta_documentos', 'error']).is('avisado_en', null)
+      .order('creado_en', { ascending: true }).limit(5);
+    if (error) return res.json({ avisos: [] }); // columnas aún no creadas: sin avisos
+    const avisos = [];
+    for (const r of data || []) {
+      const { data: tomado } = await sb.from('solicitudes_contrato').update({ avisado_en: new Date().toISOString() }).eq('id', r.id).is('avisado_en', null).select('id');
+      if (!tomado || !tomado.length) continue;
+      if (r.estado === 'listo') avisos.push(textoContratoListo(r));
+      else if (r.estado === 'falta_documentos') avisos.push(`📎 ${r.nombre_cliente || 'Cliente'}: faltan documentos para el contrato: ${r.mensaje || 'revisa cédula, RUT y factura'}.${r.link_carpeta ? `\n\n📁 Carpeta: ${r.link_carpeta}` : ''}\n\nAdjúntalos y toca "Crear contrato" otra vez.`);
+      else avisos.push(`⚠️ ${r.nombre_cliente || 'Cliente'}: no se pudo crear el contrato: ${r.mensaje || 'error desconocido'}.`);
+    }
+    res.json({ avisos });
+  } catch (e) {
+    console.error('contrato/avisos:', e);
+    res.json({ avisos: [] });
+  }
+});
 
 async function textoEstadoContrato(casoId) {
   const sb = clienteSupabaseAdmin();
@@ -1179,10 +1224,7 @@ async function textoEstadoContrato(casoId) {
   if (!r) return { reply: 'Todavía no hay una solicitud de contrato para este cliente. Toca "Crear contrato" cuando estén los documentos.', opciones: ['Crear contrato'] };
   if (r.estado === 'pendiente') return { reply: '⏳ Tu solicitud está en cola. El sistema la toma en 1 a 2 minutos.', opciones: ['Ver estado del contrato'] };
   if (r.estado === 'procesando') return { reply: '⚙️ Estoy leyendo los documentos y armando el contrato. Pregúntame de nuevo en un minuto.', opciones: ['Ver estado del contrato'] };
-  if (r.estado === 'listo') {
-    const arch = (r.archivos || []).join(', ');
-    return { reply: `✅ ¡Contrato listo! Quedó en la carpeta del cliente en SharePoint${arch ? `: ${arch}` : ''}.${r.mensaje ? `\n\n${r.mensaje}` : ''}${r.link_carpeta ? `\n\n📁 ${r.link_carpeta}` : ''}\n\nRevísalo y envíaselo al cliente para que confirme que todo está bien.` };
-  }
+  if (r.estado === 'listo') return { reply: textoContratoListo(r) };
   if (r.estado === 'falta_documentos') return { reply: `📎 Faltan documentos para el contrato: ${r.mensaje || 'revisa cédula, RUT y factura'}.\n\nAdjúntalos con el clip y toca "Crear contrato" otra vez.`, opciones: ['Crear contrato'] };
   return { reply: `⚠️ No se pudo crear el contrato: ${r.mensaje || 'error desconocido'}. Avisa a soporte o intenta de nuevo.`, opciones: ['Crear contrato'] };
 }
@@ -1366,6 +1408,7 @@ app.post('/api/chat', async (req, res) => {
       sesion = nuevaSesion();
       sesiones.set(sessionId, sesion);
     }
+    sesion.sessionId = sessionId; // para avisarle al asesor cuando su contrato esté listo
 
     // --- Elegir un cliente de la lista de coincidencias ---
     const mElegir = message.trim().match(/^elegir\s+(\d+)\b/i);
@@ -1427,7 +1470,7 @@ app.post('/api/chat', async (req, res) => {
           const r = await crearSolicitudContrato(sesion, asesor);
           let reply = r.yaExiste
             ? '⏳ Ya hay una solicitud en proceso para este cliente. Toca "Ver estado del contrato" en un par de minutos.'
-            : '✅ Listo, mandé la solicitud. El sistema revisa los documentos y arma el contrato (toma 2 a 4 minutos). Toca "Ver estado del contrato" para saber cómo va.';
+            : '✅ Listo, mandé la solicitud. El sistema revisa los documentos y arma el contrato (2 a 4 minutos). Te aviso aquí mismo con el enlace cuando esté listo.';
           const neg = sesion.negociacion;
           if (neg && neg.sub === 'contrato_docs') {
             neg.sub = 'escalar';

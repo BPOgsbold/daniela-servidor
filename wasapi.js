@@ -20,14 +20,18 @@ MEMORIA Y ARCHIVOS (muy importante)
 - Si el cliente manda varios mensajes seguidos, respóndelos juntos en un solo mensaje corto.
 FORMATO: texto plano. NUNCA uses asteriscos, negritas, guiones de lista ni Markdown; WhatsApp los muestra mal.
 SALIDA: responde SOLO un JSON válido, sin texto fuera de él:
-{"respuesta":"texto para el cliente, plano (puede tener 2 o 3 mensajes cortos separados por una línea en blanco)","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"saldos_dian":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"proceso_explicado":null,"acepta_avanzar":null,"medios_pago_informados":null,"pago_upme":null,"documentos_recibidos":[],"bancaria_despues":null,"objeciones":null,"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null,"causa_escalamiento":null}
-En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula", "certificacion_bancaria". "precio_informado":true cuando ya le explicaste los honorarios (con el valor si es EPM, Confamilia o Referix; si es SURA u otro canal, que el consultor le confirma el valor). "proceso_explicado":true cuando ya le explicaste las etapas del proceso. "bancaria_despues":true solo si el cliente dice que la certificación bancaria la envía después. "medios_pago_informados":true cuando ya le diste la cuenta y la llave para pagar los honorarios. "pago_upme":"gomez_legal" si quiere que nosotros hagamos el pago de la UPME (+$15.000) o "cliente" si lo paga él con el usuario y clave que le entregamos. "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, honorarios y proceso explicados, acepta_avanzar=true y documentos factura, rut, cedula y certificacion_bancaria recibidos (o bancaria_despues=true) (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada, sura_en_proceso. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
+{"respuesta":"texto para el cliente, plano (puede tener 2 o 3 mensajes cortos separados por una línea en blanco)","perfil":{"nombre":null,"nombre_completo":null,"cedula":null,"correo":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"saldos_dian":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"proceso_explicado":null,"acepta_avanzar":null,"medios_pago_informados":null,"pago_upme":null,"documentos_recibidos":[],"bancaria_despues":null,"pago_honorarios_recibido":null,"pago_despues":null,"objeciones":null,"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","archivos_tipos":[],"traspasar":false,"motivo_traspaso":null,"causa_escalamiento":null}
+En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula", "certificacion_bancaria". "precio_informado":true cuando ya le explicaste los honorarios (con el valor si es EPM, Confamilia o Referix; si es SURA u otro canal, que el consultor le confirma el valor). "proceso_explicado":true cuando ya le explicaste las etapas del proceso. "bancaria_despues":true solo si el cliente dice que la certificación bancaria la envía después. "nombre_completo" y "cedula" (solo números; si la factura es de una empresa, el NIT sin el dígito de verificación) salen de la cédula, el RUT o la factura. "correo": el correo del cliente para enviarle el contrato. "archivos_tipos": un tipo por cada archivo que llegó en ESTE mensaje, en el mismo orden: "factura", "rut", "cedula", "certificacion_bancaria", "certificado_upme", "soporte_pago" u "otro" (vacío si no llegó ningún archivo). "pago_honorarios_recibido":true cuando el cliente envía el comprobante del pago de honorarios o confirma que ya pagó. "pago_despues":true solo si dice que paga más adelante. "contrato_enviado_firma" y "contrato_firmado" los pone el sistema: no los cambies. "medios_pago_informados":true cuando ya le diste la cuenta y la llave para pagar los honorarios. "pago_upme":"gomez_legal" si quiere que nosotros hagamos el pago de la UPME (+$15.000) o "cliente" si lo paga él con el usuario y clave que le entregamos. "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, honorarios y proceso explicados, acepta_avanzar=true, documentos factura, rut, cedula y certificacion_bancaria recibidos (o bancaria_despues=true) y el pago de honorarios recibido (o pago_despues=true) (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada, sura_en_proceso. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
 const CAMPOS_CLAVE = ['nombre', 'marca_modelo', 'tipo_vehiculo', 'compro_nuevo', 'fecha_compra', 'titular_factura', 'tiene_certificado_upme', 'ciudad', 'saldos_dian', 'origen'];
 
 const pendientes = new Map(); // wa_id -> { timer, items, from_id }
 const vistos = new Set();     // wam_id ya procesados (dedupe en memoria)
 
 // WhatsApp muestra los asteriscos tal cual si no cierran bien: dejamos texto plano.
+const { sincronizarTodo } = require('./wasapi_caso');
+function extDeTipo(t) { return ({ 'application/pdf': 'pdf', 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' })[String(t || '').toLowerCase()] || ''; }
+// Los campos que empiezan por "_" son internos (id del caso, archivos pendientes): la IA no los ve.
+function fichaVisible(p) { const o = {}; for (const [k, v] of Object.entries(p || {})) if (!k.startsWith('_')) o[k] = v; return o; }
 function limpiarTexto(t) {
   return String(t || '').replace(/[*`~]/g, '').replace(/(^|\s)_+([^_\n]+)_+(?=\s|[.,;:!?]|$)/g, '$1$2').replace(/^\s{0,3}#{1,6}\s+/gm, '').replace(/^\s*[-•]\s+/gm, '').replace(/[ \t]+\n/g, '\n').trim();
 }
@@ -175,7 +179,7 @@ async function procesar(waId, deps) {
     const historial = Array.isArray(conv.mensajes) ? conv.mensajes : [];
     const ahora = new Date().toISOString();
 
-    const textos = []; const bloques = []; const archivos = [];
+    const textos = []; const bloques = []; const archivos = []; const adjuntos = [];
     for (const d of p.items) {
       if (d.message) textos.push(d.message);
       else if (d.caption) textos.push(d.caption);
@@ -184,7 +188,7 @@ async function procesar(waId, deps) {
         const url = await urlDeArchivo(d);
         let leido = false;
         if (url) {
-          try { const f = await bajarArchivo(url); const b = bloqueArchivo(f.buf, f.tipo, d.filename); if (b) { bloques.push(b); leido = true; } } catch (e) { console.error('wasapi archivo:', e.message); }
+          try { const f = await bajarArchivo(url); const b = bloqueArchivo(f.buf, f.tipo, d.filename); if (b) { bloques.push(b); leido = true; adjuntos.push(d.message_type === 'sticker' ? { sticker: true } : { url, buf: f.buf, nombre: d.filename || ('archivo.' + (extDeTipo(f.tipo) || 'bin')), mime: f.tipo }); } } catch (e) { console.error('wasapi archivo:', e.message); }
         }
         if (!leido) {
           textos.push('[El cliente envió un archivo (' + (d.filename || d.message_type) + ') que no pude abrir]');
@@ -206,7 +210,7 @@ async function procesar(waId, deps) {
     let conocimiento = '';
     try { conocimiento = await deps.obtenerConocimientoTexto(textoCliente); } catch (_) {}
     const sistema = BASE_PROMPT + '\n' + REGLAS_EXTRA +
-      '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(conv.perfil || {}) +
+      '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(fichaVisible(conv.perfil)) +
       (tarifaUpme((conv.perfil || {}).valor_sin_iva) ? '\nTARIFA UPME DE ESTE CLIENTE (calculadora oficial de la UPME, Resolución 135 de 2025, con el valor sin IVA de su factura): ' + tarifaUpme(conv.perfil.valor_sin_iva).texto + '. Úsala tal cual cuando hables de la tarifa de la UPME.' : '') +
       (conv.perfil && conv.perfil.nombre ? '\nNOMBRE DE PILA PARA DIRIGIRTE: ' + String(conv.perfil.nombre).trim().split(/\s+/)[0] + '. Nunca uses el apellido al hablar con el cliente.' : '') +
       (conocimiento ? '\n\nGUÍA DE CONOCIMIENTO (úsala para resolver dudas; no la copies tal cual ni menciones precios):\n' + String(conocimiento).slice(0, 14000) : '');
@@ -258,6 +262,7 @@ async function procesar(waId, deps) {
       if (!/rut/.test(docs)) falta.push('doc_rut');
       if (!/c[eé]dula|cedula/.test(docs)) falta.push('doc_cedula');
       if (!/bancaria/.test(docs) && !perfil.bancaria_despues) falta.push('doc_bancaria');
+      if (perfil.acepta_avanzar && !perfil.pago_honorarios_recibido && !perfil.pago_despues) falta.push('pago_honorarios');
       const CAUSAS = ['empresa','dos_propietarios','apoderado','rut_42_48','leasing','iva_19','error_certificado','cuenta_digital','inadmision','plazo_critico','cliente_molesto','pide_contrato','pide_estado','pide_llamada','sura_en_proceso'];
       // Solo estas cortan la conversación al instante. Las demás (empresa, IVA 19, dos propietarios...) se MARCAN
       // como alerta para el consultor y Daniela sigue recogiendo datos y documentos; se entrega al final con todo.
@@ -273,7 +278,7 @@ async function procesar(waId, deps) {
         // Si la IA ya se estaba despidiendo para entregar el caso, se descarta ese texto y se pide lo siguiente.
         if (partes.some((x) => /(consultor|asesor|un momento|pasar su caso|organizo su caso|del equipo)/i.test(x))) partes = [];
         // Aún no está completa la ficha: no se entrega al agente, se sigue perfilando.
-        if (!partes.length) partes = [({ nombre: '¿Con quién tengo el gusto de hablar?', marca_modelo: '¿Qué marca y modelo es su vehículo?', tipo_vehiculo: '¿Su vehículo es eléctrico, híbrido o híbrido enchufable?', compro_nuevo: '¿Lo compró nuevo y usted fue el primer dueño?', fecha_compra: '¿En qué fecha lo compró, más o menos?', titular_factura: '¿La factura quedó a su nombre, a nombre de dos personas o de una empresa?', tiene_certificado_upme: '¿Ya tiene el certificado de la UPME o todavía no?', ciudad: '¿En qué ciudad vive?', medios_pago: 'Los honorarios los puede pagar por consignación o transferencia a la cuenta de ahorros Bancolombia 43600005898, a nombre de GOMEZ LEGAL ABOGADOS, NIT 901964467-0, o por la llave @gomezlegalabogad. ¿Le queda claro?', pago_upme: 'Para la UPME, ¿prefiere que nosotros hagamos el pago por usted (con un costo adicional de $15.000) o que le entreguemos su usuario y clave para que usted pague directo en la UPME?', precio_informado: 'Ahora le cuento cómo funcionan nuestros honorarios. ¿Le parece?', proceso_explicado: '¿Le explico paso a paso cómo es el proceso para recuperar su IVA?', doc_bancaria: 'Por último, ¿me envía una certificación bancaria de una cuenta a su nombre? No sirven bancos digitales como Nu o Lulo.', acepta_avanzar: 'Para dejar todo listo, ¿avanzamos con su caso?', saldos_dian: 'Una última consulta para validar su beneficio: ¿tiene saldos pendientes por pagar ante la DIAN?', origen: '¿Cómo llegó con nosotros? ¿Fue por SURA, por EPM, Grupo Confamilia, Referix u otro medio?', doc_factura: '¿Me puede enviar la factura de compra en PDF o imagen?', doc_rut: '¿Me puede enviar su RUT actualizado, de menos de 30 días?', doc_cedula: '¿Me envía también una copia de su cédula por ambas caras?' })[falta[0]] || ('Para dejar todo listo, ¿me confirma su ' + falta[0].replace(/_/g, ' ') + '?')];
+        if (!partes.length) partes = [({ nombre: '¿Con quién tengo el gusto de hablar?', marca_modelo: '¿Qué marca y modelo es su vehículo?', tipo_vehiculo: '¿Su vehículo es eléctrico, híbrido o híbrido enchufable?', compro_nuevo: '¿Lo compró nuevo y usted fue el primer dueño?', fecha_compra: '¿En qué fecha lo compró, más o menos?', titular_factura: '¿La factura quedó a su nombre, a nombre de dos personas o de una empresa?', tiene_certificado_upme: '¿Ya tiene el certificado de la UPME o todavía no?', ciudad: '¿En qué ciudad vive?', medios_pago: 'Los honorarios los puede pagar por consignación o transferencia a la cuenta de ahorros Bancolombia 43600005898, a nombre de GOMEZ LEGAL ABOGADOS, NIT 901964467-0, o por la llave @gomezlegalabogad. ¿Le queda claro?', pago_upme: 'Para la UPME, ¿prefiere que nosotros hagamos el pago por usted (con un costo adicional de $15.000) o que le entreguemos su usuario y clave para que usted pague directo en la UPME?', precio_informado: 'Ahora le cuento cómo funcionan nuestros honorarios. ¿Le parece?', proceso_explicado: '¿Le explico paso a paso cómo es el proceso para recuperar su IVA?', doc_bancaria: 'Por último, ¿me envía una certificación bancaria de una cuenta a su nombre? No sirven bancos digitales como Nu o Lulo.', acepta_avanzar: 'Para dejar todo listo, ¿avanzamos con su caso?', saldos_dian: 'Una última consulta para validar su beneficio: ¿tiene saldos pendientes por pagar ante la DIAN?', origen: '¿Cómo llegó con nosotros? ¿Fue por SURA, por EPM, Grupo Confamilia, Referix u otro medio?', doc_factura: '¿Me puede enviar la factura de compra en PDF o imagen?', doc_rut: '¿Me puede enviar su RUT actualizado, de menos de 30 días?', doc_cedula: '¿Me envía también una copia de su cédula por ambas caras?', pago_honorarios: 'Mientras tanto ya estamos avanzando con su contrato: le llegará por SMS y/o correo electrónico para firmarlo. ¿Ya pudo hacer el pago de los honorarios? Si es así, me comparte el comprobante por aquí.' })[falta[0]] || ('Para dejar todo listo, ¿me confirma su ' + falta[0].replace(/_/g, ' ') + '?')];
       } else {
         estado = 'humano';
         const n = perfil.nombre ? ', ' + String(perfil.nombre).split(' ')[0] : '';
@@ -297,6 +302,15 @@ async function procesar(waId, deps) {
       actualizado_en: new Date().toISOString(), from_id: p.from_id,
       ultimo_payload_archivo: conv.ultimo_payload_archivo || null,
     }, { onConflict: 'wa_id' });
+
+    // Igual que el asistente: crea o actualiza el caso, sube cada documento con su tipo y, si ya está todo, pide el contrato.
+    if (process.env.WASAPI_CREAR_CASOS !== 'no') {
+      const tipos = j && Array.isArray(j.archivos_tipos) ? j.archivos_tipos : [];
+      adjuntos.forEach((a, i) => { a.tipo = String(tipos[i] || 'otro').toLowerCase(); });
+      const antes = JSON.stringify(perfil);
+      await sincronizarTodo({ perfil, waId, archivos: adjuntos.filter((a) => !a.sticker), sb, bajarArchivo });
+      if (JSON.stringify(perfil) !== antes) await sb.from('wasapi_conversaciones').update({ perfil }).eq('wa_id', waId);
+    }
   } catch (e) {
     console.error('wasapi procesar:', e);
   }
@@ -343,6 +357,22 @@ function programar(waId, deps) {
   enCurso.set(waId, siguiente);
 }
 
+// Mensaje del sistema al cliente por WhatsApp (contrato enviado a firma, contrato firmado...). Se busca la
+// conversación por los últimos 10 dígitos del celular; queda en el historial para que Daniela sepa qué se le dijo.
+async function avisarCliente(sb, telefono, texto, marcas) {
+  const cel = String(telefono || '').replace(/\D/g, '').slice(-10);
+  if (cel.length !== 10 || !process.env.WASAPI_API_KEY) return false;
+  const { data } = await sb.from('wasapi_conversaciones').select('*').like('wa_id', '%' + cel).order('actualizado_en', { ascending: false }).limit(1);
+  const conv = data && data[0];
+  if (!conv || !conv.from_id) return false;
+  const partes = String(texto).split(/\n\s*\n/).filter((x) => x.trim());
+  for (const parte of partes) { await enviarTexto(conv.wa_id, conv.from_id, parte.trim()); await new Promise((r) => setTimeout(r, 1200)); }
+  const hist = Array.isArray(conv.mensajes) ? conv.mensajes : [];
+  hist.push({ rol: 'daniela', texto: partes.join('\n\n'), ts: new Date().toISOString(), sistema: true });
+  await sb.from('wasapi_conversaciones').update({ mensajes: hist.slice(-200), perfil: Object.assign({}, conv.perfil || {}, marcas || {}) }).eq('wa_id', conv.wa_id);
+  return true;
+}
+
 module.exports = function montarWasapi(app, deps) {
   app.post('/api/wasapi/webhook', (req, res) => {
     res.status(200).json({ ok: true }); // Wasapi solo espera 4 s
@@ -379,3 +409,5 @@ module.exports = function montarWasapi(app, deps) {
     ultimos_origenes_enviados: ultimosOrigenes,
   }));
 };
+
+module.exports.avisarCliente = avisarCliente;

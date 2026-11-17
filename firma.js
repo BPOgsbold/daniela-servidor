@@ -278,17 +278,16 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
   const noEncontrado = (res) => res.status(404).json({ error: 'Este enlace no existe. Pide a tu asesor uno nuevo.' });
 
   // ---- Panel (equipo): enviar contrato a firma
-  app.post('/api/firma/enviar', async (req, res) => {
-    const ctx = await exigirEquipo(req, res); if (!ctx) return;
-    const { casoId, correo, celular, archivoId, reenviar } = req.body || {};
-    const sb = ctx.sb;
-    try {
-      if (!sp.configurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
-      if (!casoId) return res.status(400).json({ error: 'Falta el caso.' });
+  // Envía el contrato del caso a firma (lo usan el botón del panel y el envío automático de Daniela).
+  // Devuelve { status, body } como respondería la ruta.
+  const falla = (status, body) => ({ status, body });
+  async function enviarAFirmaInterno(sb, { casoId, correo, celular, archivoId, reenviar, enviadoPor, auto }) {
+      if (!sp.configurado()) return falla(503, { error: 'SharePoint no está configurado en el servidor.' });
+      if (!casoId) return falla(400, { error: 'Falta el caso.' });
       const { data: caso } = await sb.from('Perfilamiento_y_ventas_GLA').select('*').eq('id', casoId).maybeSingle();
-      if (!caso) return res.status(404).json({ error: 'No encontré el caso.' });
+      if (!caso) return falla(404, { error: 'No encontré el caso.' });
       const ced = soloDigitos(caso.numero_identificacion);
-      if (!ced) return res.status(400).json({ error: 'El caso no tiene número de identificación.' });
+      if (!ced) return falla(400, { error: 'El caso no tiene número de identificación.' });
       // Lo que manda el panel manda (si el asesor deja el correo vacío, no se usa el del caso)
       const mail0 = String(correo !== undefined ? correo : (caso.correo || caso.email || caso.correo_electronico || '')).trim().toLowerCase();
       const mail = EMAIL_OK.test(mail0) ? mail0 : null;
@@ -296,31 +295,33 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
       const smsA = destinoSms(cel);
       if (!mail && !smsA) {
         const sinSms = !process.env.INALAMBRIA_API_KEY ? ' (el SMS no está configurado en el servidor)' : !celularE164(cel) ? ' (el celular no es un celular colombiano válido)' : ' (en modo prueba falta FIRMA_SMS_PRUEBA)';
-        return res.status(400).json({ error: 'Falta un correo válido o un celular para enviarle el contrato' + sinSms + '.', faltaCorreo: true });
+        return falla(400, { error: 'Falta un correo válido o un celular para enviarle el contrato' + sinSms + '.', faltaCorreo: true });
       }
 
       const { data: previas } = await sb.from(TABLA).select('id,estado,vence_en,firmado_en').eq('caso_id', String(casoId));
       const firmada = (previas || []).find((p) => p.estado === 'firmado');
-      if (firmada && !reenviar) return res.status(409).json({ error: 'Este contrato ya fue firmado.', yaFirmado: true, firmado_en: firmada.firmado_en });
+      if (firmada && !reenviar) return falla(409, { error: 'Este contrato ya fue firmado.', yaFirmado: true, firmado_en: firmada.firmado_en });
       const vigente = (previas || []).find((p) => ['enviado', 'visto'].includes(p.estado) && new Date(p.vence_en) > new Date());
-      if (vigente && !reenviar) return res.status(409).json({ error: 'Ya hay un contrato enviado a firma y vigente.', yaEnviado: true });
+      if (vigente && !reenviar) return falla(409, { error: 'Ya hay un contrato enviado a firma y vigente.', yaEnviado: true });
 
       // Contrato en PDF en la carpeta del cliente
       const lista = await sp.listarDocumentosPorCedula(ced);
-      if (!lista.encontrada) return res.status(400).json({ error: 'No encontré la carpeta del cliente en SharePoint (cédula ' + ced + ').' });
+      if (!lista.encontrada) return falla(400, { error: 'No encontré la carpeta del cliente en SharePoint (cédula ' + ced + ').' });
       const contratos = lista.archivos.filter((a) => a.tipo === 'Contrato' && !/FIRMAD|CONSTANCIA/i.test(a.nombre));
       let pdfs = contratos.filter((a) => /\.pdf$/i.test(a.nombre));
       if (archivoId) pdfs = pdfs.filter((a) => a.id === archivoId);
       if (!pdfs.length) {
-        if (contratos.some((a) => /\.docx?$/i.test(a.nombre))) return res.status(400).json({ error: 'El contrato de este cliente está en Word, no en PDF. Pide que se genere en PDF (OCR_CONTRATO_FORMATO=pdf).' });
-        return res.status(400).json({ error: 'No hay un contrato generado en la carpeta del cliente.' });
+        if (contratos.some((a) => /\.docx?$/i.test(a.nombre))) return falla(400, { error: 'El contrato de este cliente está en Word, no en PDF. Pide que se genere en PDF (OCR_CONTRATO_FORMATO=pdf).' });
+        return falla(400, { error: 'No hay un contrato generado en la carpeta del cliente.' });
       }
       const finales = pdfs.filter((a) => !/^BORRADOR/i.test(a.nombre));
-      if (!finales.length) return res.status(400).json({ error: 'El contrato está como BORRADOR: hay datos por revisar. Corrígelos y vuelve a generarlo.' });
-      if (finales.length > 1 && !archivoId) return res.status(409).json({ error: 'Hay más de un contrato en la carpeta. Elige cuál enviar.', opciones: finales.map((a) => ({ id: a.id, nombre: a.nombre, modificado: a.modificado })) });
+      // En automático se toma el contrato más reciente (versión _vN más nueva).
+      if (auto && finales.length > 1) finales.sort((x, y) => String(y.modificado || '').localeCompare(String(x.modificado || '')));
+      if (!finales.length) return falla(400, { error: 'El contrato está como BORRADOR: hay datos por revisar. Corrígelos y vuelve a generarlo.' });
+      if (finales.length > 1 && !archivoId && !auto) return falla(409, { error: 'Hay más de un contrato en la carpeta. Elige cuál enviar.', opciones: finales.map((a) => ({ id: a.id, nombre: a.nombre, modificado: a.modificado })) });
       const archivo = finales[0];
       const { buffer } = await sp.descargarArchivo(archivo.id);
-      if (!buffer.length || buffer.slice(0, 4).toString() !== '%PDF') return res.status(400).json({ error: 'El archivo del contrato no es un PDF válido.' });
+      if (!buffer.length || buffer.slice(0, 4).toString() !== '%PDF') return falla(400, { error: 'El archivo del contrato no es un PDF válido.' });
 
       // Se anulan los envíos anteriores vigentes (solo en reenvío) y se crea el nuevo
       if (reenviar) await sb.from(TABLA).update({ estado: 'cancelado' }).eq('caso_id', String(casoId)).in('estado', ['enviado', 'visto']);
@@ -329,7 +330,7 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
       const fila = {
         token, caso_id: String(casoId), cedula: ced, nombre: String(caso.nombre_cliente || '').trim(), correo: mail, celular: cel,
         placa: caso.placa || null, archivo_id: archivo.id, archivo_nombre: archivo.nombre, pdf_sha256: sha256(buffer),
-        estado: 'enviado', vence_en: vence, enviado_por: ctx.email, enviado_en: new Date().toISOString(),
+        estado: 'enviado', vence_en: vence, enviado_por: enviadoPor, enviado_en: new Date().toISOString(),
       };
       const { data: ins, error } = await sb.from(TABLA).insert(fila).select('*').maybeSingle();
       if (error || !ins) throw new Error('No pude guardar la solicitud de firma: ' + (error && error.message));
@@ -350,9 +351,32 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
         throw new Error('No se pudo enviar el contrato al cliente: ' + fallas.join(' | '));
       }
       await sb.from(TABLA).update({ canal_invitacion: enviados.join(' + '), mensaje: fallas.length ? fallas.join(' | ').slice(0, 300) : null }).eq('id', ins.id);
-      await sb.from('panel_historial').insert({ caso_id: casoId, campo: 'contrato_firma', valor_anterior: null, valor_nuevo: `Contrato enviado a firma por ${enviados.join(' y ')}${ES_REAL() ? '' : ' (MODO PRUEBA)'}`, usuario_email: ctx.email }).then(() => {}, () => {});
-      console.log(`[firma] ${ctx.email} envió a firma el contrato de ${ced} (${archivo.nombre}) por ${enviados.join(' + ')}${ES_REAL() ? '' : ' [PRUEBA]'}`);
-      res.json({ ok: true, firmaId: ins.id, enviadoA: enviados.join(' y '), avisos: fallas, vence_en: vence, prueba: !ES_REAL() });
+      await sb.from('panel_historial').insert({ caso_id: casoId, campo: 'contrato_firma', valor_anterior: null, valor_nuevo: `Contrato enviado a firma por ${enviados.join(' y ')}${ES_REAL() ? '' : ' (MODO PRUEBA)'}`, usuario_email: enviadoPor }).then(() => {}, () => {});
+      console.log(`[firma] ${enviadoPor} envió a firma el contrato de ${ced} (${archivo.nombre}) por ${enviados.join(' + ')}${ES_REAL() ? '' : ' [PRUEBA]'}`);
+      return { status: 200, body: { ok: true, firmaId: ins.id, enviadoA: enviados.join(' y '), avisos: fallas, vence_en: vence, prueba: !ES_REAL() } };
+  }
+
+  // ---- Aviso al cliente por WhatsApp (solo en modo real: en prueba el correo no le llega a él)
+  async function avisarWhatsApp(sb, firmaId) {
+    if (!ES_REAL()) return false;
+    const { data: f } = await sb.from(TABLA).select('*').eq('id', firmaId).maybeSingle();
+    if (!f) return false;
+    const primer = String(f.nombre || '').split(/\s+/)[0] || '';
+    const por = f.correo ? `a su correo ${mascaraCorreo(f.correo)}` : 'por mensaje de texto (SMS) a su celular';
+    const texto = `¡Hola${primer ? ', ' + primer : ''}! Ya le enviamos su contrato de servicios ${por} para que lo firme.\n\n` +
+      'Para firmarlo: abra el enlace "Revisar y firmar mi contrato", léalo con calma y pida su código de verificación; puede elegir recibirlo por SMS a su celular o a su correo. Escríbalo, marque "Acepto" y listo, son un par de minutos.\n\n' +
+      '¿Me confirma si le llegó?';
+    try { return await require('./wasapi').avisarCliente(sb, f.celular, texto, { contrato_enviado_firma: true }); }
+    catch (e) { console.error('firma: aviso WhatsApp:', e.message); return false; }
+  }
+
+  app.post('/api/firma/enviar', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    const { casoId, correo, celular, archivoId, reenviar } = req.body || {};
+    try {
+      const r = await enviarAFirmaInterno(ctx.sb, { casoId, correo, celular, archivoId, reenviar, enviadoPor: ctx.email });
+      if (r.status === 200) avisarWhatsApp(ctx.sb, r.body.firmaId).catch(() => {});
+      res.status(r.status).json(r.body);
     } catch (err) {
       console.error('firma/enviar:', err);
       res.status(500).json({ error: String(err.message || err) });
@@ -516,6 +540,11 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
           : `Gomez Legal Abogados: tu contrato quedo aceptado. Tu copia y la constancia estan en ${URL_FIRMA()}?t=${f.token}`;
         try { await enviarSms(smsA, txt); smsOk = true; } catch (e) { aviso.push('No se pudo enviar el SMS de confirmación: ' + String(e.message || e).slice(0, 150)); }
       }
+      if (ES_REAL()) {
+        const primer = String(f.nombre || '').split(/\s+/)[0] || '';
+        const txt = `¡Listo${primer ? ', ' + primer : ''}! Recibimos su contrato firmado, muchas gracias. ${f.correo ? 'Le enviamos la copia y la constancia de firma a su correo.' : 'Su copia y la constancia quedaron en el mismo enlace del SMS.'} Seguimos avanzando con su proceso.`;
+        require('./wasapi').avisarCliente(sb, f.celular, txt, { contrato_firmado: true }).catch((e) => console.error('firma: aviso WhatsApp firmado:', e.message));
+      }
       try { await correoEquipo(firmada, links); } catch (e) { console.error('firma: no se pudo avisar al equipo:', e); aviso.push('No se pudo enviar el aviso al equipo: ' + String(e.message || e).slice(0, 120)); }
       await sb.from(TABLA).update({ mensaje: aviso.length ? aviso.join(' | ') : null, copia_enviada: correoOk, guardado_sharepoint: guardado }).eq('id', f.id);
       if (f.caso_id) await sb.from('panel_historial').insert({ caso_id: f.caso_id, campo: 'contrato_firma', valor_anterior: 'Enviado a firma', valor_nuevo: `Contrato FIRMADO por el cliente (IP ${ip})${guardado ? '' : ' - falta guardarlo en SharePoint'}`, usuario_email: 'cliente (firma electrónica)' }).then(() => {}, () => {});
@@ -523,6 +552,54 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
       res.json({ ok: true, firmado_en: ahora, copiaPorCorreo: correoOk, copiaPorSms: smsOk });
     } catch (err) { console.error('firma/aceptar:', err); res.status(500).json({ error: 'No se pudo completar la firma. Intenta de nuevo.' }); }
   });
+
+  // ---- Envío AUTOMÁTICO a firma de los contratos que pidió Daniela por WhatsApp.
+  // Contrato limpio -> se envía a firma y se avisa al cliente por WhatsApp. BORRADOR, faltan documentos o error ->
+  // correo al equipo para revisarlo (y el asesor lo envía desde el panel). Se apaga con FIRMA_AUTO=no.
+  async function correoRevisar(r, motivo) {
+    const lista = String(process.env.FIRMA_AVISO_EQUIPO || REMITENTE()).split(/[,;]/).map((x) => (x.match(/[^\s<>"]+@[^\s<>"]+/) || [''])[0]).filter(Boolean);
+    const para = ES_REAL() ? lista : DESTINOS_PRUEBA();
+    const enlaces = [r.link_contrato ? boton(r.link_contrato, 'Ver contrato') : '', r.link_carpeta ? `<p style="text-align:center;margin:-10px 0 18px"><a href="${esc(r.link_carpeta)}" style="color:#1f6a5b;font-weight:600">📁 Abrir la carpeta del cliente</a></p>` : ''].join('');
+    const html = marco('⚠️ Contrato por revisar: ' + (r.nombre_cliente || 'cliente'), `<p style="margin:0 0 12px">Daniela pidió por WhatsApp el contrato de <b>${esc(r.nombre_cliente || '')}</b> (documento ${esc(r.cedula || '')}), pero <b>no se envió a firma automáticamente</b>:</p>
+     <p style="margin:0 0 16px;background:#fff6e0;border:1px solid #f0c36d;border-radius:8px;padding:10px 12px">${esc(motivo)}</p>
+     ${enlaces}<p style="margin:0;font-size:13px;color:#4a5b56">Revísalo, corrígelo si hace falta y envíalo a firma desde el panel (Casos → Firma del contrato).</p>`);
+    await sp.enviarCorreo({ remitente: REMITENTE(), destinatarios: para, asunto: `${ES_REAL() ? '' : '[PRUEBA] '}⚠️ Contrato por revisar: ${r.nombre_cliente || 'cliente'}`, html, adjuntos: [] });
+  }
+  let avisoColumnas = false;
+  async function revisarAutomaticos() {
+    const sb = sbServicio();
+    const { data, error } = await sb.from('solicitudes_contrato').select('*').eq('auto_firma', true).is('firma_auto_en', null)
+      .in('estado', ['listo', 'falta_documentos', 'error']).order('creado_en', { ascending: true }).limit(5);
+    if (error) { if (!avisoColumnas) { avisoColumnas = true; console.log('[firma-auto] desactivado hasta correr el SQL nuevo:', error.message); } return; }
+    for (const r of data || []) {
+      const { data: tomado } = await sb.from('solicitudes_contrato').update({ firma_auto_en: new Date().toISOString() }).eq('id', r.id).is('firma_auto_en', null).select('id');
+      if (!tomado || !tomado.length) continue;
+      let resultado;
+      try {
+        const borrador = (r.archivos || []).some((a) => /^BORRADOR/i.test(a)) || /BORRADOR/i.test(String(r.mensaje || ''));
+        if (r.estado !== 'listo') { resultado = (r.estado === 'falta_documentos' ? 'Faltan documentos: ' : 'Error: ') + (r.mensaje || ''); await correoRevisar(r, resultado); }
+        else if (borrador) { resultado = 'Salió como BORRADOR (hay datos por revisar). ' + (r.mensaje || ''); await correoRevisar(r, resultado); }
+        else {
+          const env = await enviarAFirmaInterno(sb, { casoId: r.caso_id, enviadoPor: 'Daniela (automático)', auto: true });
+          if (env.status === 200) {
+            const wa = await avisarWhatsApp(sb, env.body.firmaId);
+            resultado = 'Enviado a firma por ' + env.body.enviadoA + (wa ? ' + aviso por WhatsApp' : '');
+          } else if (env.body && (env.body.yaEnviado || env.body.yaFirmado)) {
+            resultado = env.body.error;
+          } else { resultado = 'No se pudo enviar: ' + ((env.body && env.body.error) || env.status); await correoRevisar(r, resultado); }
+        }
+      } catch (e) {
+        resultado = 'Error: ' + String(e.message || e).slice(0, 200);
+        try { await correoRevisar(r, resultado); } catch (_) {}
+      }
+      console.log(`[firma-auto] ${r.nombre_cliente} (${r.cedula}): ${resultado}`);
+      await sb.from('solicitudes_contrato').update({ firma_auto_resultado: String(resultado).slice(0, 300) }).eq('id', r.id);
+    }
+  }
+  if (String(process.env.FIRMA_AUTO || '').toLowerCase() !== 'no') {
+    setInterval(() => revisarAutomaticos().catch((e) => console.error('[firma-auto]', e.message)), 60 * 1000).unref();
+  }
+  registrarFirma.revisarAutomaticos = revisarAutomaticos; // para pruebas
 };
 
 module.exports.pdfConstancia = pdfConstancia;

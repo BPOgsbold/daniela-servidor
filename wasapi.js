@@ -20,8 +20,8 @@ MEMORIA Y ARCHIVOS (muy importante)
 - Si el cliente manda varios mensajes seguidos, respóndelos juntos en un solo mensaje corto.
 FORMATO: texto plano. NUNCA uses asteriscos, negritas, guiones de lista ni Markdown; WhatsApp los muestra mal.
 SALIDA: responde SOLO un JSON válido, sin texto fuera de él:
-{"respuesta":"texto para el cliente, plano (puede tener 2 o 3 mensajes cortos separados por una línea en blanco)","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"saldos_dian":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"proceso_explicado":null,"acepta_avanzar":null,"documentos_recibidos":[],"bancaria_despues":null,"objeciones":null,"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null,"causa_escalamiento":null}
-En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula", "certificacion_bancaria". "precio_informado":true cuando ya le explicaste los honorarios (con el valor si es EPM, Confamilia o Referix; si es SURA u otro canal, que el consultor le confirma el valor). "proceso_explicado":true cuando ya le explicaste las etapas del proceso. "bancaria_despues":true solo si el cliente dice que la certificación bancaria la envía después. "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, honorarios y proceso explicados, acepta_avanzar=true y documentos factura, rut, cedula y certificacion_bancaria recibidos (o bancaria_despues=true) (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada, sura_en_proceso. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
+{"respuesta":"texto para el cliente, plano (puede tener 2 o 3 mensajes cortos separados por una línea en blanco)","perfil":{"nombre":null,"marca_modelo":null,"tipo_vehiculo":null,"compro_nuevo":null,"primer_dueno":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"saldos_dian":null,"origen":null,"iva_factura":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"proceso_explicado":null,"acepta_avanzar":null,"medios_pago_informados":null,"pago_upme":null,"documentos_recibidos":[],"bancaria_despues":null,"objeciones":null,"notas":null},"datos_archivo":"resumen breve de lo leído en el archivo o null","traspasar":false,"motivo_traspaso":null,"causa_escalamiento":null}
+En "perfil" pon solo lo que sepas (conserva lo anterior). "documentos_recibidos" lista los que ya llegaron y leíste: "factura", "rut", "cedula", "certificacion_bancaria". "precio_informado":true cuando ya le explicaste los honorarios (con el valor si es EPM, Confamilia o Referix; si es SURA u otro canal, que el consultor le confirma el valor). "proceso_explicado":true cuando ya le explicaste las etapas del proceso. "bancaria_despues":true solo si el cliente dice que la certificación bancaria la envía después. "medios_pago_informados":true cuando ya le diste la cuenta y la llave para pagar los honorarios. "pago_upme":"gomez_legal" si quiere que nosotros hagamos el pago de la UPME (+$15.000) o "cliente" si lo paga él con el usuario y clave que le entregamos. "acepta_avanzar":true solo cuando el cliente dijo claramente que sí quiere avanzar. "traspasar":true con "motivo_traspaso":"completo" y "respuesta":"" SOLO cuando tengas la ficha completa, honorarios y proceso explicados, acepta_avanzar=true y documentos factura, rut, cedula y certificacion_bancaria recibidos (o bancaria_despues=true) (el sistema pide el momento y entrega al agente). Si es un caso de ESCALA DE INMEDIATO A HUMANO usa "motivo_traspaso":"escalamiento" y "causa_escalamiento" con exactamente una de: empresa, dos_propietarios, apoderado, rut_42_48, leasing, iva_19, error_certificado, cuenta_digital, inadmision, plazo_critico, cliente_molesto, pide_contrato, pide_estado, pide_llamada, sura_en_proceso. Sin una de esas causas no se acepta el traspaso. Mientras falte algo, NO traspases: sigue con la etapa que corresponda.`;
 const CAMPOS_CLAVE = ['nombre', 'marca_modelo', 'tipo_vehiculo', 'compro_nuevo', 'fecha_compra', 'titular_factura', 'tiene_certificado_upme', 'ciudad', 'saldos_dian', 'origen'];
 
 const pendientes = new Map(); // wa_id -> { timer, items, from_id }
@@ -97,6 +97,36 @@ async function llamarClaude(sistema, mensajes) {
   if (!r.ok) throw new Error((j.error && j.error.message) || 'IA ' + r.status);
   return (j.content || []).map((b) => b.text || '').join('').trim();
 }
+// ---- Tarifa UPME: misma fórmula de la calculadora oficial (app.upme.gov.co/Calculadora/Calculator.js,
+// Resolución UPME 135 de 2025). UVT configurable en Render: UPME_UVT (por defecto 52.374, año 2026).
+function parseMonto(v) {
+  if (typeof v === 'number') return isFinite(v) ? v : null;
+  let t = String(v || '').replace(/[^\d.,]/g, '');
+  if (!t) return null;
+  if (/,\d{1,2}$/.test(t)) t = t.replace(/\./g, '').replace(',', '.');          // 123.800.000,00
+  else if (/\.\d{1,2}$/.test(t) && (t.match(/\./g) || []).length === 1) t = t.replace(/,/g, ''); // 123800000.00
+  else t = t.replace(/[.,]/g, '');                                                   // 123.800.000
+  const n = Number(t);
+  return isFinite(n) && n > 0 ? n : null;
+}
+const GESTION_PAGO_UPME = () => Number(process.env.UPME_GESTION_PAGO) || 15000;
+function tarifaUpme(valorSinIva) {
+  const UVT = Number(process.env.UPME_UVT) || 52374;
+  const precio = parseMonto(valorSinIva);
+  if (!precio || precio < 1000000) return null;
+  const uvtEq = Math.round(precio * 100 / UVT) / 100;
+  let total;
+  if (uvtEq < 275) total = 1.2;
+  else if (uvtEq < 826) total = 3.4;
+  else if (uvtEq < 1652) total = 6.7;
+  else if (uvtEq < 3305) total = 13.4;
+  else total = Math.min(13.4 + Math.round((uvtEq - 3305) * (0.405 * 0.005) * 100) / 100, 275);
+  const pesos = Math.round(total * UVT);
+  const fmt = (n, d = 0) => n.toLocaleString('es-CO', { minimumFractionDigits: d, maximumFractionDigits: d });
+  return { pesos, uvt: Math.round(total * 100) / 100, uvtProyecto: uvtEq, valor: precio, uvtValor: UVT,
+    texto: `$${fmt(pesos)} (${fmt(Math.round(total * 100) / 100, 2)} UVT; su carro sin IVA, $${fmt(precio)}, equivale a ${fmt(uvtEq, 2)} UVT; UVT 2026 = $${fmt(UVT)}). Si el cliente prefiere que nosotros hagamos el pago de la UPME, el total sería $${fmt(pesos + GESTION_PAGO_UPME())} (tarifa + $${fmt(GESTION_PAGO_UPME())} por la gestión del pago)` };
+}
+
 function parsearJSON(t) {
   const m = t.match(/\{[\s\S]*\}/);
   if (m) { try { return JSON.parse(m[0]); } catch (_) { /* se intenta rescatar abajo */ } }
@@ -177,6 +207,7 @@ async function procesar(waId, deps) {
     try { conocimiento = await deps.obtenerConocimientoTexto(textoCliente); } catch (_) {}
     const sistema = BASE_PROMPT + '\n' + REGLAS_EXTRA +
       '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(conv.perfil || {}) +
+      (tarifaUpme((conv.perfil || {}).valor_sin_iva) ? '\nTARIFA UPME DE ESTE CLIENTE (calculadora oficial de la UPME, Resolución 135 de 2025, con el valor sin IVA de su factura): ' + tarifaUpme(conv.perfil.valor_sin_iva).texto + '. Úsala tal cual cuando hables de la tarifa de la UPME.' : '') +
       (conv.perfil && conv.perfil.nombre ? '\nNOMBRE DE PILA PARA DIRIGIRTE: ' + String(conv.perfil.nombre).trim().split(/\s+/)[0] + '. Nunca uses el apellido al hablar con el cliente.' : '') +
       (conocimiento ? '\n\nGUÍA DE CONOCIMIENTO (úsala para resolver dudas; no la copies tal cual ni menciones precios):\n' + String(conocimiento).slice(0, 14000) : '');
 
@@ -195,6 +226,8 @@ async function procesar(waId, deps) {
     const perfil = Object.assign({}, conv.perfil || {});
     if (j && j.perfil) for (const [k, v] of Object.entries(j.perfil)) if (v !== null && v !== undefined && !(Array.isArray(v) && !v.length) && v !== '') perfil[k] = v;
     if (perfil.nombre) respuesta = soloPrimerNombre(respuesta, perfil.nombre);
+    const tUpme = tarifaUpme(perfil.valor_sin_iva);
+    if (tUpme) { perfil.tarifa_upme_cop = tUpme.pesos; perfil.tarifa_upme_uvt = tUpme.uvt; }
     if (j && j.datos_archivo) historial[historial.length - 1].texto += '\n[Lectura del archivo: ' + j.datos_archivo + ']';
 
     // CLIENTE DE SURA: no se le interroga. Si Claude hace preguntas de perfilamiento (compra, etapa, certificado,
@@ -217,6 +250,10 @@ async function procesar(waId, deps) {
       if (!perfil.precio_informado) falta.push('precio_informado');
       if (!perfil.proceso_explicado) falta.push('proceso_explicado');
       if (!perfil.acepta_avanzar) falta.push('acepta_avanzar');
+      // Pagos: siempre los medios de pago de honorarios; y, si necesita certificado UPME, cómo quiere pagar la UPME.
+      const yaTieneUpme = perfil.tiene_certificado_upme === true || /^s[ií]/i.test(String(perfil.tiene_certificado_upme || ''));
+      if (perfil.acepta_avanzar && !perfil.medios_pago_informados) falta.push('medios_pago');
+      if (perfil.acepta_avanzar && !yaTieneUpme && !perfil.pago_upme) falta.push('pago_upme');
       if (!/factura/.test(docs)) falta.push('doc_factura');
       if (!/rut/.test(docs)) falta.push('doc_rut');
       if (!/c[eé]dula|cedula/.test(docs)) falta.push('doc_cedula');
@@ -236,7 +273,7 @@ async function procesar(waId, deps) {
         // Si la IA ya se estaba despidiendo para entregar el caso, se descarta ese texto y se pide lo siguiente.
         if (partes.some((x) => /(consultor|asesor|un momento|pasar su caso|organizo su caso|del equipo)/i.test(x))) partes = [];
         // Aún no está completa la ficha: no se entrega al agente, se sigue perfilando.
-        if (!partes.length) partes = [({ nombre: '¿Con quién tengo el gusto de hablar?', marca_modelo: '¿Qué marca y modelo es su vehículo?', tipo_vehiculo: '¿Su vehículo es eléctrico, híbrido o híbrido enchufable?', compro_nuevo: '¿Lo compró nuevo y usted fue el primer dueño?', fecha_compra: '¿En qué fecha lo compró, más o menos?', titular_factura: '¿La factura quedó a su nombre, a nombre de dos personas o de una empresa?', tiene_certificado_upme: '¿Ya tiene el certificado de la UPME o todavía no?', ciudad: '¿En qué ciudad vive?', precio_informado: 'Ahora le cuento cómo funcionan nuestros honorarios. ¿Le parece?', proceso_explicado: '¿Le explico paso a paso cómo es el proceso para recuperar su IVA?', doc_bancaria: 'Por último, ¿me envía una certificación bancaria de una cuenta a su nombre? No sirven bancos digitales como Nu o Lulo.', acepta_avanzar: 'Para dejar todo listo, ¿avanzamos con su caso?', saldos_dian: 'Una última consulta para validar su beneficio: ¿tiene saldos pendientes por pagar ante la DIAN?', origen: '¿Cómo llegó con nosotros? ¿Fue por SURA, por EPM, Grupo Confamilia, Referix u otro medio?', doc_factura: '¿Me puede enviar la factura de compra en PDF o imagen?', doc_rut: '¿Me puede enviar su RUT actualizado, de menos de 30 días?', doc_cedula: '¿Me envía también una copia de su cédula por ambas caras?' })[falta[0]] || ('Para dejar todo listo, ¿me confirma su ' + falta[0].replace(/_/g, ' ') + '?')];
+        if (!partes.length) partes = [({ nombre: '¿Con quién tengo el gusto de hablar?', marca_modelo: '¿Qué marca y modelo es su vehículo?', tipo_vehiculo: '¿Su vehículo es eléctrico, híbrido o híbrido enchufable?', compro_nuevo: '¿Lo compró nuevo y usted fue el primer dueño?', fecha_compra: '¿En qué fecha lo compró, más o menos?', titular_factura: '¿La factura quedó a su nombre, a nombre de dos personas o de una empresa?', tiene_certificado_upme: '¿Ya tiene el certificado de la UPME o todavía no?', ciudad: '¿En qué ciudad vive?', medios_pago: 'Los honorarios los puede pagar por consignación o transferencia a la cuenta de ahorros Bancolombia 43600005898, a nombre de GOMEZ LEGAL ABOGADOS, NIT 901964467-0, o por la llave @gomezlegalabogad. ¿Le queda claro?', pago_upme: 'Para la UPME, ¿prefiere que nosotros hagamos el pago por usted (con un costo adicional de $15.000) o que le entreguemos su usuario y clave para que usted pague directo en la UPME?', precio_informado: 'Ahora le cuento cómo funcionan nuestros honorarios. ¿Le parece?', proceso_explicado: '¿Le explico paso a paso cómo es el proceso para recuperar su IVA?', doc_bancaria: 'Por último, ¿me envía una certificación bancaria de una cuenta a su nombre? No sirven bancos digitales como Nu o Lulo.', acepta_avanzar: 'Para dejar todo listo, ¿avanzamos con su caso?', saldos_dian: 'Una última consulta para validar su beneficio: ¿tiene saldos pendientes por pagar ante la DIAN?', origen: '¿Cómo llegó con nosotros? ¿Fue por SURA, por EPM, Grupo Confamilia, Referix u otro medio?', doc_factura: '¿Me puede enviar la factura de compra en PDF o imagen?', doc_rut: '¿Me puede enviar su RUT actualizado, de menos de 30 días?', doc_cedula: '¿Me envía también una copia de su cédula por ambas caras?' })[falta[0]] || ('Para dejar todo listo, ¿me confirma su ' + falta[0].replace(/_/g, ' ') + '?')];
       } else {
         estado = 'humano';
         const n = perfil.nombre ? ', ' + String(perfil.nombre).split(' ')[0] : '';

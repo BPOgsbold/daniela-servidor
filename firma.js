@@ -8,6 +8,7 @@
 //   FIRMA_URL_BASE      página de firma (por defecto https://gomezlegal.netlify.app/firmar.html)
 //   FIRMA_VIGENCIA_DIAS días que vale el enlace (por defecto 7)
 //   FIRMA_SECRETO       texto cualquiera que se mezcla al guardar el código (más seguridad)
+//   FIRMA_AVISO_EQUIPO  correos del equipo que reciben el aviso "cliente X firmó" (separados por coma)
 //   INALAMBRIA_API_KEY  llave de Inalambria Express con permiso de ENVÍO (activa el SMS: enlace, código y copia)
 //   FIRMA_SMS_PRUEBA    celular que recibe los SMS mientras está el modo prueba (si no hay, en prueba no sale SMS)
 // Modo prueba propio: mientras FIRMA_ENVIO_REAL no sea "si", los correos van a FIRMA_CORREO_PRUEBA (o al buzón remitente)
@@ -242,6 +243,28 @@ async function correoCopia(f, adjuntos) {
   await sp.enviarCorreo({ remitente: REMITENTE(), destinatarios: d.para, asunto: `${d.prefijo}Tu contrato firmado - Gómez Legal`, html, adjuntos });
 }
 
+// Aviso al equipo cada vez que un cliente firma (sin adjuntos: con los enlaces a SharePoint y al panel).
+async function correoEquipo(f, links) {
+  const lista = String(process.env.FIRMA_AVISO_EQUIPO || REMITENTE()).split(/[,;]/).map((x) => (x.match(/[^\s<>"]+@[^\s<>"]+/) || [''])[0]).filter(Boolean);
+  const para = ES_REAL() ? lista : DESTINOS_PRUEBA();
+  const fila = (k, v) => v ? `<tr><td style="padding:9px 14px;color:#5b6b66;font-size:13px;border-bottom:1px solid #e6efec;width:38%">${esc(k)}</td><td style="padding:9px 14px;font-size:14px;font-weight:600;color:#10241f;border-bottom:1px solid #e6efec">${esc(v)}</td></tr>` : '';
+  const medio = f.canal_codigo === 'sms' ? 'Código por SMS al celular ' + mascaraCel(f.celular) : 'Código al correo ' + mascaraCorreo(f.correo);
+  const botones = [
+    links.contrato ? boton(links.contrato, 'Ver contrato firmado') : '',
+    links.carpeta ? `<p style="text-align:center;margin:-10px 0 18px"><a href="${esc(links.carpeta)}" style="color:#1f6a5b;font-weight:600">📁 Abrir la carpeta del cliente</a></p>` : '',
+    `<p style="text-align:center;margin:0 0 6px"><a href="https://gomezlegal.netlify.app" style="color:#1f6a5b;font-weight:600">Ir al panel (Casos)</a></p>`,
+  ].join('');
+  const html = marco('✍️ ' + (f.nombre || 'Cliente') + ' firmó su contrato', `${ES_REAL() ? '' : '<p style="background:#fff6e0;border:1px solid #f0c36d;border-radius:8px;padding:8px 12px;font-size:13px;color:#7a5c10">MODO PRUEBA: este aviso habría llegado al equipo.</p>'}
+   <p style="margin:0 0 14px">Buenas noticias, equipo: <b>${esc(f.nombre)}</b> aceptó y firmó electrónicamente su contrato. Ya puede pasar a <b>Cliente</b> y seguir con el trámite.</p>
+   <table style="width:100%;border-collapse:collapse;background:#f8fbfa;border-radius:10px;overflow:hidden;margin:0 0 20px">
+     ${fila('Cliente', f.nombre)}${fila('Documento', f.cedula)}${fila('Placa', f.placa)}${fila('Contrato', f.archivo_nombre)}
+     ${fila('Firmado el', fechaCO(f.firmado_en))}${fila('Validación', medio)}${fila('Enviado a firma por', f.enviado_por)}
+   </table>
+   ${botones}
+   <p style="margin:14px 0 0;font-size:12.5px;color:#6a7b76">El contrato firmado y la constancia de firma quedaron en la carpeta del cliente en SharePoint.${links.contrato ? '' : ' (No se pudo obtener el enlace directo: búscalo en la carpeta.)'}</p>`);
+  await sp.enviarCorreo({ remitente: REMITENTE(), destinatarios: para, asunto: `${ES_REAL() ? '' : '[PRUEBA] '}✍️ ${f.nombre || 'Cliente'} firmó su contrato`, html, adjuntos: [] });
+}
+
 // ---------------------------------------------------------------- Rutas
 module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
   const estadoEfectivo = (f) => (['enviado', 'visto'].includes(f.estado) && new Date(f.vence_en) <= new Date()) ? 'vencido' : f.estado;
@@ -471,14 +494,17 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
       ];
 
       let guardado = false, correoOk = false;
+      const links = { contrato: null, carpeta: null };
       const aviso = [];
       try {
         const k1 = 'cf_' + f.id.slice(0, 8), k2 = 'cc_' + f.id.slice(0, 8);
         sp.TIPOS_DOC[k1] = `Contrato firmado${pie}`; sp.TIPOS_DOC[k2] = `Contrato constancia de firma${pie}`;
         const s1 = await sp.subirDocumento({ cedula: f.cedula, nombre: f.nombre, tipo: k1, nombreArchivo: 'x.pdf', buffer, esCliente: false });
+        links.contrato = (s1 && (s1.linkArchivo || s1.webUrl)) || null;
+        links.carpeta = (s1 && s1.linkCarpeta) || null;
         await sp.subirDocumento({ cedula: f.cedula, nombre: f.nombre, tipo: k2, nombreArchivo: 'x.pdf', buffer: constancia, esCliente: false });
         guardado = true;
-        await sb.from(TABLA).update({ link_firmado: (s1 && (s1.webUrl || s1.url)) || null }).eq('id', f.id);
+        await sb.from(TABLA).update({ link_firmado: links.contrato }).eq('id', f.id);
       } catch (e) { console.error('firma: no se pudo guardar en SharePoint:', e); aviso.push('No se pudo guardar en SharePoint: ' + String(e.message || e).slice(0, 150)); }
       if (f.correo) {
         try { await correoCopia(firmada, adj); correoOk = true; } catch (e) { console.error('firma: no se pudo enviar la copia:', e); aviso.push('No se pudo enviar la copia por correo: ' + String(e.message || e).slice(0, 150)); }
@@ -490,6 +516,7 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
           : `Gomez Legal Abogados: tu contrato quedo aceptado. Tu copia y la constancia estan en ${URL_FIRMA()}?t=${f.token}`;
         try { await enviarSms(smsA, txt); smsOk = true; } catch (e) { aviso.push('No se pudo enviar el SMS de confirmación: ' + String(e.message || e).slice(0, 150)); }
       }
+      try { await correoEquipo(firmada, links); } catch (e) { console.error('firma: no se pudo avisar al equipo:', e); aviso.push('No se pudo enviar el aviso al equipo: ' + String(e.message || e).slice(0, 120)); }
       await sb.from(TABLA).update({ mensaje: aviso.length ? aviso.join(' | ') : null, copia_enviada: correoOk, guardado_sharepoint: guardado }).eq('id', f.id);
       if (f.caso_id) await sb.from('panel_historial').insert({ caso_id: f.caso_id, campo: 'contrato_firma', valor_anterior: 'Enviado a firma', valor_nuevo: `Contrato FIRMADO por el cliente (IP ${ip})${guardado ? '' : ' - falta guardarlo en SharePoint'}`, usuario_email: 'cliente (firma electrónica)' }).then(() => {}, () => {});
       console.log(`[firma] firmado ${f.cedula} (${f.archivo_nombre}) sp=${guardado} correo=${correoOk}`);

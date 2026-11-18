@@ -362,7 +362,7 @@ function programar(waId, deps) {
 async function avisarCliente(sb, telefono, texto, marcas) {
   const cel = String(telefono || '').replace(/\D/g, '').slice(-10);
   if (cel.length !== 10 || !process.env.WASAPI_API_KEY) return false;
-  const { data } = await sb.from('wasapi_conversaciones').select('*').like('wa_id', '%' + cel).order('actualizado_en', { ascending: false }).limit(1);
+  const { data } = await sb.from('wasapi_conversaciones').select('*').like('wa_id', '%' + cel).not('from_id', 'is', null).order('actualizado_en', { ascending: false }).limit(1);
   const conv = data && data[0];
   if (!conv || !conv.from_id) return false;
   const partes = String(texto).split(/\n\s*\n/).filter((x) => x.trim());
@@ -411,3 +411,4 @@ module.exports = function montarWasapi(app, deps) {
 };
 
 module.exports.avisarCliente = avisarCliente;
+module.exports.ia = { llamarClaude, parsearJSON, limpiarTexto, tarifaUpme };

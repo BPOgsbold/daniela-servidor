@@ -39,7 +39,7 @@ function estadoSegunPerfil(p) {
 }
 
 // Datos del caso a partir de la ficha que arma Daniela (solo lo que se sabe).
-function datosDelPerfil(p, waId) {
+function datosDelPerfil(p, waId, canal) {
   const cedula = digitos(p.cedula);
   const datos = {
     nombre_cliente: p.nombre_completo || p.nombre || null,
@@ -47,7 +47,7 @@ function datosDelPerfil(p, waId) {
     email: p.correo && /@/.test(p.correo) ? String(p.correo).trim().toLowerCase() : null,
     numero_identificacion: cedula || null,
     tipo_identificacion: cedula ? (cedula.length >= 9 && /^[89]/.test(cedula) ? 'NIT' : 'CC') : null,
-    canal: 'WhatsApp',
+    canal: canal || 'WhatsApp',
     fuente: fuenteDeOrigen(p.origen),
     vehiculo: p.marca_modelo || null,
     tecnologia: p.tipo_vehiculo || null,
@@ -61,9 +61,9 @@ function datosDelPerfil(p, waId) {
 }
 
 // Crea el caso la primera vez (si no existe por teléfono/cédula) y lo mantiene al día. Devuelve el id del caso.
-async function sincronizarCaso(p, waId, sb) {
+async function sincronizarCaso(p, waId, sb, o = {}) {
   if (!p.nombre && !p.nombre_completo) return null; // sin nombre todavía no se crea nada
-  const datos = datosDelPerfil(p, waId);
+  const datos = datosDelPerfil(p, waId, o.canal);
   const estado = estadoSegunPerfil(p);
   let caso = null;
   if (p._caso_id) {
@@ -78,7 +78,7 @@ async function sincronizarCaso(p, waId, sb) {
     }
   }
   if (!caso) {
-    const nuevo = await crearCaso(`wa-${digitos(waId)}`, ASESOR, { ...datos, estado_pipeline: estado });
+    const nuevo = await crearCaso(`${o.prefijo || 'wa'}-${digitos(waId)}`, o.asesor || ASESOR, { ...datos, estado_pipeline: estado });
     console.log(`[wasapi-caso] caso NUEVO ${nuevo.id}: ${datos.nombre_cliente} (${datos.telefono})`);
     return nuevo.id;
   }
@@ -107,10 +107,12 @@ async function subirDocumentos(p, archivos) {
   const pendientes = Array.isArray(p._pendientes) ? p._pendientes : [];
   for (const a of archivos) {
     if (!TIPOS_VALIDOS.includes(a.tipo)) continue;
+    if (a.hash && (p._hashes || []).includes(a.hash)) continue; // ya se subió antes (Chattigo reenvía los archivos en cada consulta)
     if (!cedula || cedula.length < 5 || !sp.configurado()) { if (a.url) pendientes.push({ url: a.url, nombre: a.nombre, tipo: a.tipo }); continue; }
     try {
       await sp.subirDocumento({ cedula, nombre, tipo: a.tipo, nombreArchivo: a.nombre || ('archivo' + (a.ext || '')), buffer: a.buf, esCliente: false });
       hechos.push(a.tipo);
+      if (a.hash) p._hashes = [...(p._hashes || []), a.hash].slice(-40);
     } catch (e) {
       console.error('[wasapi-caso] no pude subir', a.tipo, e.message);
       if (a.url) pendientes.push({ url: a.url, nombre: a.nombre, tipo: a.tipo });
@@ -134,13 +136,13 @@ async function subirPendientes(p, bajarArchivo) {
 }
 
 // Con factura, RUT y cédula ya en SharePoint y el cliente de acuerdo: se pide el contrato (una sola vez).
-async function pedirContratoSiListo(p, sb) {
+async function pedirContratoSiListo(p, sb, o = {}) {
   if (!p._caso_id || p._contrato_pedido || !p.acepta_avanzar) return false;
   const docs = p._docs || [];
   if (!['factura', 'rut', 'cedula'].every((d) => docs.includes(d))) return false;
   const yaTieneUpme = /^s[ií]/i.test(String(certificadoTexto(p.tiene_certificado_upme) || ''));
-  const fila = { caso_id: p._caso_id, cedula: digitos(p.cedula), nombre_cliente: p.nombre_completo || p.nombre || null, asesor: ASESOR,
-    servicio: yaTieneUpme ? 'Solo DIAN' : 'Servicio completo', auto_firma: true, origen: 'whatsapp' };
+  const fila = { caso_id: p._caso_id, cedula: digitos(p.cedula), nombre_cliente: p.nombre_completo || p.nombre || null, asesor: o.asesor || ASESOR,
+    servicio: yaTieneUpme ? 'Solo DIAN' : 'Servicio completo', auto_firma: true, origen: o.origen || 'whatsapp' };
   // Nunca dos solicitudes vivas para el mismo caso.
   const { data: previas } = await sb.from('solicitudes_contrato').select('id').eq('caso_id', p._caso_id).in('estado', ['pendiente', 'procesando', 'listo']).limit(1);
   if (previas && previas.length) { p._contrato_pedido = new Date().toISOString(); return false; }
@@ -156,14 +158,15 @@ async function pedirContratoSiListo(p, sb) {
 }
 
 // Todo junto, después de responder al cliente (nunca bloquea ni rompe la conversación).
-async function sincronizarTodo({ perfil, waId, archivos, sb, bajarArchivo }) {
+async function sincronizarTodo({ perfil, waId, archivos, sb, bajarArchivo, opciones }) {
+  const o = opciones || {};
   try {
-    const id = await sincronizarCaso(perfil, waId, sb);
+    const id = await sincronizarCaso(perfil, waId, sb, o);
     if (id) perfil._caso_id = id;
   } catch (e) { console.error('[wasapi-caso] caso:', e.message); }
   try { await subirDocumentos(perfil, archivos || []); } catch (e) { console.error('[wasapi-caso] documentos:', e.message); }
-  try { await subirPendientes(perfil, bajarArchivo); } catch (e) { console.error('[wasapi-caso] pendientes:', e.message); }
-  try { await pedirContratoSiListo(perfil, sb); } catch (e) { console.error('[wasapi-caso] contrato:', e.message); }
+  if (bajarArchivo) try { await subirPendientes(perfil, bajarArchivo); } catch (e) { console.error('[wasapi-caso] pendientes:', e.message); }
+  try { await pedirContratoSiListo(perfil, sb, o); } catch (e) { console.error('[wasapi-caso] contrato:', e.message); }
 }
 
 module.exports = { sincronizarTodo, datosDelPerfil, fuenteDeOrigen, TIPOS_VALIDOS };

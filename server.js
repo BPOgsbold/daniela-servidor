@@ -60,6 +60,7 @@ app.use(cors());
 // Los documentos adjuntos llegan en base64: este endpoint admite hasta ~25mb.
 app.use('/api/adjuntar', express.json({ limit: '35mb' }));
 app.use('/api/sp/subir', express.json({ limit: '35mb' }));
+app.use('/api/chattigo', express.json({ limit: '35mb' }));
 // Límite subido de 100kb (default de Express) a 2mb: una entrada de
 // conocimiento larga (ej. un Excel convertido a texto) puede pesar más de
 // 100kb y Express la rechazaría con un error 413 antes de llegar a la
@@ -3360,6 +3361,8 @@ app.patch('/api/usuarios', async (req, res) => {
 require('./wasapi')(app, { obtenerConocimientoTexto, sbServicio });
 // Firma electrónica de contratos (envío a firma, código, aceptación y constancia).
 require('./firma')(app, { sbServicio, exigirEquipo });
+require('./chattigo')(app, { sbServicio });
+require('./portal')(app, { sbServicio, exigirEquipo });
 
 app.listen(PORT, () => {
   console.log(`Servidor de Daniela (Gómez Legal Abogados) escuchando en http://localhost:${PORT}`);

@@ -603,3 +603,5 @@ module.exports = function registrarFirma(app, { sbServicio, exigirEquipo }) {
 };
 
 module.exports.pdfConstancia = pdfConstancia;
+module.exports.construirConstancia = construirConstancia;
+module.exports.enviarSms = enviarSms;

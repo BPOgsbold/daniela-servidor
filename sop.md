@@ -1,5 +1,5 @@
 # SOP — Beneficios tributarios por compra de vehículos eléctricos e híbridos
-Gómez Legal Abogados S.A.S. · Versión 1.0
+Gómez Legal Abogados S.A.S. · Versión 2.0 (17 de noviembre de 2026)
 
 ## 1. El beneficio en una página
 Quien compra un vehículo eléctrico o híbrido NUEVO en Colombia tiene derecho a dos
@@ -23,10 +23,16 @@ para resolver: 50 días hábiles (en práctica 2-3 meses). Plazo de la UPME para
 certificado: hasta 30 días hábiles (en práctica suele salir en una semana). Ventana de
 radicación UPME: 1 de febrero a 15 de diciembre de cada año.
 
-Honorarios de la firma: proceso completo $600.000 · solo certificado UPME $300.000 ·
-solo procedimiento DIAN $300.000 (cita incluida, nunca se vende sola). Clientes SURA:
-$600.000 + IVA. El fee es POR CARRO. La tarifa UPME va aparte y el agente puede
-pagarla por el cliente.
+Honorarios de la firma POR CONVENIO (el fee es POR CARRO; solo UPME o solo DIAN = 50 %):
+- EPM: completo $714.000 · solo UPME $357.000 · solo DIAN $357.000.
+- Grupo Confamilia: completo $773.500 · solo UPME $386.750 · solo DIAN $386.750.
+- Referix: completo $900.000 · solo UPME $450.000 · solo DIAN $450.000.
+- SURA (Chattigo, IVA incluido): completo $714.000 (siempre se ofrece primero) · solo UPME
+  $357.000 · cita DIAN $357.000 si nosotros reunimos los documentos o $297.500 si el
+  cliente ya los tiene todos.
+- Otros canales: lo confirma el consultor.
+El procedimiento DIAN incluye la cita y nunca se vende "solo cita". No se dan descuentos.
+La tarifa UPME va aparte (ver sección 6) y tiene dos formas de pago (ver sección 13).
 
 ## 2. ¿Qué vehículos aplican?
 Criterios que SÍ aplican:
@@ -129,11 +135,14 @@ se radica TODO (hasta una abreviatura distinta en la dirección causa inadmisió
 7. Seguimiento por número de caso hasta que el certificado esté listo (revisar cada
    dato dígito por dígito antes de pasarlo a la DIAN).
 
-**Tarifa UPME 2026** (según valor del carro sin IVA, en UVT — UVT 2026 = $52.374):
+**Tarifa UPME 2026** (según valor del carro sin IVA, en UVT — UVT 2026 = $52.374; es la
+misma fórmula de la calculadora oficial de la UPME, Resolución 135 de 2025):
 menos de 275 UVT → 1,2 UVT ($62.849); 275-826 UVT → 3,4 UVT ($178.072); 826-1.652 UVT
-→ 6,7 UVT ($350.906); 1.652-3.305 UVT → 13,4 UVT ($701.812); más de 3.305 UVT → 13,4
-UVT + 0,5% del beneficio estimado (tope 275 UVT). La tarifa NO se devuelve aunque el
-certificado no se apruebe.
+→ 6,7 UVT ($350.906); 1.652-3.305 UVT → 13,4 UVT ($701.812); desde 3.305 UVT → 13,4
+UVT + (UVT del carro − 3.305) × 0,405 × 0,005, con tope de 275 UVT. Se redondea a 2
+decimales en UVT y luego a pesos. Ejemplo: $202.542.367 sin IVA = 3.867,23 UVT →
+14,54 UVT → $761.518. La tarifa NO se devuelve aunque el certificado no se apruebe.
+Cuando el cliente ya escribió por WhatsApp, Daniela ya le dio la tarifa exacta.
 
 **Qué revisar en el certificado antes de pasarlo a la DIAN:** cédula/NIT del
 beneficiario igual al RUT dígito por dígito; nombre completo como el RUT; valor sin
@@ -194,3 +203,118 @@ trámite), Concepto DIAN 013853 de 2025 (híbridos), Concepto DIAN 000057 de 202
 Resolución UPME 000400 de 2026 (ventana de radicación 1 feb-15 dic). Los agentes NO
 interpretan estas normas: las usan para ubicar el fundamento cuando el cliente o la
 DIAN preguntan. Cualquier discusión de fondo se escala a jurídico.
+
+## 10. Estados del pipeline comercial de un caso
+Cada caso tiene un estado comercial (distinto del resultado final del trámite ante
+la DIAN) que se actualiza a medida que avanza la gestión. El asesor lo cambia
+escribiéndole a Daniela, por ejemplo "cambia el estado del cliente Juan Pérez a
+cliente" o "márcalo como en proceso UPME". Los estados son:
+
+Registro: se intentó el contacto pero no se logró hablar con el cliente.
+
+Contacto: el cliente se comunicó pero no dio todos los datos que se necesitan. Los
+casos que crea Daniela por WhatsApp arrancan aquí.
+
+Interesado: el cliente ya dio los datos requeridos (nombre, teléfono, tipo de
+persona, vehículo, valor y si tiene certificado UPME) o mostró interés.
+
+Negociación: el cliente confirmó que sigue interesado y aceptó avanzar; se está
+cerrando la propuesta (contrato, firma y pago).
+
+Cliente: el caso se convierte en cliente cuando ya se tienen todos los documentos
+que debe enviar (RUT, factura, cédula, cámara de comercio si aplica), la firma del
+contrato, y el pago realizado.
+
+Cierre perdido: el cliente no firmó el contrato, no envió la documentación y/o no
+realizó el pago.
+
+En proceso UPME: el cliente está en trámite del certificado ante la UPME.
+
+En proceso DIAN: el cliente está en trámite ante la DIAN, pendiente de
+agendamiento de cita.
+
+Pendiente desembolso: se está a la espera de que la DIAN realice el desembolso de
+la devolución.
+
+Desembolso realizado: el cliente confirmó que ya recibió el pago del desembolso.
+
+## 11. Contratos y firma electrónica
+**Cómo se pide el contrato:** con cédula, RUT y factura en la carpeta del cliente en
+SharePoint, el asesor dice "Crear contrato". El worker del PC de la oficina lo genera
+en 1 a 3 minutos y Daniela le escribe solo al asesor con los enlaces al contrato PDF,
+al Word editable y a la carpeta (no hay que ir a buscarlo). Si el cliente llegó por
+WhatsApp, el contrato se pide automáticamente.
+
+**Qué trae el contrato:** "quien manifiesta ser cliente de [convenio]" según la fuente
+del caso, y los honorarios de ese convenio. Se genera en PDF y en Word con versión
+(_v2, _v3...). Persona jurídica: sale a nombre de la EMPRESA con su NIT y lo firma el
+representante legal (nombre y cédula leídos del RUT); se necesita el RUT de la empresa
+y la cédula del representante.
+
+**BORRADOR:** si la lectura dejó datos por revisar, el contrato sale como BORRADOR_.
+Un BORRADOR nunca se envía a firma. Se corrige el dato o el documento y se vuelve a
+pedir el contrato. NUNCA se le quita la palabra BORRADOR a mano.
+
+**Firma electrónica (reemplaza Adobe):** en el panel, Casos → recuadro "✍ Contrato ·
+firma electrónica" (casos en Negociación o Cliente) → revisar correo y celular →
+"Enviar contrato a firma". El cliente recibe un correo con el botón "Revisar y firmar
+mi contrato" (o un SMS con el enlace si no tiene correo), pide un código de 6 dígitos
+por SMS o por correo (vale 10 minutos), lo escribe y marca "Acepto". El enlace vence en
+7 días. Estados: Sin enviar, Enviado, Visto, Firmado, Vencido, Cancelado, Error.
+"Reenviar a firma" cancela el envío anterior. Al firmar, el contrato firmado y la
+constancia quedan en la carpeta, el cliente recibe su copia y el equipo recibe el
+correo "✍️ [Cliente] firmó su contrato". Si el contrato cambió después de enviarlo, no
+deja firmar: hay que reenviarlo.
+
+**Si el SMS falla** (por ejemplo "FRAUD_DETECTED" o "API_KEY_USER_BANNED"): el correo sí
+sale; el cliente pide el código por correo. Avisar a administración.
+
+## 12. Daniela por WhatsApp: qué hace sola y cuándo entrega
+Daniela atiende el número 300 913 6657 y hace sola todo el primer contacto: perfila,
+explica el beneficio y la tarifa UPME exacta, da honorarios por convenio, resuelve
+objeciones, da los medios de pago, pide y lee el 100 % de los documentos (factura,
+RUT, cédula y certificación bancaria) y el comprobante de pago.
+
+Además, sin que nadie lo pida: crea el caso en el panel o actualiza el que ya existe
+con ese celular o cédula (nunca duplica y no pisa lo que llenó un asesor), sube cada
+documento a SharePoint con su tipo, pide el contrato cuando están factura, RUT y
+cédula, y si sale limpio lo envía a firma y le explica al cliente por WhatsApp cómo
+firmarlo. Si sale BORRADOR, el equipo recibe "⚠️ Contrato por revisar".
+
+Pasa el chat a una persona DE INMEDIATO solo si: pide una persona o llamada, está
+molesto, viene de SURA con un caso en proceso, pide el contrato o el estado de su
+expediente y no se resuelve, o hay plazo crítico (5 años o 15 de diciembre). Casos de
+empresa, dos propietarios, apoderado, leasing, RUT 42/48, IVA 19 %, cuenta digital o
+inadmisión NO cortan la conversación: quedan como ALERTA para el consultor. Entrega al
+final cuando tiene todo: ficha completa, aceptación, pagos explicados, documentos y
+comprobante de pago (o "pago después"). Al recibir un chat: leer todo el historial, no
+volver a pedir nada, verificar el pago y la firma, y dar el primer estado al cliente
+en las próximas horas.
+
+## 13. Pagos
+Honorarios: consignación o transferencia a la cuenta de ahorros Bancolombia
+43600005898, a nombre de GOMEZ LEGAL ABOGADOS, NIT 901964467-0, o por la llave
+@gomezlegalabogad. El comprobante se guarda como "Soporte de pago".
+
+Pago de la UPME (si el cliente no tiene certificado), dos opciones: a) la pagamos
+nosotros por el cliente con un costo adicional de $15.000 sobre la tarifa UPME; o
+b) le entregamos su usuario y clave de la UPME y él paga directo en el portal. Si duda,
+se recomienda la opción a, sin presionar.
+
+Mensajes estándar: mientras sale el contrato, "Ya estamos avanzando con su contrato; le
+llegará por SMS y/o correo electrónico". Al recibir el pago, "¡Recibimos su pago!
+Ya avanzamos con su proceso y durante las próximas horas le daremos un primer estado
+de su caso". El pago lo verifica el equipo en la cuenta antes de pasar el caso a
+Cliente.
+
+## 14. Copiloto de Daniela en Chattigo (clientes SURA)
+En Chattigo (cola "Beneficio tributario Autos Sura") el agente usa la extensión de
+Daniela v2.2: con el chat abierto toca "✨ Daniela sugiere", Daniela lee la conversación
+y los archivos y deja la siguiente respuesta en la caja de texto; el agente la revisa y
+la envía él mismo. Daniela además crea o actualiza el caso (canal Chattigo, fuente
+WhatsApp Sura), sube los documentos a SharePoint con su tipo y pide el contrato. Indica
+la acción: Responder, Preguntar en el grupo de Teams "GLA Novedades atención" (con el
+texto listo para pegar), Transferir a cierre (alternando entre Lina Marcela Bedoya y
+Lina Margod Betancur, sin avisarle al cliente) o No atender (chats de otros servicios).
+Si un adjunto no se puede leer desde la pantalla, el agente lo descarga y lo agrega con
+el clip 📎 del copiloto.

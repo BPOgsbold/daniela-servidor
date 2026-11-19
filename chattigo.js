@@ -7,6 +7,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const express_urlencoded = require('express').urlencoded({ extended: false, limit: '50kb' });
 const { sincronizarTodo } = require('./wasapi_caso');
 const { llamarClaude, parsearJSON, limpiarTexto, tarifaUpme } = require('./wasapi').ia;
 
@@ -50,13 +51,14 @@ MODO AUTÓNOMO (manda sobre lo anterior cuando hablen de lo mismo)
 - Si llega una nota de voz, pídele con amabilidad que por favor te lo escriba.`;
 
 // Aviso al grupo de Teams "GLA Novedades atención" (flujo de Workflows "cuando se reciba una solicitud de webhook").
-async function avisarTeams({ titulo, texto, nombre, telefono }) {
+async function avisarTeams({ titulo, texto, nombre, telefono, boton }) {
   const url = process.env.TEAMS_WEBHOOK_URL;
   if (!url) return false;
   const lineas = [nombre && ('Cliente: ' + nombre), telefono && ('Celular: +' + digitos(telefono)), texto].filter(Boolean);
   const tarjeta = { type: 'AdaptiveCard', $schema: 'http://adaptivecards.io/schemas/adaptive-card.json', version: '1.4',
     body: [{ type: 'TextBlock', text: titulo, weight: 'Bolder', size: 'Medium', wrap: true },
-      ...lineas.map((l) => ({ type: 'TextBlock', text: String(l).slice(0, 1500), wrap: true }))] };
+      ...lineas.map((l) => ({ type: 'TextBlock', text: String(l).slice(0, 1500), wrap: true }))],
+    ...(boton ? { actions: [{ type: 'Action.OpenUrl', title: boton.titulo, url: boton.url }] } : {}) };
   try {
     const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ type: 'message', attachments: [{ contentType: 'application/vnd.microsoft.card.adaptive', contentUrl: null, content: tarjeta }] }) });
@@ -64,6 +66,24 @@ async function avisarTeams({ titulo, texto, nombre, telefono }) {
     return r.ok;
   } catch (e) { console.error('Teams webhook:', e.message); return false; }
 }
+// ---------- Preguntas al equipo con respuesta (botón "Responder a Daniela" en la tarjeta de Teams)
+const SECRETO_P = () => process.env.PORTAL_SECRETO || process.env.FIRMA_SECRETO || crypto.createHash('sha256').update(String(process.env.SUPABASE_SERVICE_ROLE_KEY || 'gla')).digest('hex');
+const firmaP = (id) => crypto.createHmac('sha256', SECRETO_P()).update('pregunta:' + id).digest('base64url').slice(0, 32);
+const URL_SERVIDOR = () => String(process.env.SERVIDOR_URL || 'https://daniela-servidor.onrender.com').replace(/\/$/, '');
+const escH = (t) => String(t == null ? '' : t).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+async function instruccionesPendientes(sb, clave) {
+  try {
+    const { data } = await sb.from('chattigo_preguntas').select('id,pregunta,respuesta,respondido_por').eq('clave', clave).not('respondido_en', 'is', null).is('aplicado_en', null).order('respondido_en', { ascending: true }).limit(5);
+    return data || [];
+  } catch (_) { return []; }
+}
+async function aprendizajes(sb) {
+  try {
+    const { data } = await sb.from('chattigo_preguntas').select('pregunta,respuesta').not('respondido_en', 'is', null).order('respondido_en', { ascending: false }).limit(25);
+    return (data || []).filter((r) => r.respuesta);
+  } catch (_) { return []; }
+}
+
 const autoActivo = () => process.env.CHATTIGO_AUTONOMO !== '0';
 
 // Estado REAL del trámite en el panel (el mismo que ve el cliente en "Mi trámite"), para no inventar ni contradecir.
@@ -146,6 +166,41 @@ module.exports = function montarChattigo(app, { sbServicio }) {
     res.json({ ok });
   });
 
+  // Página para responder la pregunta de Daniela (se abre desde el botón de la tarjeta de Teams).
+  const paginaP = (cuerpo) => `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Responder a Daniela</title>
+<style>body{margin:0;font-family:Segoe UI,Arial,sans-serif;background:#f6f4ee;color:#1c2430}.c{max-width:640px;margin:24px auto;background:#fff;border-radius:14px;box-shadow:0 10px 30px rgba(11,31,58,.15);overflow:hidden}
+.h{background:linear-gradient(135deg,#0b1f3a,#1c3a63);color:#e9dfbf;padding:16px 20px;font-weight:700}.b{padding:18px 20px}.q{background:#fff7e0;border-left:4px solid #d9a400;border-radius:6px;padding:10px 12px;white-space:pre-wrap;margin:8px 0 14px}
+textarea,input{width:100%;box-sizing:border-box;border:1px solid #cfc6ad;border-radius:8px;padding:10px;font-size:15px;font-family:inherit}textarea{min-height:130px}label{font-weight:600;display:block;margin:10px 0 4px}
+button{margin-top:14px;background:#1f5c4d;color:#fff;border:0;border-radius:8px;padding:11px 18px;font-weight:700;font-size:15px;cursor:pointer}.ok{background:#e3f4ea;color:#17663b;padding:12px;border-radius:8px}.m{color:#6a7b76;font-size:13px}</style></head><body><div class="c"><div class="h">DANIELA · PREGUNTA PARA EL EQUIPO</div><div class="b">${cuerpo}</div></div></body></html>`;
+  app.get('/api/chattigo/responder/:id', async (req, res) => {
+    const id = String(req.params.id);
+    if (req.query.t !== firmaP(id)) return res.status(403).send(paginaP('Enlace no válido.'));
+    const { data: p } = await sbServicio().from('chattigo_preguntas').select('*').eq('id', id).maybeSingle();
+    if (!p) return res.status(404).send(paginaP('No encontré esta pregunta.'));
+    res.send(paginaP(`<div><b>${escH(p.nombre || '')}</b> ${p.telefono ? '· +' + escH(p.telefono) : ''}</div><div class="q">${escH(p.pregunta)}</div>
+${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por || 'el equipo')}: <br>${escH(p.respuesta)}</div><p class="m">Si quiere corregirla, escriba la nueva indicación y guárdela.</p>` : ''}
+<form method="post"><label>¿Qué debe hacer o responder Daniela?</label><textarea name="respuesta" required placeholder="Ej.: Dile que el pago ya está registrado y que la UPME está estudiando su solicitud; no tiene que hacer nada en la plataforma.">${escH(p.respondido_en ? '' : '')}</textarea>
+<label>Su nombre</label><input name="por" required placeholder="Ej.: Daniela Vera"><button>Enviar a Daniela</button>
+<p class="m">Daniela le escribe al cliente aplicando esta indicación en la próxima revisión del chat, y la usa como guía para casos parecidos.</p></form>`));
+  });
+  app.post('/api/chattigo/responder/:id', express_urlencoded, async (req, res) => {
+    const id = String(req.params.id);
+    if (req.query.t !== firmaP(id)) return res.status(403).send(paginaP('Enlace no válido.'));
+    const respuesta = String((req.body || {}).respuesta || '').trim().slice(0, 2000);
+    const por = String((req.body || {}).por || '').trim().slice(0, 80);
+    if (!respuesta) return res.status(400).send(paginaP('Escriba la respuesta.'));
+    await sbServicio().from('chattigo_preguntas').update({ respuesta, respondido_por: por || null, respondido_en: new Date().toISOString(), aplicado_en: null }).eq('id', id);
+    res.send(paginaP('<div class="ok">✅ ¡Gracias! Daniela aplicará esta indicación con el cliente en la próxima revisión del chat.</div>'));
+  });
+  // La extensión pregunta si un chat pausado ya tiene respuesta del equipo.
+  app.post('/api/chattigo/pendientes', async (req, res) => {
+    if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
+    const tel = digitos((req.body || {}).telefono).slice(-10);
+    if (tel.length !== 10) return res.json({ respondida: false });
+    const lista = await instruccionesPendientes(sbServicio(), 'chattigo-57' + tel);
+    res.json({ respondida: lista.length > 0, cuantas: lista.length });
+  });
+
   app.post('/api/chattigo/sugerir', async (req, res) => {
     if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
     const { telefono, nombre, mensajes, archivos, asesor, pedido, modo, ensayo } = req.body || {};
@@ -192,10 +247,14 @@ module.exports = function montarChattigo(app, { sbServicio }) {
       }
 
       const real = await estadoReal(sb, tel);
+      const instrucciones = await instruccionesPendientes(sb, clave);
+      const aprend = await aprendizajes(sb);
       const t = tarifaUpme(perfil.valor_sin_iva);
       const sistema = GUIA + '\n' + SALIDA + (autonomo ? '\n' + SALIDA_AUTO : '') +
         '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(fichaVisible(perfil)) +
         (real ? '\n\n' + real : '') +
+        (aprend.length ? '\n\nRESPUESTAS RECIENTES DEL EQUIPO A PREGUNTAS DE DANIELA (están aprobadas; úsalas como guía si el caso es igual, sin inventar más allá):\n' + aprend.map((a) => '- P: ' + String(a.pregunta).slice(0, 300) + '\n  R: ' + String(a.respuesta).slice(0, 400)).join('\n') : '') +
+        (instrucciones.length ? '\n\nINSTRUCCIÓN DEL EQUIPO PARA ESTE CLIENTE (respuesta a tu pregunta; APLÍCALA AHORA en tu mensaje, con tus palabras, sin decir que preguntaste a nadie; accion "responder" salvo que la instrucción diga otra cosa):\n' + instrucciones.map((i) => '- Pregunta: ' + i.pregunta + '\n  Indicación' + (i.respondido_por ? ' de ' + i.respondido_por : '') + ': ' + i.respuesta).join('\n') : '') +
         (t ? '\nTARIFA UPME DE ESTE CLIENTE (calculadora oficial UPME): ' + t.texto + '. Úsala tal cual si hablas de la tarifa de la UPME.' : '');
       const hoy = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(new Date());
       const texto = 'HOY ES ' + hoy + ' (hora de Colombia).\nCONVERSACIÓN EN CHATTIGO (la más reciente al final; las horas vienen como AAAA-MM-DD HH:MM):\n' + transcripcion(mensajes) +
@@ -249,7 +308,13 @@ module.exports = function montarChattigo(app, { sbServicio }) {
         perfil.medios_pago_informados = true;
       }
       let transferirA = null;
-      if (accion === 'transferir_cierre') transferirA = perfil._cierre_asignado || (perfil._cierre_asignado = await siguienteCierre(sb));
+      // Si el equipo indicó a quién transferir, se respeta; si no, se alterna entre las asesoras de cierre.
+      const nrm = (x) => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+      const textoInstr = nrm(instrucciones.map((i) => i.respuesta).join(' '));
+      if (instrucciones.length && /transfer/.test(textoInstr)) accion = 'transferir_cierre';
+      const indicada = CIERRE().find((n) => textoInstr.includes(nrm(n)) || textoInstr.includes(nrm(n.split(' ').slice(0, 3).join(' '))));
+      if (accion === 'transferir_cierre') transferirA = indicada || perfil._cierre_asignado || (perfil._cierre_asignado = await siguienteCierre(sb));
+      if (indicada) perfil._cierre_asignado = indicada;
 
       // Igual que WhatsApp: caso, documentos con su tipo y contrato automático (solo si se conoce el celular).
       if (tel.length === 10) {
@@ -260,6 +325,9 @@ module.exports = function montarChattigo(app, { sbServicio }) {
       await sb.from('wasapi_conversaciones').upsert({ wa_id: clave, perfil, estado: 'copiloto', from_id: null, actualizado_en: new Date().toISOString(),
         mensajes: (mensajes || []).slice(-60).map((m) => ({ rol: m.rol === 'cliente' ? 'cliente' : 'agente', texto: String(m.texto || '').slice(0, 2000), hora: m.hora || null })) }, { onConflict: 'wa_id' });
 
+      if (instrucciones.length && !ensayo && (String(j.respuesta || '').trim() || accion !== 'responder')) {
+        await sb.from('chattigo_preguntas').update({ aplicado_en: new Date().toISOString() }).in('id', instrucciones.map((i) => i.id)).then(() => {}, () => {});
+      }
       // Modo autónomo: el equipo se entera por Teams (preguntas, cierres y chats que no son del beneficio).
       if (autonomo && !ensayo) {
         const base = { nombre: perfil.nombre_completo || perfil.nombre || nombre, telefono: tel.length === 10 ? '57' + tel : telefono };
@@ -271,9 +339,14 @@ module.exports = function montarChattigo(app, { sbServicio }) {
         const firma = crypto.createHash('sha1').update(String(j.nota_equipo).toLowerCase().replace(/\W+/g, '').slice(0, 200)).digest('hex').slice(0, 12);
         perfil._preguntas = Array.isArray(perfil._preguntas) ? perfil._preguntas : [];
         if (!perfil._preguntas.includes(firma)) {
-          const ok = await avisarTeams({ nombre: perfil.nombre_completo || perfil.nombre || nombre, telefono: tel.length === 10 ? '57' + tel : telefono,
+          let boton = null;
+          try {
+            const { data: fp } = await sb.from('chattigo_preguntas').insert({ clave, telefono: tel.length === 10 ? '57' + tel : null, nombre: perfil.nombre_completo || perfil.nombre || nombre || null, pregunta: String(j.nota_equipo).slice(0, 2000) }).select('id').single();
+            if (fp) boton = { titulo: '✍️ Responder a Daniela', url: `${URL_SERVIDOR()}/api/chattigo/responder/${fp.id}?t=${firmaP(fp.id)}` };
+          } catch (e) { console.error('chattigo_preguntas:', e.message); }
+          const ok = await avisarTeams({ nombre: perfil.nombre_completo || perfil.nombre || nombre, telefono: tel.length === 10 ? '57' + tel : telefono, boton,
             titulo: '❓ Daniela (Chattigo) necesita al equipo',
-            texto: j.nota_equipo + (autonomo ? '\nCuando tengan la respuesta, escríbanla en el chat de Chattigo; Daniela retoma después.' : '\nRespondan aquí al agente que atiende el chat.') });
+            texto: j.nota_equipo + (boton ? '\nToquen "Responder a Daniela" y escriban qué debe hacer: ella se lo aplica al cliente.' : '\nRespondan escribiendo en el chat de Chattigo.') });
           if (ok) { perfil._preguntas = [...perfil._preguntas, firma].slice(-20); await sb.from('wasapi_conversaciones').update({ perfil }).eq('wa_id', clave); }
         }
       }

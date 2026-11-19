@@ -89,6 +89,27 @@ Usa este estado para explicarle en qué va su trámite. Si el cliente dice que l
   } catch (e) { console.error('chattigo estadoReal:', e.message); return null; }
 }
 
+// PDF con clave (casi siempre la cédula del cliente): se abre en el servidor y se le pasa a la IA el TEXTO.
+let pdfjs = null;
+try { pdfjs = require('pdfjs-dist/legacy/build/pdf.js'); } catch (_) { pdfjs = null; }
+const tieneClave = (buf) => buf.includes('/Encrypt');
+async function abrirConClave(buf, claves) {
+  if (!pdfjs) return { ok: false, motivo: 'falta la librería pdfjs-dist en el servidor' };
+  for (const password of claves) {
+    try {
+      const doc = await pdfjs.getDocument({ data: new Uint8Array(buf), password, isEvalSupported: false, verbosity: 0 }).promise;
+      let texto = '';
+      for (let i = 1; i <= Math.min(doc.numPages, 6); i++) { const c = await (await doc.getPage(i)).getTextContent(); texto += c.items.map((x) => x.str).join(' ') + '\n'; }
+      return { ok: true, texto: texto.replace(/[ \t]+/g, ' ').trim().slice(0, 12000) };
+    } catch (e) { if (!/password/i.test(String(e && (e.name + e.message)))) return { ok: false, motivo: 'no se pudo leer el PDF' }; }
+  }
+  return { ok: false, motivo: 'la clave no es la cédula conocida' };
+}
+async function cedulaDelPanel(sb, tel) {
+  if (!tel || tel.length !== 10) return [];
+  try { const { data } = await sb.from('Perfilamiento_y_ventas_GLA').select('numero_identificacion').eq('telefono', tel).limit(5); return (data || []).map((r) => digitos(r.numero_identificacion)).filter(Boolean); } catch (_) { return []; }
+}
+
 function fichaVisible(p) { const o = {}; for (const [k, v] of Object.entries(p || {})) if (!k.startsWith('_')) o[k] = v; return o; }
 
 function transcripcion(mensajes) {
@@ -149,13 +170,24 @@ module.exports = function montarChattigo(app, { sbServicio }) {
         return { buf, hash, nombre: a.nombre || 'archivo', mime: String(a.mime || '').toLowerCase() };
       }).filter((a) => a.buf.length > 0 && a.buf.length < 20 * 1024 * 1024);
       const nuevos = todos.filter((a) => !leidos.has(a.hash) && MIMES.includes(a.mime)).slice(0, 4);
-      const bloques = [];
-      nuevos.forEach((a, i) => {
+      // Claves posibles para PDF protegidos: cédula de la ficha, del caso en el panel y números que escribió el cliente.
+      const claves = Array.from(new Set([digitos(perfil.cedula), ...(await cedulaDelPanel(sb, tel)),
+        ...mensajes.filter((m) => m.rol === 'cliente').flatMap((m) => String(m.texto || '').replace(/[.\s]/g, '').match(/\d{6,11}/g) || []),
+        '1', ''].filter((x) => x !== undefined && x !== null && (x === '' || String(x).length))));
+      const bloques = [], sinAbrir = new Set();
+      for (let i = 0; i < nuevos.length; i++) {
+        const a = nuevos[i];
+        if (a.mime === 'application/pdf' && tieneClave(a.buf)) {
+          const r = await abrirConClave(a.buf, claves);
+          if (r.ok && r.texto.length > 40) bloques.push({ type: 'text', text: `ARCHIVO NUEVO ${i + 1} (lo envió el CLIENTE): ${a.nombre} — PDF con clave, abierto con la cédula. TEXTO DEL DOCUMENTO:\n${r.texto}` });
+          else { sinAbrir.add(a.hash); bloques.push({ type: 'text', text: `ARCHIVO NUEVO ${i + 1} (lo envió el CLIENTE): ${a.nombre} — PDF protegido con clave que no se pudo abrir (${r.ok ? 'es una imagen escaneada' : r.motivo}). Clasifícalo por su nombre y la conversación; no le pidas otra vez el documento al cliente: el equipo lo abre con la cédula.` }); }
+          continue;
+        }
         bloques.push({ type: 'text', text: `ARCHIVO NUEVO ${i + 1} (lo envió el CLIENTE): ${a.nombre}` });
         bloques.push(a.mime === 'application/pdf'
           ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: a.buf.toString('base64') } }
           : { type: 'image', source: { type: 'base64', media_type: a.mime, data: a.buf.toString('base64') } });
-      });
+      }
 
       const real = await estadoReal(sb, tel);
       const t = tarifaUpme(perfil.valor_sin_iva);
@@ -167,13 +199,22 @@ module.exports = function montarChattigo(app, { sbServicio }) {
       const texto = 'HOY ES ' + hoy + ' (hora de Colombia).\nCONVERSACIÓN EN CHATTIGO (la más reciente al final; las horas vienen como AAAA-MM-DD HH:MM):\n' + transcripcion(mensajes) +
         (pedido ? '\n\nINDICACIÓN DEL AGENTE PARA ESTA RESPUESTA: ' + String(pedido).slice(0, 500) : '') +
         (autonomo ? '\n\nRedacta el siguiente mensaje de Daniela (se enviará tal cual) y responde con el JSON.' : '\n\nRedacta el siguiente mensaje del agente y responde con el JSON.');
-      const bruto = await llamarClaude(sistema, [{ role: 'user', content: [...bloques, { type: 'text', text: texto }] }]);
+      let bruto;
+      try { bruto = await llamarClaude(sistema, [{ role: 'user', content: [...bloques, { type: 'text', text: texto }] }]); }
+      catch (e) {
+        // Si un archivo daña la consulta (PDF raro, imagen dañada), se responde igual sin los archivos.
+        if (!bloques.some((b) => b.type !== 'text')) throw e;
+        console.error('chattigo: archivo rechazado por la IA, se reintenta sin archivos:', e.message);
+        nuevos.forEach((a) => sinAbrir.add(a.hash));
+        const soloTexto = bloques.filter((b) => b.type === 'text').map((b) => ({ type: 'text', text: b.text + (/TEXTO DEL DOCUMENTO/.test(b.text) ? '' : ' (no se pudo leer este archivo)') }));
+        bruto = await llamarClaude(sistema, [{ role: 'user', content: [...soloTexto, { type: 'text', text: texto }] }]);
+      }
       const j = parsearJSON(bruto) || {};
 
       // Ficha: se conserva lo anterior y se suma lo nuevo.
       if (j.perfil) for (const [k, v] of Object.entries(j.perfil)) if (v !== null && v !== undefined && v !== '' && !(Array.isArray(v) && !v.length)) perfil[k] = v;
       const tipos = Array.isArray(j.archivos_tipos) ? j.archivos_tipos : [];
-      nuevos.forEach((a, i) => { perfil._tipos[a.hash] = String(tipos[i] || 'otro').toLowerCase(); leidos.add(a.hash); });
+      nuevos.forEach((a, i) => { perfil._tipos[a.hash] = String(tipos[i] || 'otro').toLowerCase(); if (!sinAbrir.has(a.hash)) leidos.add(a.hash); });
       perfil._leidos = Array.from(leidos).slice(-60);
       if (j.datos_archivos) perfil.notas = String((perfil.notas ? perfil.notas + ' | ' : '') + j.datos_archivos).slice(-1500);
       if (Array.isArray(j.alertas) && j.alertas.length) perfil.alertas = Array.from(new Set([...(perfil.alertas || []), ...j.alertas.map(String)]));

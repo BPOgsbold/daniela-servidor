@@ -29,12 +29,13 @@ FORMA DE TRABAJO EN ESTA HERRAMIENTA (manda sobre la guía cuando hablen de lo m
 - En "nota_equipo" escribe directo la pregunta (sin saludos ni firmas ni marcadores como [nombre bot]); incluye nombre y celular del cliente solo si salen de la conversación del CLIENTE o de la ficha.
 - Si el chat no es del beneficio tributario (cita médica, técnico-mecánica, arrendamiento), accion = "no_atender".
 - Si algo requiere aprobación del equipo o no está en la guía, accion = "preguntar_grupo", escribe en "nota_equipo" la pregunta para el grupo de Teams "GLA Novedades atención" y en "respuesta" un mensaje que no afirme nada sobre ese punto.
-- Si el expediente está completo y en orden según la guía (factura, RUT vigente y cédula completos, sin nada que no cuadre), accion = "transferir_cierre" y "respuesta" vacía (se transfiere sin avisar al cliente).
+- Revisa TODO el historial (también lo que se habló antes de transferencias) y todo lo leído en los documentos (ficha y notas) antes de decidir: no vuelvas a pedir algo que el cliente ya envió.
+- Si el expediente está completo y en orden según la guía (factura, RUT vigente y cédula completos, sin nada que no cuadre), accion = "transferir_cierre", "respuesta" vacía (se transfiere sin avisar al cliente) y llena "resumen_cierre". No uses "preguntar_grupo" solo para que alguien revise documentos que tú ya puedes leer.
 - Si el cliente pide hablar con alguien: "respuesta" = "Un asesor del equipo se comunicará con usted." y accion = "preguntar_grupo" con la nota para el grupo.
 - Si un archivo no se puede leer, usa la respuesta fija de la guía y accion = "preguntar_grupo".
 
 RESPONDE SOLO con un JSON válido (sin texto alrededor):
-{"respuesta":"mensaje sugerido para el cliente o vacío","accion":"responder|preguntar_grupo|transferir_cierre|no_atender","nota_equipo":"texto para el grupo de Teams o null","alertas":["empresa","dos_propietarios","rut_vencido","iva_19","leasing","otro..."],"faltan":["lo que falta del expediente"],"archivos_tipos":[],"datos_archivos":"resumen breve de lo leído en los archivos nuevos o null","perfil":{"nombre":null,"nombre_completo":null,"cedula":null,"correo":null,"marca_modelo":null,"tipo_vehiculo":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"medios_pago_informados":null,"documentos_recibidos":[],"pago_honorarios_recibido":null,"dos_propietarios":null,"notas":null}}
+{"respuesta":"mensaje sugerido para el cliente o vacío","accion":"responder|preguntar_grupo|transferir_cierre|no_atender","nota_equipo":"texto para el grupo de Teams o null","alertas":["empresa","dos_propietarios","rut_vencido","iva_19","leasing","otro..."],"faltan":["lo que falta del expediente"],"archivos_tipos":[],"datos_archivos":"resumen breve de lo leído en los archivos nuevos o null","resumen_cierre":"solo si accion = transferir_cierre: resumen consolidado para la asesora de cierre (nombre completo, cédula/NIT, vehículo, fecha de factura, valor sin IVA, IVA, titular de la factura, RUT vigente sí/no, documentos recibidos, servicio que quiere, alertas) o null","perfil":{"nombre":null,"nombre_completo":null,"cedula":null,"correo":null,"marca_modelo":null,"tipo_vehiculo":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"medios_pago_informados":null,"documentos_recibidos":[],"pago_honorarios_recibido":null,"dos_propietarios":null,"notas":null}}
 En "perfil" pon solo lo que sepas (se conserva lo anterior). "cedula": solo números (si la factura es de empresa, el NIT sin dígito de verificación). "fecha_compra" en formato AAAA-MM-DD si la sabes. "archivos_tipos": un tipo por cada ARCHIVO NUEVO adjunto en este mensaje, en el mismo orden: "factura", "rut", "cedula", "certificacion_bancaria", "certificado_upme", "soporte_pago" u "otro".`;
 
 // Modo autónomo: Daniela envía ella misma (PC dedicado con la extensión v2.3).
@@ -194,8 +195,15 @@ module.exports = function montarChattigo(app, { sbServicio }) {
       if (autonomo && !ensayo) {
         const base = { nombre: perfil.nombre_completo || perfil.nombre || nombre, telefono: tel.length === 10 ? '57' + tel : telefono };
         if (accion === 'preguntar_grupo') await avisarTeams({ ...base, titulo: '❓ Daniela (Chattigo) necesita al equipo', texto: (j.nota_equipo || 'Revisar el chat.') + '\nCuando tengan la respuesta, escríbanla en el chat de Chattigo; Daniela retoma después.' });
-        else if (accion === 'transferir_cierre') await avisarTeams({ ...base, titulo: '✅ Expediente completo → cierre', texto: 'Se transfiere a ' + transferirA + '.' + (perfil.marca_modelo ? ' Vehículo: ' + perfil.marca_modelo + '.' : '') + (Array.isArray(j.alertas) && j.alertas.length ? ' Alertas: ' + j.alertas.join(', ') + '.' : '') });
         else if (accion === 'no_atender') await avisarTeams({ ...base, titulo: '⛔ Chat que no es del beneficio tributario', texto: 'Daniela no lo atiende. Revísenlo y gestiónenlo a mano en Chattigo.' });
+      }
+
+      if (accion === 'transferir_cierre' && !ensayo && !perfil._aviso_cierre) {
+        const ok = await avisarTeams({ nombre: perfil.nombre_completo || perfil.nombre || nombre, telefono: tel.length === 10 ? '57' + tel : telefono,
+          titulo: '✅ Expediente completo → transferir a ' + transferirA,
+          texto: (j.resumen_cierre || [perfil.marca_modelo && 'Vehículo: ' + perfil.marca_modelo, perfil.cedula && 'Cédula/NIT: ' + perfil.cedula].filter(Boolean).join(' · ')) +
+            (Array.isArray(j.alertas) && j.alertas.length ? '\nAlertas: ' + j.alertas.join(', ') : '') + (autonomo ? '' : '\n(Transferencia hecha por el agente desde Chattigo.)') });
+        if (ok) { perfil._aviso_cierre = new Date().toISOString(); await sb.from('wasapi_conversaciones').update({ perfil }).eq('wa_id', clave); }
       }
 
       let caso = null;
@@ -205,7 +213,7 @@ module.exports = function montarChattigo(app, { sbServicio }) {
       }
       res.json({
         respuesta: limpiarTexto(String(j.respuesta || '')),
-        accion, transferir_a: transferirA, nota_equipo: j.nota_equipo || null,
+        accion, transferir_a: transferirA, nota_equipo: j.nota_equipo || null, resumen_cierre: j.resumen_cierre || null, aviso_cierre: !!perfil._aviso_cierre,
         alertas: perfil.alertas || [], faltan: Array.isArray(j.faltan) ? j.faltan : [],
         caso, documentos: perfil._docs || [], contrato_pedido: !!perfil._contrato_pedido,
         sin_telefono: tel.length !== 10, archivos_leidos: nuevos.length,

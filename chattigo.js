@@ -265,8 +265,9 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
     if (igual && igual.length) return res.send(formEncargo(await ultimosEnc(), '<div class="ok">Ese encargo ya estaba registrado: Daniela lo hace en la próxima revisión.</div>'));
     const { data: conv } = await sb.from('wasapi_conversaciones').select('perfil').eq('wa_id', 'chattigo-57' + tel).maybeSingle();
     const nombre = conv && conv.perfil ? (conv.perfil.nombre_completo || conv.perfil.nombre || null) : null;
-    await sb.from('chattigo_encargos').insert({ telefono: '57' + tel, nombre, instruccion, tipo: seg ? 'seguimiento' : 'una_vez', cada_horas: seg ? cada : null,
+    const { error: errIns } = await sb.from('chattigo_encargos').insert({ telefono: '57' + tel, nombre, instruccion, tipo: seg ? 'seguimiento' : 'una_vez', cada_horas: seg ? cada : null,
       hasta: seg ? new Date(Date.now() + dias * 864e5).toISOString() : null, creado_por: String(b.por || '').slice(0, 80) || null });
+    if (errIns) return res.status(500).send(formEncargo([], '<div class="q">⚠️ No se pudo guardar el encargo: ' + escH(errIns.message) + '. Avísenle al administrador (¿falta ejecutar chattigo_encargos.sql en Supabase?).</div>'));
     await avisarTeams({ titulo: '📝 Encargo para Daniela', nombre, telefono: '57' + tel, texto: instruccion + (seg ? `\n(Seguimiento cada ${cada} h durante ${dias} día(s))` : '') + (b.por ? '\nPedido por: ' + b.por : '') });
     res.send(formEncargo(await ultimosEnc(), '<div class="ok">✅ Encargo recibido. Daniela lo hace en la próxima revisión y avisa en Teams.</div>'));
   });
@@ -470,7 +471,8 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
         if (!perfil._preguntas.includes(firma)) {
           let boton = null;
           try {
-            const { data: fp } = await sb.from('chattigo_preguntas').insert({ clave, telefono: tel.length === 10 ? '57' + tel : null, nombre: perfil.nombre_completo || perfil.nombre || nombre || null, pregunta: String(j.nota_equipo).slice(0, 2000) }).select('id').single();
+            const { data: fp, error: errP } = await sb.from('chattigo_preguntas').insert({ clave, telefono: tel.length === 10 ? '57' + tel : null, nombre: perfil.nombre_completo || perfil.nombre || nombre || null, pregunta: String(j.nota_equipo).slice(0, 2000) }).select('id').single();
+            if (errP) console.error('chattigo_preguntas (¿falta ejecutar chattigo_preguntas.sql?):', errP.message);
             if (fp) boton = { titulo: '✍️ Responder a Daniela', url: `${URL_SERVIDOR()}/api/chattigo/responder/${fp.id}?t=${firmaP(fp.id)}` };
           } catch (e) { console.error('chattigo_preguntas:', e.message); }
           const ok = await avisarTeams({ nombre: perfil.nombre_completo || perfil.nombre || nombre, telefono: tel.length === 10 ? '57' + tel : telefono, boton,

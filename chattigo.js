@@ -23,6 +23,8 @@ FORMA DE TRABAJO EN ESTA HERRAMIENTA (manda sobre la guía cuando hablen de lo m
 - EXPERIENCIA DEL CLIENTE: responde exactamente lo que el cliente preguntó, primero la respuesta y luego el siguiente paso. Usa cifras concretas cuando las tengas (honorarios de la guía, tarifa UPME de la calculadora oficial, etapa del trámite). Nunca dejes una pregunta del cliente sin responder ni la cambies por otra pregunta. Si prometes confirmar algo, escala de inmediato con "preguntar_grupo".
 - Mensajes cortos, una sola pregunta, de usted, sin listas ni negritas, sin marcadores tipo [nombre].
 - QUIÉN ENVIÓ QUÉ: en la conversación, CLIENTE es el cliente y AGENTE somos nosotros (Gómez Legal / Daniela). Las imágenes o archivos que envía el AGENTE (capturas de la UPME, instrucciones, ejemplos) son material de apoyo NUESTRO: nunca digas que el cliente los compartió y nunca tomes de ellos nombres, cédulas, celulares ni datos del cliente. Solo los "ARCHIVO NUEVO" son documentos enviados por el cliente.
+- BIENVENIDA OFICIAL: el primer mensaje al cliente es SIEMPRE la bienvenida oficial de Gómez Legal ("¡Hola! Soy Daniela Gómez de Gómez Legal Abogados en alianza con SURA…" + la lista de documentos), que el sistema envía automáticamente. NUNCA uses otro saludo de presentación ni el saludo de ejemplo de la guía. Si el chat todavía no tiene ningún mensaje nuestro, no la redactes tú: deja "respuesta" vacía y el sistema la envía.
+- BENEFICIO: habla siempre de la "devolución del IVA que pagó al comprar el vehículo" (el 100 % de ese IVA) y de la deducción de hasta el 50 % en renta; no digas "el 5 % del IVA", para no contradecir la bienvenida oficial.
 - SALUDO: si en la conversación de HOY el AGENTE ya saludó o se presentó, NO vuelvas a saludar ni a presentarte ("Buenos días", "Soy Daniela de…"): ve directo al punto, llamando al cliente por su nombre.
 - TONO: atiende el caso y da tranquilidad. Reconoce lo que el cliente dijo o envió, dile que lo estamos revisando, que su trámite sigue en curso y que lo acompañamos en todo el proceso. Nada de textos largos ni de repetir lo que ya se le explicó.
 - No menciones por iniciativa propia que eres asistente virtual, bot o inteligencia artificial: firma y habla como Daniela, del equipo de Gómez Legal Abogados.
@@ -133,6 +135,35 @@ async function cedulaDelPanel(sb, tel) {
   if (!tel || tel.length !== 10) return [];
   try { const { data } = await sb.from('Perfilamiento_y_ventas_GLA').select('numero_identificacion').eq('telefono', tel).limit(5); return (data || []).map((r) => digitos(r.numero_identificacion)).filter(Boolean); } catch (_) { return []; }
 }
+
+const BIENVENIDA_OFICIAL = `¡Hola! Soy Daniela Gómez de Gómez Legal Abogados en alianza con SURA. Gracias por escribirnos.
+
+¿En qué consiste el beneficio?
+La Ley 1715 de 2014 da incentivos tributarios a quienes compran vehículos eléctricos o híbridos, porque usan la energía de forma más eficiente. Si su vehículo cumple los requisitos, puede acceder a:
+
+✅ Devolución del 100% del IVA que pagó al comprar el vehículo.
+✅ Si declara renta, puede deducir hasta el 50 % del valor del vehículo, repartido hasta en 15 años.
+
+¿Cómo funciona el trámite?
+1️⃣ Revisamos sus documentos y le confirmamos si su vehículo aplica.
+2️⃣ Pedimos ante la UPME el certificado que reconoce el beneficio.
+3️⃣ Con ese certificado, radicamos la solicitud de devolución ante la DIAN.
+4️⃣ La DIAN estudia la solicitud y, si la aprueba, consigna el valor en su cuenta bancaria.
+
+Nosotros hacemos todo el trámite y le contamos cómo va en cada etapa. Los tiempos dependen de cada entidad.
+
+Para empezar, por favor envíenos por este medio (foto clara o PDF):
+
+📄 Cédula del propietario, por ambos lados.
+📄 RUT actualizado.
+📄 Factura electrónica de compra del vehículo.
+📄 Certificación bancaria de una cuenta a nombre del propietario, con fecha de expedición no mayor a 30 días.
+
+Y cuéntenos:
+🚗 Marca, modelo y fecha de compra.
+👥 Si el vehículo está a nombre de más de una persona, o si tiene más de un vehículo eléctrico o híbrido.
+
+Al enviarnos sus documentos, nos autoriza a tratar sus datos personales solo para gestionar este trámite, conforme a la Ley 1581 de 2012 y a nuestra política de tratamiento de datos, que podrá consultar en www.gomezlegalabogados.co`;
 
 function fichaVisible(p) { const o = {}; for (const [k, v] of Object.entries(p || {})) if (!k.startsWith('_')) o[k] = v; return o; }
 
@@ -351,6 +382,10 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
       const texto = 'HOY ES ' + hoy + ' (hora de Colombia).\nCONVERSACIÓN EN CHATTIGO (la más reciente al final; las horas vienen como AAAA-MM-DD HH:MM):\n' + transcripcion(mensajes) +
         (pedido ? '\n\nINDICACIÓN DEL AGENTE PARA ESTA RESPUESTA: ' + String(pedido).slice(0, 500) : '') +
         (autonomo ? '\n\nRedacta el siguiente mensaje de Daniela (se enviará tal cual) y responde con el JSON.' : '\n\nRedacta el siguiente mensaje del agente y responde con el JSON.');
+      // Copiloto: si el chat no tiene ningún mensaje nuestro, la sugerencia es la bienvenida oficial (sin IA).
+      if (!autonomo && !(mensajes || []).some((m) => m.rol === 'agente' && !/te damos la bienvenida a la linea|te estamos transfiriendo|elige la opcion|agenda aqui/.test(String(m.texto || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase())) && !archivos?.length) {
+        return res.json({ respuesta: BIENVENIDA_OFICIAL, accion: 'responder', transferir_a: null, nota_equipo: null, alertas: [], faltan: ['factura', 'rut', 'cedula', 'certificacion_bancaria'], caso: null, documentos: [], contrato_pedido: false, sin_telefono: tel.length !== 10, archivos_leidos: 0 });
+      }
       let bruto;
       try { bruto = await llamarClaude(sistema, [{ role: 'user', content: [...bloques, { type: 'text', text: texto }] }]); }
       catch (e) {

@@ -21,7 +21,11 @@ FORMA DE TRABAJO EN ESTA HERRAMIENTA (manda sobre la guía cuando hablen de lo m
 - Lee TODA la conversación. Si el último mensaje es del agente y el cliente no ha respondido, sugiere un seguimiento corto o deja "respuesta" vacía si no hace falta escribir.
 - Mensajes cortos, una sola pregunta, de usted, sin listas ni negritas, sin marcadores tipo [nombre].
 - QUIÉN ENVIÓ QUÉ: en la conversación, CLIENTE es el cliente y AGENTE somos nosotros (Gómez Legal / Daniela). Las imágenes o archivos que envía el AGENTE (capturas de la UPME, instrucciones, ejemplos) son material de apoyo NUESTRO: nunca digas que el cliente los compartió y nunca tomes de ellos nombres, cédulas, celulares ni datos del cliente. Solo los "ARCHIVO NUEVO" son documentos enviados por el cliente.
-- Si el cliente pregunta si eres una persona o un bot, responde con naturalidad que eres Daniela, asistente virtual de Gómez Legal Abogados, y que un asesor del equipo revisa su caso; luego continúa con lo pendiente.
+- SALUDO: si en la conversación de HOY el AGENTE ya saludó o se presentó, NO vuelvas a saludar ni a presentarte ("Buenos días", "Soy Daniela de…"): ve directo al punto, llamando al cliente por su nombre.
+- TONO: atiende el caso y da tranquilidad. Reconoce lo que el cliente dijo o envió, dile que lo estamos revisando, que su trámite sigue en curso y que lo acompañamos en todo el proceso. Nada de textos largos ni de repetir lo que ya se le explicó.
+- No menciones por iniciativa propia que eres asistente virtual, bot o inteligencia artificial: firma y habla como Daniela, del equipo de Gómez Legal Abogados.
+- Si el cliente pregunta directamente si habla con una persona o con un bot: NO afirmes ser una persona y no lo niegues. Responde SOLO: "Permítanos un momento, por favor, estamos revisando su caso." (puedes anteponer el nombre del cliente) y pon accion = "preguntar_grupo" con nota_equipo: "El cliente preguntó si habla con un bot. Que la operación tome este chat." Así la operación sigue la conversación.
+- Lo que el AGENTE ya le envió (instrucciones, usuario y clave de la UPME, pasos de pago) es nuestro: si el cliente dice que no le sale lo que le indicamos, no le repitas las instrucciones; tranquilízalo y pregunta al equipo con el detalle de lo que el cliente ve.
 - En "nota_equipo" escribe directo la pregunta (sin saludos ni firmas ni marcadores como [nombre bot]); incluye nombre y celular del cliente solo si salen de la conversación del CLIENTE o de la ficha.
 - Si el chat no es del beneficio tributario (cita médica, técnico-mecánica, arrendamiento), accion = "no_atender".
 - Si algo requiere aprobación del equipo o no está en la guía, accion = "preguntar_grupo", escribe en "nota_equipo" la pregunta para el grupo de Teams "GLA Novedades atención" y en "respuesta" un mensaje que no afirme nada sobre ese punto.
@@ -58,6 +62,31 @@ async function avisarTeams({ titulo, texto, nombre, telefono }) {
   } catch (e) { console.error('Teams webhook:', e.message); return false; }
 }
 const autoActivo = () => process.env.CHATTIGO_AUTONOMO !== '0';
+
+// Estado REAL del trámite en el panel (el mismo que ve el cliente en "Mi trámite"), para no inventar ni contradecir.
+async function estadoReal(sb, tel) {
+  if (!tel || tel.length !== 10) return null;
+  try {
+    const { armarTramite } = require('./portal');
+    const { data: casos } = await sb.from('Perfilamiento_y_ventas_GLA').select('*').eq('telefono', tel).limit(10);
+    if (!casos || !casos.length) return null;
+    const caso = casos.slice().sort((a, b) => String(b.updated_at || b.created_at || '').localeCompare(String(a.updated_at || a.created_at || '')))[0];
+    let cli = null;
+    const { data: c1 } = await sb.from('BD_Cliente_GLA').select('*').eq('caso_id', caso.id).limit(1);
+    cli = (c1 || [])[0] || null;
+    if (!cli && caso.numero_identificacion) {
+      const { data: c2 } = await sb.from('BD_Cliente_GLA').select('*').eq('numero_identificacion', caso.numero_identificacion).limit(1);
+      cli = (c2 || [])[0] || null;
+    }
+    const t = armarTramite(caso, cli, []);
+    const pasos = (t.pasos || []).filter((x) => x.estado !== 'pendiente' || x.estado === 'actual').map((x) =>
+      `- ${x.titulo}: ${x.estado === 'hecho' ? 'HECHO' : x.estado === 'actual' ? 'EN CURSO (etapa actual)' : x.estado === 'omitido' ? 'no aplica' : 'pendiente'}${x.fecha ? ' (' + String(x.fecha).slice(0, 10) + ')' : ''}${(x.datos || []).length ? ' · ' + x.datos.map((d) => d[0] + ': ' + d[1]).join(', ') : ''}${x.estado === 'actual' && x.usted ? ' · Lo que le toca al cliente: ' + x.usted : ''}`);
+    return `ESTADO REAL DEL TRÁMITE EN NUESTRO PANEL (fuente oficial; Gómez Legal hace la UPME y la DIAN POR el cliente, el cliente no radica nada por su cuenta salvo que el panel diga que ya tenía el certificado):
+Cliente: ${caso.nombre_cliente || ''} · Estado comercial: ${caso.estado_pipeline || ''} · Vehículo: ${caso.vehiculo || (cli && cli.vehiculo) || ''}${cli ? ' · Ya es CLIENTE activo (contrato y pago confirmados; su expediente de documentos ya está completo, no le pidas factura, RUT ni cédula salvo que el equipo lo indique)' : ''}
+${pasos.join('\n')}
+Usa este estado para explicarle en qué va su trámite. Si el cliente dice que la plataforma de la UPME le muestra algo distinto o tiene dudas sobre lo que ve allí, explícale con calma la etapa en la que va según este estado y, si hace falta, pregunta al equipo.`;
+  } catch (e) { console.error('chattigo estadoReal:', e.message); return null; }
+}
 
 function fichaVisible(p) { const o = {}; for (const [k, v] of Object.entries(p || {})) if (!k.startsWith('_')) o[k] = v; return o; }
 
@@ -99,7 +128,10 @@ module.exports = function montarChattigo(app, { sbServicio }) {
     const autonomo = modo === 'autonomo';
     if (autonomo && !autoActivo()) return res.status(423).json({ error: 'Modo autónomo apagado en el servidor.' });
     if (!Array.isArray(mensajes) || !mensajes.length) return res.status(400).json({ error: 'No llegó la conversación.' });
-    const tel = digitos(telefono).slice(-10);
+    // Nuestras propias líneas de Chattigo nunca son el celular de un cliente.
+    const PROPIOS = String(process.env.CHATTIGO_DIDS || '3152757888').split(',').map((x) => digitos(x).slice(-10));
+    let tel = digitos(telefono).slice(-10);
+    if (PROPIOS.includes(tel)) tel = '';
     const clave = 'chattigo-' + (tel.length === 10 ? '57' + tel : 'n-' + crypto.createHash('sha1').update(String(nombre || '')).digest('hex').slice(0, 12));
     const sb = sbServicio();
     try {
@@ -124,11 +156,14 @@ module.exports = function montarChattigo(app, { sbServicio }) {
           : { type: 'image', source: { type: 'base64', media_type: a.mime, data: a.buf.toString('base64') } });
       });
 
+      const real = await estadoReal(sb, tel);
       const t = tarifaUpme(perfil.valor_sin_iva);
       const sistema = GUIA + '\n' + SALIDA + (autonomo ? '\n' + SALIDA_AUTO : '') +
         '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(fichaVisible(perfil)) +
+        (real ? '\n\n' + real : '') +
         (t ? '\nTARIFA UPME DE ESTE CLIENTE (calculadora oficial UPME): ' + t.texto + '. Úsala tal cual si hablas de la tarifa de la UPME.' : '');
-      const texto = 'CONVERSACIÓN EN CHATTIGO (la más reciente al final):\n' + transcripcion(mensajes) +
+      const hoy = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(new Date());
+      const texto = 'HOY ES ' + hoy + ' (hora de Colombia).\nCONVERSACIÓN EN CHATTIGO (la más reciente al final; las horas vienen como AAAA-MM-DD HH:MM):\n' + transcripcion(mensajes) +
         (pedido ? '\n\nINDICACIÓN DEL AGENTE PARA ESTA RESPUESTA: ' + String(pedido).slice(0, 500) : '') +
         (autonomo ? '\n\nRedacta el siguiente mensaje de Daniela (se enviará tal cual) y responde con el JSON.' : '\n\nRedacta el siguiente mensaje del agente y responde con el JSON.');
       const bruto = await llamarClaude(sistema, [{ role: 'user', content: [...bloques, { type: 'text', text: texto }] }]);

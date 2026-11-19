@@ -20,6 +20,9 @@ FORMA DE TRABAJO EN ESTA HERRAMIENTA (manda sobre la guía cuando hablen de lo m
 - Eres el copiloto de un agente humano de Chattigo. Tú NO envías nada: redactas el SIGUIENTE mensaje que el agente le va a enviar al cliente, como Daniela de Gómez Legal Abogados en representación de SURA. El agente lo revisa y lo envía.
 - Lee TODA la conversación. Si el último mensaje es del agente y el cliente no ha respondido, sugiere un seguimiento corto o deja "respuesta" vacía si no hace falta escribir.
 - Mensajes cortos, una sola pregunta, de usted, sin listas ni negritas, sin marcadores tipo [nombre].
+- QUIÉN ENVIÓ QUÉ: en la conversación, CLIENTE es el cliente y AGENTE somos nosotros (Gómez Legal / Daniela). Las imágenes o archivos que envía el AGENTE (capturas de la UPME, instrucciones, ejemplos) son material de apoyo NUESTRO: nunca digas que el cliente los compartió y nunca tomes de ellos nombres, cédulas, celulares ni datos del cliente. Solo los "ARCHIVO NUEVO" son documentos enviados por el cliente.
+- Si el cliente pregunta si eres una persona o un bot, responde con naturalidad que eres Daniela, asistente virtual de Gómez Legal Abogados, y que un asesor del equipo revisa su caso; luego continúa con lo pendiente.
+- En "nota_equipo" escribe directo la pregunta (sin saludos ni firmas ni marcadores como [nombre bot]); incluye nombre y celular del cliente solo si salen de la conversación del CLIENTE o de la ficha.
 - Si el chat no es del beneficio tributario (cita médica, técnico-mecánica, arrendamiento), accion = "no_atender".
 - Si algo requiere aprobación del equipo o no está en la guía, accion = "preguntar_grupo", escribe en "nota_equipo" la pregunta para el grupo de Teams "GLA Novedades atención" y en "respuesta" un mensaje que no afirme nada sobre ese punto.
 - Si el expediente está completo y en orden según la guía (factura, RUT vigente y cédula completos, sin nada que no cuadre), accion = "transferir_cierre" y "respuesta" vacía (se transfiere sin avisar al cliente).
@@ -115,7 +118,7 @@ module.exports = function montarChattigo(app, { sbServicio }) {
       const nuevos = todos.filter((a) => !leidos.has(a.hash) && MIMES.includes(a.mime)).slice(0, 4);
       const bloques = [];
       nuevos.forEach((a, i) => {
-        bloques.push({ type: 'text', text: `ARCHIVO NUEVO ${i + 1}: ${a.nombre}` });
+        bloques.push({ type: 'text', text: `ARCHIVO NUEVO ${i + 1} (lo envió el CLIENTE): ${a.nombre}` });
         bloques.push(a.mime === 'application/pdf'
           ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: a.buf.toString('base64') } }
           : { type: 'image', source: { type: 'base64', media_type: a.mime, data: a.buf.toString('base64') } });

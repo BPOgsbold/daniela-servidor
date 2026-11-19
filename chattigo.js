@@ -30,6 +30,32 @@ RESPONDE SOLO con un JSON válido (sin texto alrededor):
 {"respuesta":"mensaje sugerido para el cliente o vacío","accion":"responder|preguntar_grupo|transferir_cierre|no_atender","nota_equipo":"texto para el grupo de Teams o null","alertas":["empresa","dos_propietarios","rut_vencido","iva_19","leasing","otro..."],"faltan":["lo que falta del expediente"],"archivos_tipos":[],"datos_archivos":"resumen breve de lo leído en los archivos nuevos o null","perfil":{"nombre":null,"nombre_completo":null,"cedula":null,"correo":null,"marca_modelo":null,"tipo_vehiculo":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"medios_pago_informados":null,"documentos_recibidos":[],"pago_honorarios_recibido":null,"dos_propietarios":null,"notas":null}}
 En "perfil" pon solo lo que sepas (se conserva lo anterior). "cedula": solo números (si la factura es de empresa, el NIT sin dígito de verificación). "fecha_compra" en formato AAAA-MM-DD si la sabes. "archivos_tipos": un tipo por cada ARCHIVO NUEVO adjunto en este mensaje, en el mismo orden: "factura", "rut", "cedula", "certificacion_bancaria", "certificado_upme", "soporte_pago" u "otro".`;
 
+// Modo autónomo: Daniela envía ella misma (PC dedicado con la extensión v2.3).
+const SALIDA_AUTO = `
+MODO AUTÓNOMO (manda sobre lo anterior cuando hablen de lo mismo)
+- En este chat NO hay un agente revisando: lo que pongas en "respuesta" se le envía tal cual al cliente por WhatsApp, como Daniela de Gómez Legal Abogados en representación de SURA.
+- Responde solo lo que sabes por la guía y la ficha. Ante cualquier duda, accion = "preguntar_grupo": en "respuesta" un mensaje breve de espera (por ejemplo, que lo está validando con el equipo y le confirma en breve) y en "nota_equipo" la pregunta concreta para el grupo, con el dato que hace falta.
+- Nunca prometas montos, fechas ni resultados que no estén en la guía. Nunca pidas datos de tarjetas ni claves (solo la clave de apertura del RUT o la factura si viene protegida).
+- Si el último mensaje del cliente es solo un agradecimiento o un "ok" y no hay nada pendiente de tu parte, deja "respuesta" vacía.
+- Si llega una nota de voz, pídele con amabilidad que por favor te lo escriba.`;
+
+// Aviso al grupo de Teams "GLA Novedades atención" (flujo de Workflows "cuando se reciba una solicitud de webhook").
+async function avisarTeams({ titulo, texto, nombre, telefono }) {
+  const url = process.env.TEAMS_WEBHOOK_URL;
+  if (!url) return false;
+  const lineas = [nombre && ('Cliente: ' + nombre), telefono && ('Celular: +' + digitos(telefono)), texto].filter(Boolean);
+  const tarjeta = { type: 'AdaptiveCard', $schema: 'http://adaptivecards.io/schemas/adaptive-card.json', version: '1.4',
+    body: [{ type: 'TextBlock', text: titulo, weight: 'Bolder', size: 'Medium', wrap: true },
+      ...lineas.map((l) => ({ type: 'TextBlock', text: String(l).slice(0, 1500), wrap: true }))] };
+  try {
+    const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'message', attachments: [{ contentType: 'application/vnd.microsoft.card.adaptive', contentUrl: null, content: tarjeta }] }) });
+    if (!r.ok) console.error('Teams webhook:', r.status, (await r.text()).slice(0, 200));
+    return r.ok;
+  } catch (e) { console.error('Teams webhook:', e.message); return false; }
+}
+const autoActivo = () => process.env.CHATTIGO_AUTONOMO !== '0';
+
 function fichaVisible(p) { const o = {}; for (const [k, v] of Object.entries(p || {})) if (!k.startsWith('_')) o[k] = v; return o; }
 
 function transcripcion(mensajes) {
@@ -50,11 +76,25 @@ async function siguienteCierre(sb) {
 }
 
 module.exports = function montarChattigo(app, { sbServicio }) {
-  app.get('/api/chattigo/salud', (req, res) => res.json({ ok: true, guia: GUIA.length, cierre: CIERRE() }));
+  const tokenOk = (req) => !process.env.CHATTIGO_TOKEN || req.get('x-copiloto-token') === process.env.CHATTIGO_TOKEN;
+  app.get('/api/chattigo/salud', (req, res) => res.json({ ok: true, guia: GUIA.length, cierre: CIERRE(), teams: !!process.env.TEAMS_WEBHOOK_URL, autonomo: autoActivo() }));
+  // Interruptor general del modo autónomo: en Render, CHATTIGO_AUTONOMO=0 lo apaga en todos los PC.
+  app.get('/api/chattigo/config', (req, res) => res.json({ autonomo: autoActivo(), teams: !!process.env.TEAMS_WEBHOOK_URL }));
+  // Avisos de la extensión (sesión cerrada, transferencia fallida, límites) al grupo de Teams.
+  app.post('/api/chattigo/aviso', async (req, res) => {
+    if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
+    const { tipo, texto, nombre, telefono, ensayo } = req.body || {};
+    if (ensayo) return res.json({ ok: true, ensayo: true });
+    const titulos = { sesion: '⚠️ Daniela (Chattigo): sesión cerrada', transferencia_fallida: '➡️ Daniela (Chattigo): transferir a mano', limite: '⏸️ Daniela (Chattigo): chat pausado' };
+    const ok = await avisarTeams({ titulo: titulos[tipo] || '🔔 Daniela (Chattigo)', texto: String(texto || '').slice(0, 1500), nombre, telefono });
+    res.json({ ok });
+  });
 
   app.post('/api/chattigo/sugerir', async (req, res) => {
-    if (process.env.CHATTIGO_TOKEN && req.get('x-copiloto-token') !== process.env.CHATTIGO_TOKEN) return res.status(401).json({ error: 'Token del copiloto no válido.' });
-    const { telefono, nombre, mensajes, archivos, asesor, pedido } = req.body || {};
+    if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
+    const { telefono, nombre, mensajes, archivos, asesor, pedido, modo, ensayo } = req.body || {};
+    const autonomo = modo === 'autonomo';
+    if (autonomo && !autoActivo()) return res.status(423).json({ error: 'Modo autónomo apagado en el servidor.' });
     if (!Array.isArray(mensajes) || !mensajes.length) return res.status(400).json({ error: 'No llegó la conversación.' });
     const tel = digitos(telefono).slice(-10);
     const clave = 'chattigo-' + (tel.length === 10 ? '57' + tel : 'n-' + crypto.createHash('sha1').update(String(nombre || '')).digest('hex').slice(0, 12));
@@ -82,12 +122,12 @@ module.exports = function montarChattigo(app, { sbServicio }) {
       });
 
       const t = tarifaUpme(perfil.valor_sin_iva);
-      const sistema = GUIA + '\n' + SALIDA +
+      const sistema = GUIA + '\n' + SALIDA + (autonomo ? '\n' + SALIDA_AUTO : '') +
         '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(fichaVisible(perfil)) +
         (t ? '\nTARIFA UPME DE ESTE CLIENTE (calculadora oficial UPME): ' + t.texto + '. Úsala tal cual si hablas de la tarifa de la UPME.' : '');
       const texto = 'CONVERSACIÓN EN CHATTIGO (la más reciente al final):\n' + transcripcion(mensajes) +
         (pedido ? '\n\nINDICACIÓN DEL AGENTE PARA ESTA RESPUESTA: ' + String(pedido).slice(0, 500) : '') +
-        '\n\nRedacta el siguiente mensaje del agente y responde con el JSON.';
+        (autonomo ? '\n\nRedacta el siguiente mensaje de Daniela (se enviará tal cual) y responde con el JSON.' : '\n\nRedacta el siguiente mensaje del agente y responde con el JSON.');
       const bruto = await llamarClaude(sistema, [{ role: 'user', content: [...bloques, { type: 'text', text: texto }] }]);
       const j = parsearJSON(bruto) || {};
 
@@ -107,10 +147,18 @@ module.exports = function montarChattigo(app, { sbServicio }) {
       if (tel.length === 10) {
         const conTipo = todos.map((a) => ({ ...a, tipo: perfil._tipos[a.hash] })).filter((a) => a.tipo);
         await sincronizarTodo({ perfil, waId: '57' + tel, archivos: conTipo, sb, bajarArchivo: null,
-          opciones: { canal: 'Chattigo', asesor: 'Daniela (Chattigo' + (asesor ? ' · ' + String(asesor).slice(0, 40) : '') + ')', prefijo: 'ct', origen: 'chattigo' } });
+          opciones: { sinContrato: !!ensayo, canal: 'Chattigo', asesor: 'Daniela (Chattigo' + (asesor ? ' · ' + String(asesor).slice(0, 40) : '') + ')', prefijo: 'ct', origen: 'chattigo' } });
       }
       await sb.from('wasapi_conversaciones').upsert({ wa_id: clave, perfil, estado: 'copiloto', from_id: null, actualizado_en: new Date().toISOString(),
         mensajes: (mensajes || []).slice(-60).map((m) => ({ rol: m.rol === 'cliente' ? 'cliente' : 'agente', texto: String(m.texto || '').slice(0, 2000), hora: m.hora || null })) }, { onConflict: 'wa_id' });
+
+      // Modo autónomo: el equipo se entera por Teams (preguntas, cierres y chats que no son del beneficio).
+      if (autonomo && !ensayo) {
+        const base = { nombre: perfil.nombre_completo || perfil.nombre || nombre, telefono: tel.length === 10 ? '57' + tel : telefono };
+        if (accion === 'preguntar_grupo') await avisarTeams({ ...base, titulo: '❓ Daniela (Chattigo) necesita al equipo', texto: (j.nota_equipo || 'Revisar el chat.') + '\nCuando tengan la respuesta, escríbanla en el chat de Chattigo; Daniela retoma después.' });
+        else if (accion === 'transferir_cierre') await avisarTeams({ ...base, titulo: '✅ Expediente completo → cierre', texto: 'Se transfiere a ' + transferirA + '.' + (perfil.marca_modelo ? ' Vehículo: ' + perfil.marca_modelo + '.' : '') + (Array.isArray(j.alertas) && j.alertas.length ? ' Alertas: ' + j.alertas.join(', ') + '.' : '') });
+        else if (accion === 'no_atender') await avisarTeams({ ...base, titulo: '⛔ Chat que no es del beneficio tributario', texto: 'Daniela no lo atiende. Revísenlo y gestiónenlo a mano en Chattigo.' });
+      }
 
       let caso = null;
       if (perfil._caso_id) {

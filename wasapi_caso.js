@@ -166,7 +166,7 @@ async function sincronizarTodo({ perfil, waId, archivos, sb, bajarArchivo, opcio
   } catch (e) { console.error('[wasapi-caso] caso:', e.message); }
   try { await subirDocumentos(perfil, archivos || []); } catch (e) { console.error('[wasapi-caso] documentos:', e.message); }
   if (bajarArchivo) try { await subirPendientes(perfil, bajarArchivo); } catch (e) { console.error('[wasapi-caso] pendientes:', e.message); }
-  try { await pedirContratoSiListo(perfil, sb, o); } catch (e) { console.error('[wasapi-caso] contrato:', e.message); }
+  if (!o.sinContrato) try { await pedirContratoSiListo(perfil, sb, o); } catch (e) { console.error('[wasapi-caso] contrato:', e.message); }
 }
 
 module.exports = { sincronizarTodo, datosDelPerfil, fuenteDeOrigen, TIPOS_VALIDOS };

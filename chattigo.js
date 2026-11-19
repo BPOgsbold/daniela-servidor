@@ -20,6 +20,7 @@ const SALIDA = `
 FORMA DE TRABAJO EN ESTA HERRAMIENTA (manda sobre la guía cuando hablen de lo mismo)
 - Eres el copiloto de un agente humano de Chattigo. Tú NO envías nada: redactas el SIGUIENTE mensaje que el agente le va a enviar al cliente, como Daniela de Gómez Legal Abogados en representación de SURA. El agente lo revisa y lo envía.
 - Lee TODA la conversación. Si el último mensaje es del agente y el cliente no ha respondido, sugiere un seguimiento corto o deja "respuesta" vacía si no hace falta escribir.
+- EXPERIENCIA DEL CLIENTE: responde exactamente lo que el cliente preguntó, primero la respuesta y luego el siguiente paso. Usa cifras concretas cuando las tengas (honorarios de la guía, tarifa UPME de la calculadora oficial, etapa del trámite). Nunca dejes una pregunta del cliente sin responder ni la cambies por otra pregunta. Si prometes confirmar algo, escala de inmediato con "preguntar_grupo".
 - Mensajes cortos, una sola pregunta, de usted, sin listas ni negritas, sin marcadores tipo [nombre].
 - QUIÉN ENVIÓ QUÉ: en la conversación, CLIENTE es el cliente y AGENTE somos nosotros (Gómez Legal / Daniela). Las imágenes o archivos que envía el AGENTE (capturas de la UPME, instrucciones, ejemplos) son material de apoyo NUESTRO: nunca digas que el cliente los compartió y nunca tomes de ellos nombres, cédulas, celulares ni datos del cliente. Solo los "ARCHIVO NUEVO" son documentos enviados por el cliente.
 - SALUDO: si en la conversación de HOY el AGENTE ya saludó o se presentó, NO vuelvas a saludar ni a presentarte ("Buenos días", "Soy Daniela de…"): ve directo al punto, llamando al cliente por su nombre.
@@ -161,7 +162,7 @@ module.exports = function montarChattigo(app, { sbServicio }) {
     if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
     const { tipo, texto, nombre, telefono, ensayo } = req.body || {};
     if (ensayo) return res.json({ ok: true, ensayo: true });
-    const titulos = { sesion: '⚠️ Daniela (Chattigo): sesión cerrada', transferencia_fallida: '➡️ Daniela (Chattigo): transferir a mano', limite: '⏸️ Daniela (Chattigo): chat pausado' };
+    const titulos = { sin_respuesta: '📵 Cliente sin respuesta tras 2 seguimientos', recordatorio: '⏰ Daniela sigue esperando respuesta del equipo', transferido: '➡️ Daniela transfirió un caso', sesion: '⚠️ Daniela (Chattigo): sesión cerrada', transferencia_fallida: '➡️ Daniela (Chattigo): transferir a mano', limite: '⏸️ Daniela (Chattigo): chat pausado' };
     const ok = await avisarTeams({ titulo: titulos[tipo] || '🔔 Daniela (Chattigo)', texto: String(texto || '').slice(0, 1500), nombre, telefono });
     res.json({ ok });
   });
@@ -285,7 +286,7 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
 
   app.post('/api/chattigo/sugerir', async (req, res) => {
     if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
-    const { telefono, nombre, mensajes, archivos, asesor, pedido, modo, ensayo, encargo } = req.body || {};
+    const { telefono, nombre, mensajes, archivos, asesor, pedido, modo, ensayo, encargo, pendiente } = req.body || {};
     const autonomo = modo === 'autonomo';
     if (autonomo && !autoActivo()) return res.status(423).json({ error: 'Modo autónomo apagado en el servidor.' });
     if (!Array.isArray(mensajes) || !mensajes.length) return res.status(400).json({ error: 'No llegó la conversación.' });
@@ -331,12 +332,17 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
       const real = await estadoReal(sb, tel);
       const instrucciones = await instruccionesPendientes(sb, clave);
       const aprend = await aprendizajes(sb);
+      if (!perfil.valor_sin_iva && tel.length === 10) { // la tarifa UPME sale del valor sin IVA del caso en el panel
+        try { const { data: cv } = await sb.from('Perfilamiento_y_ventas_GLA').select('valor_sin_iva').eq('telefono', tel).not('valor_sin_iva', 'is', null).limit(1); if (cv && cv[0]) perfil.valor_sin_iva = cv[0].valor_sin_iva; } catch (_) {}
+      }
       const t = tarifaUpme(perfil.valor_sin_iva);
       const sistema = GUIA + '\n' + SALIDA + (autonomo ? '\n' + SALIDA_AUTO : '') +
         '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(fichaVisible(perfil)) +
         (real ? '\n\n' + real : '') +
         (aprend.length ? '\n\nRESPUESTAS RECIENTES DEL EQUIPO A PREGUNTAS DE DANIELA (están aprobadas; úsalas como guía si el caso es igual, sin inventar más allá):\n' + aprend.map((a) => '- P: ' + String(a.pregunta).slice(0, 300) + '\n  R: ' + String(a.respuesta).slice(0, 400)).join('\n') : '') +
         (encargo && encargo.instruccion ? '\n\nTAREA ENCARGADA POR EL EQUIPO PARA ESTE CLIENTE (' + (encargo.tipo === 'seguimiento' ? 'SEGUIMIENTO n.º ' + ((Number(encargo.veces) || 0) + 1) + ': si lo que se busca ya se cumplió según la conversación, deja "respuesta" vacía y pon "encargo_cumplido": true; si no, escribe un recordatorio amable y breve, distinto a los anteriores' : 'hazla AHORA') + '; escríbele al cliente con tus palabras, sin decir que alguien te lo pidió; accion "responder" salvo que la tarea diga transferir o preguntar):\n' + String(encargo.instruccion).slice(0, 1500) : '') +
+        (pendiente === 'promesa' ? '\n\nSITUACIÓN: el último mensaje NUESTRO le dijo al cliente que íbamos a validar y le confirmábamos, y no se cumplió. El cliente sigue esperando la respuesta a su última pregunta. AHORA: si la guía, la ficha, la tarifa UPME, el estado real o las respuestas recientes del equipo te permiten responder, respóndele YA con la respuesta concreta (cifras exactas y siguiente paso), sin volver a decir que estás validando. Si de verdad no puedes, accion "preguntar_grupo" con la pregunta exacta del cliente en "nota_equipo" y en "respuesta" un mensaje breve y cálido diciendo que ya lo escalamos con el área encargada y le confirmamos hoy mismo.' : '') +
+        (pendiente === 'seguimiento' ? '\n\nSITUACIÓN: SEGUIMIENTO COMERCIAL. El cliente no responde hace 4 horas o más a nuestro último mensaje. Escribe UN mensaje de seguimiento con enfoque comercial, no un "¿pudo revisar?" básico: recuérdale el beneficio concreto que está dejando en espera (la devolución del 5 % del IVA de su vehículo, con el valor estimado si lo conoces, más la deducción en renta), crea un motivo para avanzar hoy (los tiempos de la UPME y la DIAN corren desde que radicamos, cada día de espera retrasa su devolución) y cierra con UNA acción fácil y concreta (enviar el documento que falta, hacer el pago con los datos ya compartidos, firmar el contrato o confirmar que avanzamos). Breve, cálido, sin presionar de forma agresiva y distinto a los mensajes anteriores. Si la conversación ya quedó cerrada, el cliente dijo que no le interesa o no hay nada pendiente de su parte, deja "respuesta" vacía.' : '') +
         (instrucciones.length ? '\n\nINSTRUCCIÓN DEL EQUIPO PARA ESTE CLIENTE (respuesta a tu pregunta; APLÍCALA AHORA en tu mensaje, con tus palabras, sin decir que preguntaste a nadie; accion "responder" salvo que la instrucción diga otra cosa):\n' + instrucciones.map((i) => '- Pregunta: ' + i.pregunta + '\n  Indicación' + (i.respondido_por ? ' de ' + i.respondido_por : '') + ': ' + i.respuesta).join('\n') : '') +
         (t ? '\nTARIFA UPME DE ESTE CLIENTE (calculadora oficial UPME): ' + t.texto + '. Úsala tal cual si hablas de la tarifa de la UPME.' : '');
       const hoy = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(new Date());
@@ -433,7 +439,7 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
           if (ok) { perfil._preguntas = [...perfil._preguntas, firma].slice(-20); await sb.from('wasapi_conversaciones').update({ perfil }).eq('wa_id', clave); }
         }
       }
-      if (accion === 'transferir_cierre' && !ensayo && !perfil._aviso_cierre) {
+      if (accion === 'transferir_cierre' && !ensayo && !autonomo && !perfil._aviso_cierre) {
         const ok = await avisarTeams({ nombre: perfil.nombre_completo || perfil.nombre || nombre, telefono: tel.length === 10 ? '57' + tel : telefono,
           titulo: '✅ Expediente completo → transferir a ' + transferirA,
           texto: (j.resumen_cierre || [perfil.marca_modelo && 'Vehículo: ' + perfil.marca_modelo, perfil.cedula && 'Cédula/NIT: ' + perfil.cedula].filter(Boolean).join(' · ')) +

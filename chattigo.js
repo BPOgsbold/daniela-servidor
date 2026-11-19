@@ -52,8 +52,9 @@ MODO AUTÓNOMO (manda sobre lo anterior cuando hablen de lo mismo)
 - Si llega una nota de voz, pídele con amabilidad que por favor te lo escriba.`;
 
 // Aviso al grupo de Teams "GLA Novedades atención" (flujo de Workflows "cuando se reciba una solicitud de webhook").
-async function avisarTeams({ titulo, texto, nombre, telefono, boton }) {
-  const url = process.env.TEAMS_WEBHOOK_URL;
+async function avisarTeams({ titulo, texto, nombre, telefono, boton, grupo }) {
+  // grupo 'recepcion' → GLA_GTR_Notificación_Casos_Nuevos (TEAMS_WEBHOOK_RECEPCION); el resto → GLA Novedades atención.
+  const url = (grupo === 'recepcion' && process.env.TEAMS_WEBHOOK_RECEPCION) || process.env.TEAMS_WEBHOOK_URL;
   if (!url) return false;
   const lineas = [nombre && ('Cliente: ' + nombre), telefono && ('Celular: +' + digitos(telefono)), texto].filter(Boolean);
   const tarjeta = { type: 'AdaptiveCard', $schema: 'http://adaptivecards.io/schemas/adaptive-card.json', version: '1.4',
@@ -162,8 +163,9 @@ module.exports = function montarChattigo(app, { sbServicio }) {
     if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
     const { tipo, texto, nombre, telefono, ensayo } = req.body || {};
     if (ensayo) return res.json({ ok: true, ensayo: true });
-    const titulos = { status_recepcion: '📊 Recepción Chattigo: transferencias de la última hora', sin_respuesta: '📵 Cliente sin respuesta tras 2 seguimientos', recordatorio: '⏰ Daniela sigue esperando respuesta del equipo', transferido: '➡️ Daniela transfirió un caso', sesion: '⚠️ Daniela (Chattigo): sesión cerrada', transferencia_fallida: '➡️ Daniela (Chattigo): transferir a mano', limite: '⏸️ Daniela (Chattigo): chat pausado' };
-    const ok = await avisarTeams({ titulo: titulos[tipo] || '🔔 Daniela (Chattigo)', texto: String(texto || '').slice(0, 1500), nombre, telefono });
+    const titulos = { recepcion_fallida: '⚠️ Recepción: no se pudo transferir un caso', status_recepcion: '📊 Recepción Chattigo: transferencias de la última hora', sin_respuesta: '📵 Cliente sin respuesta tras 2 seguimientos', recordatorio: '⏰ Daniela sigue esperando respuesta del equipo', transferido: '➡️ Daniela transfirió un caso', sesion: '⚠️ Daniela (Chattigo): sesión cerrada', transferencia_fallida: '➡️ Daniela (Chattigo): transferir a mano', limite: '⏸️ Daniela (Chattigo): chat pausado' };
+    const ok = await avisarTeams({ titulo: titulos[tipo] || '🔔 Daniela (Chattigo)', texto: String(texto || '').slice(0, 1500), nombre, telefono,
+      grupo: /^(status_recepcion|recepcion_)/.test(String(tipo)) ? 'recepcion' : null });
     res.json({ ok });
   });
 

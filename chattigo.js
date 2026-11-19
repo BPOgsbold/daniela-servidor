@@ -242,7 +242,7 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
 <option value="una_vez">Una sola vez, ahora</option><option value="seguimiento">Seguimiento: repetir hasta que el cliente cumpla</option></select>
 <label>Si es seguimiento: cada cuántas horas y durante cuántos días</label>
 <div style="display:flex;gap:8px"><input name="cada_horas" type="number" min="2" max="72" value="4"><input name="dias" type="number" min="1" max="10" value="2"></div>
-<label>Su nombre</label><input name="por" required placeholder="Ej.: Daniela Vera"><button>Encargar a Daniela</button>
+<label>Su nombre</label><input name="por" required placeholder="Ej.: Daniela Vera"><button onclick="setTimeout(()=>{this.disabled=true;this.textContent='Enviando…'},0)">Encargar a Daniela</button>
 <p class="m">Daniela lo hace en la próxima revisión (horario de atención). El chat debe estar en la bandeja de Daniela en Chattigo; si no, ella avisa en Teams para que se lo transfieran. Solo puede escribir si el cliente escribió en las últimas 24 h (regla de WhatsApp).</p></form>
 <h3 style="margin-top:22px">Últimos encargos</h3>${(lista || []).map((e) => `<div class="m" style="border-bottom:1px dashed #e1dac5;padding:6px 0"><b>${escH(e.estado)}</b> · +${escH(e.telefono)} · ${escH(String(e.instruccion).slice(0, 90))} · ${escH(e.creado_por || '')}${e.resultado ? '<br>→ ' + escH(String(e.resultado).slice(0, 160)) : ''}</div>`).join('') || '<p class="m">Aún no hay encargos.</p>'}`);
   const ultimosEnc = async () => { const { data } = await sbServicio().from('chattigo_encargos').select('*').order('creado_en', { ascending: false }).limit(15); return data || []; };
@@ -260,6 +260,9 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
     const cada = Math.min(72, Math.max(2, Number(b.cada_horas) || 4));
     const dias = Math.min(10, Math.max(1, Number(b.dias) || 2));
     const sb = sbServicio();
+    // Doble clic / reenvío del formulario: si ya hay un encargo pendiente igual para ese celular, no se crea otro.
+    const { data: igual } = await sb.from('chattigo_encargos').select('id').eq('telefono', '57' + tel).eq('estado', 'pendiente').eq('instruccion', instruccion).limit(1);
+    if (igual && igual.length) return res.send(formEncargo(await ultimosEnc(), '<div class="ok">Ese encargo ya estaba registrado: Daniela lo hace en la próxima revisión.</div>'));
     const { data: conv } = await sb.from('wasapi_conversaciones').select('perfil').eq('wa_id', 'chattigo-57' + tel).maybeSingle();
     const nombre = conv && conv.perfil ? (conv.perfil.nombre_completo || conv.perfil.nombre || null) : null;
     await sb.from('chattigo_encargos').insert({ telefono: '57' + tel, nombre, instruccion, tipo: seg ? 'seguimiento' : 'una_vez', cada_horas: seg ? cada : null,

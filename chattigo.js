@@ -38,7 +38,7 @@ FORMA DE TRABAJO EN ESTA HERRAMIENTA (manda sobre la guía cuando hablen de lo m
 - Si un archivo no se puede leer, usa la respuesta fija de la guía y accion = "preguntar_grupo".
 
 RESPONDE SOLO con un JSON válido (sin texto alrededor):
-{"respuesta":"mensaje sugerido para el cliente o vacío","accion":"responder|preguntar_grupo|transferir_cierre|no_atender","nota_equipo":"texto para el grupo de Teams o null","alertas":["empresa","dos_propietarios","rut_vencido","iva_19","leasing","otro..."],"faltan":["lo que falta del expediente"],"archivos_tipos":[],"datos_archivos":"resumen breve de lo leído en los archivos nuevos o null","resumen_cierre":"solo si accion = transferir_cierre: resumen consolidado para la asesora de cierre (nombre completo, cédula/NIT, vehículo, fecha de factura, valor sin IVA, IVA, titular de la factura, RUT vigente sí/no, documentos recibidos, servicio que quiere, alertas) o null","perfil":{"nombre":null,"nombre_completo":null,"cedula":null,"correo":null,"marca_modelo":null,"tipo_vehiculo":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"medios_pago_informados":null,"documentos_recibidos":[],"pago_honorarios_recibido":null,"dos_propietarios":null,"notas":null}}
+{"respuesta":"mensaje sugerido para el cliente o vacío","accion":"responder|preguntar_grupo|transferir_cierre|no_atender","nota_equipo":"texto para el grupo de Teams o null","alertas":["empresa","dos_propietarios","rut_vencido","iva_19","leasing","otro..."],"faltan":["lo que falta del expediente"],"archivos_tipos":[],"datos_archivos":"resumen breve de lo leído en los archivos nuevos o null","encargo_cumplido":"solo si hay TAREA ENCARGADA de tipo seguimiento: true si lo que se buscaba ya se cumplió (el cliente respondió, envió lo pedido o pagó), si no false","resumen_cierre":"solo si accion = transferir_cierre: resumen consolidado para la asesora de cierre (nombre completo, cédula/NIT, vehículo, fecha de factura, valor sin IVA, IVA, titular de la factura, RUT vigente sí/no, documentos recibidos, servicio que quiere, alertas) o null","perfil":{"nombre":null,"nombre_completo":null,"cedula":null,"correo":null,"marca_modelo":null,"tipo_vehiculo":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"medios_pago_informados":null,"documentos_recibidos":[],"pago_honorarios_recibido":null,"dos_propietarios":null,"notas":null}}
 En "perfil" pon solo lo que sepas (se conserva lo anterior). "cedula": solo números (si la factura es de empresa, el NIT sin dígito de verificación). "fecha_compra" en formato AAAA-MM-DD si la sabes. "archivos_tipos": un tipo por cada ARCHIVO NUEVO adjunto en este mensaje, en el mismo orden: "factura", "rut", "cedula", "certificacion_bancaria", "certificado_upme", "soporte_pago" u "otro".`;
 
 // Modo autónomo: Daniela envía ella misma (PC dedicado con la extensión v2.3).
@@ -192,6 +192,88 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
     await sbServicio().from('chattigo_preguntas').update({ respuesta, respondido_por: por || null, respondido_en: new Date().toISOString(), aplicado_en: null }).eq('id', id);
     res.send(paginaP('<div class="ok">✅ ¡Gracias! Daniela aplicará esta indicación con el cliente en la próxima revisión del chat.</div>'));
   });
+  // ---------- Encargos: el equipo le pide a Daniela que haga algo con un cliente (enlace fijo anclado en Teams)
+  const firmaE = () => crypto.createHmac('sha256', SECRETO_P()).update('encargos').digest('base64url').slice(0, 24);
+  // Publica en Teams la tarjeta con el botón "Encargar a Daniela" (se ancla en el grupo). Lo dispara el panel 🤖 de la extensión.
+  app.post('/api/chattigo/encargos/anclar', async (req, res) => {
+    if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
+    const ok = await avisarTeams({ titulo: '📌 Encargos para Daniela (Chattigo)', boton: { titulo: '📝 Encargar a Daniela', url: `${URL_SERVIDOR()}/api/chattigo/encargo?t=${firmaE()}` },
+      texto: 'Anclen este mensaje. Toquen el botón para pedirle a Daniela que le escriba a un cliente o le haga seguimiento (por ejemplo, recordarle el soporte de pago cada 4 horas). Ella lo hace en su próxima revisión y avisa aquí el resultado.' });
+    res.json({ ok });
+  });
+  const formEncargo = (lista, aviso) => paginaP(`${aviso || ''}<form method="post">
+<label>Celular del cliente</label><input name="telefono" required placeholder="Ej.: 3012759428">
+<label>¿Qué debe hacer Daniela?</label><textarea name="instruccion" required placeholder="Ej.: Escríbele que su certificado UPME ya salió y que seguimos con la cita en la DIAN.&#10;Ej.: Recuérdale enviar el soporte de pago de los honorarios."></textarea>
+<label>¿Cuándo?</label><select name="tipo" style="width:100%;padding:10px;border:1px solid #cfc6ad;border-radius:8px;font-size:15px">
+<option value="una_vez">Una sola vez, ahora</option><option value="seguimiento">Seguimiento: repetir hasta que el cliente cumpla</option></select>
+<label>Si es seguimiento: cada cuántas horas y durante cuántos días</label>
+<div style="display:flex;gap:8px"><input name="cada_horas" type="number" min="2" max="72" value="4"><input name="dias" type="number" min="1" max="10" value="2"></div>
+<label>Su nombre</label><input name="por" required placeholder="Ej.: Daniela Vera"><button>Encargar a Daniela</button>
+<p class="m">Daniela lo hace en la próxima revisión (horario de atención). El chat debe estar en la bandeja de Daniela en Chattigo; si no, ella avisa en Teams para que se lo transfieran. Solo puede escribir si el cliente escribió en las últimas 24 h (regla de WhatsApp).</p></form>
+<h3 style="margin-top:22px">Últimos encargos</h3>${(lista || []).map((e) => `<div class="m" style="border-bottom:1px dashed #e1dac5;padding:6px 0"><b>${escH(e.estado)}</b> · +${escH(e.telefono)} · ${escH(String(e.instruccion).slice(0, 90))} · ${escH(e.creado_por || '')}${e.resultado ? '<br>→ ' + escH(String(e.resultado).slice(0, 160)) : ''}</div>`).join('') || '<p class="m">Aún no hay encargos.</p>'}`);
+  const ultimosEnc = async () => { const { data } = await sbServicio().from('chattigo_encargos').select('*').order('creado_en', { ascending: false }).limit(15); return data || []; };
+  app.get('/api/chattigo/encargo', async (req, res) => {
+    if (req.query.t !== firmaE()) return res.status(403).send(paginaP('Enlace no válido.'));
+    res.send(formEncargo(await ultimosEnc()));
+  });
+  app.post('/api/chattigo/encargo', express_urlencoded, async (req, res) => {
+    if (req.query.t !== firmaE()) return res.status(403).send(paginaP('Enlace no válido.'));
+    const b = req.body || {};
+    const tel = digitos(b.telefono).slice(-10);
+    const instruccion = String(b.instruccion || '').trim().slice(0, 1500);
+    if (tel.length !== 10 || !instruccion) return res.status(400).send(formEncargo(await ultimosEnc(), '<div class="q">Revise el celular (10 dígitos) y la instrucción.</div>'));
+    const seg = b.tipo === 'seguimiento';
+    const cada = Math.min(72, Math.max(2, Number(b.cada_horas) || 4));
+    const dias = Math.min(10, Math.max(1, Number(b.dias) || 2));
+    const sb = sbServicio();
+    const { data: conv } = await sb.from('wasapi_conversaciones').select('perfil').eq('wa_id', 'chattigo-57' + tel).maybeSingle();
+    const nombre = conv && conv.perfil ? (conv.perfil.nombre_completo || conv.perfil.nombre || null) : null;
+    await sb.from('chattigo_encargos').insert({ telefono: '57' + tel, nombre, instruccion, tipo: seg ? 'seguimiento' : 'una_vez', cada_horas: seg ? cada : null,
+      hasta: seg ? new Date(Date.now() + dias * 864e5).toISOString() : null, creado_por: String(b.por || '').slice(0, 80) || null });
+    await avisarTeams({ titulo: '📝 Encargo para Daniela', nombre, telefono: '57' + tel, texto: instruccion + (seg ? `\n(Seguimiento cada ${cada} h durante ${dias} día(s))` : '') + (b.por ? '\nPedido por: ' + b.por : '') });
+    res.send(formEncargo(await ultimosEnc(), '<div class="ok">✅ Encargo recibido. Daniela lo hace en la próxima revisión y avisa en Teams.</div>'));
+  });
+  // La extensión pide los encargos que ya tocan para los chats de su bandeja.
+  app.post('/api/chattigo/encargos/pendientes', async (req, res) => {
+    if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
+    const tels = new Set((Array.isArray((req.body || {}).telefonos) ? req.body.telefonos : []).map((t) => '57' + digitos(t).slice(-10)));
+    const sb = sbServicio();
+    const { data } = await sb.from('chattigo_encargos').select('*').eq('estado', 'pendiente').lte('proximo_en', new Date().toISOString()).order('proximo_en', { ascending: true }).limit(30);
+    const listos = [];
+    for (const e of data || []) {
+      if (e.hasta && new Date(e.hasta) < new Date()) {
+        await sb.from('chattigo_encargos').update({ estado: 'hecho', hecho_en: new Date().toISOString(), resultado: (e.resultado || '') + ' · Terminó el plazo del seguimiento.' }).eq('id', e.id);
+        await avisarTeams({ titulo: '⌛ Terminó el seguimiento de Daniela', nombre: e.nombre, telefono: e.telefono, texto: e.instruccion + '\nEl cliente no cumplió en el plazo: revísenlo.' });
+        continue;
+      }
+      if (tels.has(e.telefono)) listos.push({ id: e.id, telefono: e.telefono, instruccion: e.instruccion, tipo: e.tipo, veces: e.veces });
+      else if (!e.avisado_bandeja && Date.now() - new Date(e.proximo_en).getTime() > 5 * 60e3) {
+        await sb.from('chattigo_encargos').update({ avisado_bandeja: true }).eq('id', e.id);
+        await avisarTeams({ titulo: '📥 Daniela necesita el chat para el encargo', nombre: e.nombre, telefono: e.telefono, texto: 'No tengo este chat en mi bandeja de Chattigo. Transfiéranmelo y lo hago: ' + e.instruccion });
+      }
+    }
+    res.json({ encargos: listos.slice(0, 5) });
+  });
+  app.post('/api/chattigo/encargos/:id/resultado', async (req, res) => {
+    if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
+    const { ok, texto, cumplido, reintentar_min } = req.body || {};
+    const sb = sbServicio();
+    const { data: e } = await sb.from('chattigo_encargos').select('*').eq('id', req.params.id).maybeSingle();
+    if (!e) return res.status(404).json({ error: 'No existe.' });
+    const veces = (e.veces || 0) + 1;
+    let cambios = { veces, resultado: String(texto || '').slice(0, 500) };
+    if (reintentar_min) cambios = { proximo_en: new Date(Date.now() + Number(reintentar_min) * 60e3).toISOString(), resultado: cambios.resultado };
+    else if (!ok) cambios = { ...cambios, estado: 'fallido', hecho_en: new Date().toISOString() };
+    else if (e.tipo === 'seguimiento' && !cumplido) cambios.proximo_en = new Date(Date.now() + (e.cada_horas || 4) * 3600e3).toISOString();
+    else cambios = { ...cambios, estado: 'hecho', hecho_en: new Date().toISOString() };
+    await sb.from('chattigo_encargos').update(cambios).eq('id', e.id);
+    if (!reintentar_min && (cambios.estado || veces === 1)) {
+      const t = cambios.estado === 'fallido' ? '⚠️ Daniela no pudo hacer el encargo' : cambios.estado === 'hecho' ? '✅ Encargo cumplido por Daniela' : '🔁 Daniela hizo el primer seguimiento';
+      await avisarTeams({ titulo: t, nombre: e.nombre, telefono: e.telefono, texto: e.instruccion + '\n→ ' + (texto || '') + (cambios.proximo_en && !cambios.estado ? '\nPróximo recordatorio: en ' + (e.cada_horas || 4) + ' h.' : '') });
+    }
+    res.json({ ok: true });
+  });
+
   // La extensión pregunta si un chat pausado ya tiene respuesta del equipo.
   app.post('/api/chattigo/pendientes', async (req, res) => {
     if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
@@ -203,7 +285,7 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
 
   app.post('/api/chattigo/sugerir', async (req, res) => {
     if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
-    const { telefono, nombre, mensajes, archivos, asesor, pedido, modo, ensayo } = req.body || {};
+    const { telefono, nombre, mensajes, archivos, asesor, pedido, modo, ensayo, encargo } = req.body || {};
     const autonomo = modo === 'autonomo';
     if (autonomo && !autoActivo()) return res.status(423).json({ error: 'Modo autónomo apagado en el servidor.' });
     if (!Array.isArray(mensajes) || !mensajes.length) return res.status(400).json({ error: 'No llegó la conversación.' });
@@ -254,6 +336,7 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
         '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(fichaVisible(perfil)) +
         (real ? '\n\n' + real : '') +
         (aprend.length ? '\n\nRESPUESTAS RECIENTES DEL EQUIPO A PREGUNTAS DE DANIELA (están aprobadas; úsalas como guía si el caso es igual, sin inventar más allá):\n' + aprend.map((a) => '- P: ' + String(a.pregunta).slice(0, 300) + '\n  R: ' + String(a.respuesta).slice(0, 400)).join('\n') : '') +
+        (encargo && encargo.instruccion ? '\n\nTAREA ENCARGADA POR EL EQUIPO PARA ESTE CLIENTE (' + (encargo.tipo === 'seguimiento' ? 'SEGUIMIENTO n.º ' + ((Number(encargo.veces) || 0) + 1) + ': si lo que se busca ya se cumplió según la conversación, deja "respuesta" vacía y pon "encargo_cumplido": true; si no, escribe un recordatorio amable y breve, distinto a los anteriores' : 'hazla AHORA') + '; escríbele al cliente con tus palabras, sin decir que alguien te lo pidió; accion "responder" salvo que la tarea diga transferir o preguntar):\n' + String(encargo.instruccion).slice(0, 1500) : '') +
         (instrucciones.length ? '\n\nINSTRUCCIÓN DEL EQUIPO PARA ESTE CLIENTE (respuesta a tu pregunta; APLÍCALA AHORA en tu mensaje, con tus palabras, sin decir que preguntaste a nadie; accion "responder" salvo que la instrucción diga otra cosa):\n' + instrucciones.map((i) => '- Pregunta: ' + i.pregunta + '\n  Indicación' + (i.respondido_por ? ' de ' + i.respondido_por : '') + ': ' + i.respuesta).join('\n') : '') +
         (t ? '\nTARIFA UPME DE ESTE CLIENTE (calculadora oficial UPME): ' + t.texto + '. Úsala tal cual si hablas de la tarifa de la UPME.' : '');
       const hoy = new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(new Date());
@@ -365,7 +448,7 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
       }
       res.json({
         respuesta: limpiarTexto(String(j.respuesta || '')),
-        accion, transferir_a: transferirA, nota_equipo: j.nota_equipo || null, resumen_cierre: j.resumen_cierre || null, aviso_cierre: !!perfil._aviso_cierre,
+        accion, transferir_a: transferirA, nota_equipo: j.nota_equipo || null, encargo_cumplido: j.encargo_cumplido === true, resumen_cierre: j.resumen_cierre || null, aviso_cierre: !!perfil._aviso_cierre,
         alertas: perfil.alertas || [], faltan: Array.isArray(j.faltan) ? j.faltan : [],
         caso, documentos: perfil._docs || [], contrato_pedido: !!perfil._contrato_pedido,
         sin_telefono: tel.length !== 10, archivos_leidos: nuevos.length,

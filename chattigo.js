@@ -29,8 +29,9 @@ FORMA DE TRABAJO EN ESTA HERRAMIENTA (manda sobre la guía cuando hablen de lo m
 - En "nota_equipo" escribe directo la pregunta (sin saludos ni firmas ni marcadores como [nombre bot]); incluye nombre y celular del cliente solo si salen de la conversación del CLIENTE o de la ficha.
 - Si el chat no es del beneficio tributario (cita médica, técnico-mecánica, arrendamiento), accion = "no_atender".
 - Si algo requiere aprobación del equipo o no está en la guía, accion = "preguntar_grupo", escribe en "nota_equipo" la pregunta para el grupo de Teams "GLA Novedades atención" y en "respuesta" un mensaje que no afirme nada sobre ese punto.
+- PAGO SIN ESPERAS: en cuanto los documentos estén en orden y el cliente quiera avanzar, en ESE MISMO mensaje pide la certificación bancaria (vigencia inferior a 30 días, cuenta a su nombre, no bancos digitales como Nu o Lulo) Y compártele de una vez los datos de pago de los honorarios, tal cual la sección 6 de la guía: cuenta de ahorros Bancolombia 43600005898, a nombre de GOMEZ LEGAL ABOGADOS, NIT 901964467-0, o la llave @gomezlegalabogad. Recuérdale el valor de los honorarios que ya se le informó y pídele que envíe el soporte de pago por este mismo chat para iniciar de inmediato ante la UPME. Nunca digas "cuando nos envíe X le enviaremos los datos de pago". Si ya se le dieron (medios_pago_informados = true), no los repitas completos: recuérdale amablemente el pago y el soporte. Marca "medios_pago_informados": true en el perfil cuando los compartas.
 - Revisa TODO el historial (también lo que se habló antes de transferencias) y todo lo leído en los documentos (ficha y notas) antes de decidir: no vuelvas a pedir algo que el cliente ya envió.
-- Si el expediente está completo y en orden según la guía (factura, RUT vigente y cédula completos, sin nada que no cuadre), accion = "transferir_cierre", "respuesta" vacía (se transfiere sin avisar al cliente) y llena "resumen_cierre". No uses "preguntar_grupo" solo para que alguien revise documentos que tú ya puedes leer.
+- Si el expediente está completo y en orden según la guía (factura, RUT vigente y cédula completos, sin nada que no cuadre), accion = "transferir_cierre" y llena "resumen_cierre". "respuesta" vacía, salvo que el cliente haya hecho una pregunta pendiente: en ese caso respóndela en una frase y dile que un asesor del equipo continúa con su proceso. No uses "preguntar_grupo" solo para que alguien revise documentos que tú ya puedes leer.
 - Si el cliente pide hablar con alguien: "respuesta" = "Un asesor del equipo se comunicará con usted." y accion = "preguntar_grupo" con la nota para el grupo.
 - Si un archivo no se puede leer, usa la respuesta fija de la guía y accion = "preguntar_grupo".
 
@@ -220,6 +221,18 @@ module.exports = function montarChattigo(app, { sbServicio }) {
       if (Array.isArray(j.alertas) && j.alertas.length) perfil.alertas = Array.from(new Set([...(perfil.alertas || []), ...j.alertas.map(String)]));
 
       let accion = ['responder', 'preguntar_grupo', 'transferir_cierre', 'no_atender'].includes(j.accion) ? j.accion : 'responder';
+      // Regla fija: expediente completo (factura + RUT + cédula, RUT no vencido) => pasa a cierre y se avisa en Teams.
+      const norm = (x) => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+      const docs = new Set([...Object.values(perfil._tipos || {}), ...(perfil._docs || []), ...(Array.isArray(perfil.documentos_recibidos) ? perfil.documentos_recibidos : [])].map(norm));
+      const tiene = (k) => [...docs].some((d) => d.includes(k));
+      const completo = tiene('factura') && tiene('rut') && (tiene('cedula') || tiene('nit'));
+      const alertasAhora = (perfil.alertas || []).map(norm);
+      if (completo && accion === 'responder' && !alertasAhora.some((a) => a.includes('rut_vencido'))) {
+        accion = 'transferir_cierre';
+        if (!j.resumen_cierre) j.resumen_cierre = [perfil.nombre_completo || perfil.nombre, perfil.cedula && 'Cédula/NIT: ' + perfil.cedula, perfil.marca_modelo && 'Vehículo: ' + perfil.marca_modelo,
+          perfil.fecha_compra && 'Compra: ' + perfil.fecha_compra, perfil.valor_sin_iva && 'Valor sin IVA: ' + perfil.valor_sin_iva, 'Documentos: ' + [...docs].filter((d) => /factura|rut|cedula|bancaria|upme|pago/.test(d)).join(', '),
+          perfil._contrato_pedido ? 'Contrato ya enviado a firma' : null].filter(Boolean).join(' · ');
+      }
       let transferirA = null;
       if (accion === 'transferir_cierre') transferirA = perfil._cierre_asignado || (perfil._cierre_asignado = await siguienteCierre(sb));
 
@@ -243,7 +256,7 @@ module.exports = function montarChattigo(app, { sbServicio }) {
         const ok = await avisarTeams({ nombre: perfil.nombre_completo || perfil.nombre || nombre, telefono: tel.length === 10 ? '57' + tel : telefono,
           titulo: '✅ Expediente completo → transferir a ' + transferirA,
           texto: (j.resumen_cierre || [perfil.marca_modelo && 'Vehículo: ' + perfil.marca_modelo, perfil.cedula && 'Cédula/NIT: ' + perfil.cedula].filter(Boolean).join(' · ')) +
-            (Array.isArray(j.alertas) && j.alertas.length ? '\nAlertas: ' + j.alertas.join(', ') : '') + (autonomo ? '' : '\n(Transferencia hecha por el agente desde Chattigo.)') });
+            (Array.isArray(j.alertas) && j.alertas.length ? '\nAlertas: ' + j.alertas.join(', ') : '') + (autonomo ? '' : '\nEl agente la transfiere desde Chattigo.') });
         if (ok) { perfil._aviso_cierre = new Date().toISOString(); await sb.from('wasapi_conversaciones').update({ perfil }).eq('wa_id', clave); }
       }
 

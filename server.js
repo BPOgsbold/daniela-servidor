@@ -1384,6 +1384,8 @@ app.post('/api/adjuntar', async (req, res) => {
     const buffer = Buffer.from(base64, 'base64');
     if (buffer.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'El archivo pesa más de 25 MB.' });
     const r = await subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer, esCliente: esClienteDefinitivo(datos) });
+    if (tipo === 'soporte_pago') require('./pagos').registrarPago({ cedula, nombre, telefono: datos.telefono, canal: 'Asistente (panel)',
+      cargado_por: datos.asesor || (sesion && sesion.asesor) || 'Asistente', archivo: nombreArchivo, link: r.linkArchivo || r.linkCarpeta, caso_id: sesion && sesion.casoId });
     res.json({
       ok: true,
       reply: `📎 Listo, guardé "${TIPOS_DOC[tipo]}" de ${nombre} en SharePoint, carpeta "${r.carpeta}".`,
@@ -3074,6 +3076,7 @@ app.post('/api/sp/subir', async (req, res) => {
     const buffer = Buffer.from(base64, 'base64');
     if (buffer.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'El archivo pesa más de 25 MB.' });
     const r = await subirDocumento({ cedula: ced, nombre: nom, tipo, nombreArchivo, buffer, esCliente: false });
+    if (tipo === 'soporte_pago') require('./pagos').registrarPago({ cedula: ced, nombre: nom, canal: 'Panel (Crear cliente / UPME)', cargado_por: ctx.email, archivo: nombreArchivo, link: r.linkArchivo || r.linkCarpeta });
     console.log(`[sp/subir] ${ctx.email} subió ${TIPOS_DOC[tipo]} de ${ced}`);
     res.json({ ok: true, carpeta: r.carpeta, archivo: r.archivo, link: r.linkCarpeta || null });
   } catch (err) {
@@ -3362,6 +3365,7 @@ require('./wasapi')(app, { obtenerConocimientoTexto, sbServicio });
 // Firma electrónica de contratos (envío a firma, código, aceptación y constancia).
 require('./firma')(app, { sbServicio, exigirEquipo });
 require('./chattigo')(app, { sbServicio });
+require('./pagos').montarPagos(app); // informe diario de pagos cargados (8:00 p. m.)
 require('./portal')(app, { sbServicio, exigirEquipo });
 
 app.listen(PORT, () => {

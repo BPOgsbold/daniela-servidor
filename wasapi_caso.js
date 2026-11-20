@@ -100,7 +100,7 @@ async function sincronizarCaso(p, waId, sb, o = {}) {
 }
 
 // Sube a la carpeta del cliente (una por cédula) los archivos de este mensaje. Sin cédula aún, quedan en espera.
-async function subirDocumentos(p, archivos) {
+async function subirDocumentos(p, archivos, o = {}) {
   const cedula = digitos(p.cedula);
   const nombre = p.nombre_completo || p.nombre || '';
   const hechos = [];
@@ -110,7 +110,9 @@ async function subirDocumentos(p, archivos) {
     if (a.hash && (p._hashes || []).includes(a.hash)) continue; // ya se subió antes (Chattigo reenvía los archivos en cada consulta)
     if (!cedula || cedula.length < 5 || !sp.configurado()) { if (a.url) pendientes.push({ url: a.url, nombre: a.nombre, tipo: a.tipo }); continue; }
     try {
-      await sp.subirDocumento({ cedula, nombre, tipo: a.tipo, nombreArchivo: a.nombre || ('archivo' + (a.ext || '')), buffer: a.buf, esCliente: false });
+      const r = await sp.subirDocumento({ cedula, nombre, tipo: a.tipo, nombreArchivo: a.nombre || ('archivo' + (a.ext || '')), buffer: a.buf, esCliente: false });
+      if (a.tipo === 'soporte_pago') require('./pagos').registrarPago({ cedula, nombre, telefono: p._telefono || null, canal: o.canal || p._canal || 'WhatsApp',
+        cargado_por: o.asesor || 'Daniela (' + (o.canal || p._canal || 'WhatsApp') + ')', archivo: a.nombre, link: r && (r.linkArchivo || r.linkCarpeta), caso_id: p._caso_id });
       hechos.push(a.tipo);
       if (a.hash) p._hashes = [...(p._hashes || []), a.hash].slice(-40);
     } catch (e) {
@@ -164,7 +166,9 @@ async function sincronizarTodo({ perfil, waId, archivos, sb, bajarArchivo, opcio
     const id = await sincronizarCaso(perfil, waId, sb, o);
     if (id) perfil._caso_id = id;
   } catch (e) { console.error('[wasapi-caso] caso:', e.message); }
-  try { await subirDocumentos(perfil, archivos || []); } catch (e) { console.error('[wasapi-caso] documentos:', e.message); }
+  if (o.canal) perfil._canal = o.canal;
+  if (waId) perfil._telefono = String(waId).replace(/\D/g, '').slice(-10);
+  try { await subirDocumentos(perfil, archivos || [], o); } catch (e) { console.error('[wasapi-caso] documentos:', e.message); }
   if (bajarArchivo) try { await subirPendientes(perfil, bajarArchivo); } catch (e) { console.error('[wasapi-caso] pendientes:', e.message); }
   if (!o.sinContrato) try { await pedirContratoSiListo(perfil, sb, o); } catch (e) { console.error('[wasapi-caso] contrato:', e.message); }
 }

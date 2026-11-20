@@ -253,6 +253,78 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
     res.send(paginaP('<div class="ok">✅ ¡Gracias! Daniela aplicará esta indicación con el cliente en la próxima revisión del chat.</div>'));
   });
   // ---------- Encargos: el equipo le pide a Daniela que haga algo con un cliente (enlace fijo anclado en Teams)
+  // ---------- Conexión del PC de Daniela: latido, alerta en Teams y reconexión con enlace seguro (la clave no se guarda)
+  // Estado en memoria: el PC autónomo manda un latido cada 20 s. Si queda en la pantalla de login o deja de latir, se avisa.
+  const PC = { id: null, secreto: null, ultimo: 0, estado: null, usuario: null, avisoCaida: 0, reconexion: null, credenciales: null };
+  const firmaR = (id) => crypto.createHmac('sha256', SECRETO_P()).update('reconectar:' + id).digest('base64url').slice(0, 32);
+  const horaBogota = () => new Intl.DateTimeFormat('es-CO', { timeZone: 'America/Bogota', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
+  async function pedirReconexion(motivo) {
+    if (PC.reconexion && Date.now() - PC.reconexion.creado < 60 * 60e3) return; // un enlace vivo por hora
+    const id = crypto.randomBytes(9).toString('base64url');
+    PC.reconexion = { id, creado: Date.now(), motivo };
+    await avisarTeams({ titulo: '🔌 Daniela se desconectó de Chattigo', boton: { titulo: '🔑 Reconectar a Daniela', url: `${URL_SERVIDOR()}/api/chattigo/reconectar/${id}?t=${firmaR(id)}` },
+      texto: `${motivo} (${horaBogota()}).\nToquen "Reconectar a Daniela" y escriban el usuario y la clave de Chattigo del PC de Daniela. La clave no queda en este chat ni se guarda: se usa una sola vez.` });
+  }
+  app.post('/api/chattigo/latido', async (req, res) => {
+    if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
+    const { pc, secreto, estado, usuario, perfil, ensayo } = req.body || {};
+    if (!pc || !secreto) return res.status(400).json({ error: 'Falta el PC.' });
+    if (PC.id && PC.id !== pc && Date.now() - PC.ultimo < 5 * 60e3) return res.json({ ok: true, otro: true }); // solo un PC autónomo a la vez
+    const antes = PC.estado;
+    Object.assign(PC, { id: pc, secreto, ultimo: Date.now(), estado, usuario: usuario || PC.usuario, perfil, ensayo: !!ensayo });
+    if (ensayo) return res.json({ ok: true });
+    if (estado === 'ok' && antes && antes !== 'ok') {
+      PC.reconexion = null; PC.credenciales = null; PC.avisoCaida = 0;
+      await avisarTeams({ titulo: '✅ Daniela está en línea otra vez', texto: `La sesión de Chattigo${PC.usuario ? ' de ' + PC.usuario : ''} quedó activa (${horaBogota()}). Daniela sigue atendiendo${perfil === 'recepcion' ? ' en Recepción' : ''}. Revisen que su estado en Chattigo diga "Online".` });
+    } else if (estado === 'login' || estado === 'sesion') {
+      await pedirReconexion(estado === 'login' ? 'La sesión de Chattigo se cerró y Daniela está en la pantalla de inicio de sesión' : 'Chattigo rechazó la sesión de Daniela');
+    } else if (estado === 'login_fallido' && antes !== 'login_fallido') {
+      PC.reconexion = null; await pedirReconexion('❌ No pude entrar con el usuario y la clave que enviaron. Revísenlos e inténtenlo de nuevo');
+    } else if (estado === 'verificacion' && antes !== 'verificacion') {
+      await avisarTeams({ titulo: '🧩 Chattigo pide una verificación', texto: 'Chattigo pidió un código o una verificación para entrar. Alguien debe completarla en el PC de Daniela; ella no lo hace sola.' });
+    }
+    res.json({ ok: true });
+  });
+  // El PC de Daniela recoge los datos (una sola vez, solo el PC que avisó la desconexión).
+  app.post('/api/chattigo/credenciales', async (req, res) => {
+    if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
+    const { pc, secreto } = req.body || {};
+    if (!PC.credenciales || pc !== PC.id || secreto !== PC.secreto) return res.json({ hay: false });
+    if (Date.now() - PC.credenciales.en > 10 * 60e3) { PC.credenciales = null; return res.json({ hay: false }); }
+    const c = PC.credenciales; PC.credenciales = null; // se usa una sola vez
+    res.json({ hay: true, usuario: c.usuario, clave: c.clave });
+  });
+  app.get('/api/chattigo/reconectar/:id', (req, res) => {
+    const id = String(req.params.id);
+    if (req.query.t !== firmaR(id) || !PC.reconexion || PC.reconexion.id !== id) return res.status(403).send(paginaP('Este enlace ya no está activo. Si Daniela sigue desconectada, llegará uno nuevo a Teams.'));
+    res.send(paginaP(`<div class="q">Daniela se desconectó de Chattigo: ${escH(PC.reconexion.motivo)}.</div>
+<form method="post" autocomplete="off"><label>Usuario de Chattigo</label><input name="usuario" required value="${escH(PC.usuario || '')}" placeholder="usuario@empresa.com" autocomplete="off">
+<label>Clave</label><input name="clave" type="password" required autocomplete="new-password">
+<label>Su nombre</label><input name="por" required placeholder="Ej.: Miguel Sierra">
+<button onclick="setTimeout(()=>{this.disabled=true;this.textContent='Enviando…'},0)">Reconectar a Daniela</button>
+<p class="m">La clave no se guarda: viaja cifrada, la usa el PC de Daniela una sola vez y se borra (vence en 10 minutos). Cuando entre, llegará "✅ Daniela está en línea otra vez" al grupo.</p></form>`));
+  });
+  app.post('/api/chattigo/reconectar/:id', express_urlencoded, async (req, res) => {
+    const id = String(req.params.id);
+    if (req.query.t !== firmaR(id) || !PC.reconexion || PC.reconexion.id !== id) return res.status(403).send(paginaP('Este enlace ya no está activo.'));
+    const usuario = String((req.body || {}).usuario || '').trim().slice(0, 120), clave = String((req.body || {}).clave || '').slice(0, 200), por = String((req.body || {}).por || '').trim().slice(0, 80);
+    if (!usuario || !clave) return res.status(400).send(paginaP('Escriba usuario y clave.'));
+    PC.credenciales = { usuario, clave, en: Date.now() };
+    console.log(`[chattigo] reconexión pedida por ${por || 'alguien del equipo'} (usuario ${usuario})`); // la clave nunca se registra
+    await avisarTeams({ titulo: '🔑 Reconexión en curso', texto: `${por || 'Alguien del equipo'} envió los datos de acceso. Daniela está intentando entrar a Chattigo…` });
+    res.send(paginaP('<div class="ok">✅ Listo. Daniela está entrando a Chattigo; en menos de un minuto debe llegar "✅ Daniela está en línea otra vez" al grupo de Teams.</div>'));
+  });
+  // Sin latido: el PC se apagó, se quedó sin internet o cerraron Chrome.
+  setInterval(async () => {
+    if (!PC.id || !PC.ultimo || PC.ensayo || PC.estado === 'apagado') return;
+    const h = horaBogota();
+    if (h < '07:00' || h > '19:55') return;
+    if (Date.now() - PC.ultimo > 6 * 60e3 && Date.now() - PC.avisoCaida > 60 * 60e3) {
+      PC.avisoCaida = Date.now();
+      await avisarTeams({ titulo: '⚠️ El PC de Daniela no responde', texto: `Hace ${Math.round((Date.now() - PC.ultimo) / 60e3)} min no tengo señal del PC de Daniela (apagado, suspendido, sin internet o Chrome cerrado). Revísenlo y abran Chattigo; si pide iniciar sesión, llegará el enlace para reconectar.` });
+    }
+  }, 60e3);
+
   const firmaE = () => crypto.createHmac('sha256', SECRETO_P()).update('encargos').digest('base64url').slice(0, 24);
   // Publica en Teams la tarjeta con el botón "Encargar a Daniela" (se ancla en el grupo). Lo dispara el panel 🤖 de la extensión.
   app.post('/api/chattigo/encargos/anclar', async (req, res) => {

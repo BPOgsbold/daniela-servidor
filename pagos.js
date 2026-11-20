@@ -28,6 +28,10 @@ async function registrarPago({ cedula, nombre, telefono, canal, cargado_por, arc
   } catch (e) { console.error('[pagos] registrarPago:', e.message); }
 }
 
+const inicioMesAnterior = (fecha) => { const d = new Date(fecha.slice(0, 7) + '-01T12:00:00Z'); d.setUTCMonth(d.getUTCMonth() - 1); return d.toISOString().slice(0, 10); };
+const sumarDias = (fecha, n) => { const d = new Date(fecha + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+const diasDelMes = (fecha) => new Date(Date.UTC(+fecha.slice(0, 4), +fecha.slice(5, 7), 0)).getUTCDate();
+
 // Soportes de pago que están en SharePoint con fecha de hoy (subidos por Daniela antes de que existiera el registro, o a mano).
 let cacheSP = { fecha: null, t: 0, lista: [] };
 async function pagosSharePoint(fecha) {
@@ -44,12 +48,13 @@ async function pagosSharePoint(fecha) {
         const r = await sp.listarDocumentosDeCarpeta(String(c.id));
         for (const a of (r && r.archivos) || []) {
           if (!/pago/i.test(String(a.tipo || '') + ' ' + String(a.nombre || '')) || /upme/i.test(String(a.nombre || ''))) continue;
-          const dia = a.modificado ? fechaBog(new Date(a.modificado)) : '';
-          if (dia !== fecha && !String(a.nombre || '').includes(fecha)) continue;
+          const enNombre = (String(a.nombre || '').match(/(\d{4}-\d{2}-\d{2})/) || [])[1];
+          const dia = enNombre || (a.modificado ? fechaBog(new Date(a.modificado)) : '');
+          if (!dia || dia < inicioMesAnterior(fecha) || dia > fecha) continue;
           const nomCarpeta = String(c.nombre || (r && r.carpeta) || '');
           const m = nomCarpeta.match(/^(\d{5,12})\s*-\s*(.+)$/);
-          lista.push({ cedula: m ? m[1] : '', nombre: m ? m[2].trim() : nomCarpeta, canal: 'SharePoint', cargado_por: '—', archivo: a.nombre,
-            link: (r && r.webUrl) || null, creado_en: a.modificado || new Date(fecha + 'T12:00:00-05:00').toISOString() });
+          lista.push({ cedula: m ? m[1] : '', nombre: m ? m[2].trim() : nomCarpeta, canal: 'SharePoint', cargado_por: '—', archivo: a.nombre, dia,
+            link: (r && r.webUrl) || null, creado_en: a.modificado && fechaBog(new Date(a.modificado)) === dia ? a.modificado : new Date(dia + 'T12:00:00-05:00').toISOString() });
         }
       } catch (_) { /* una carpeta con problema no detiene el informe */ }
     }
@@ -60,19 +65,37 @@ async function pagosSharePoint(fecha) {
 }
 
 async function datosInforme(fecha) {
-  const { desde, hasta } = rangoDia(fecha);
-  const { data: registrados } = await sb().from('pagos_cargados').select('*').gte('creado_en', desde).lte('creado_en', hasta).order('creado_en', { ascending: true });
-  // Se suman los soportes de pago de hoy que están en SharePoint y no quedaron en el registro (misma cédula = mismo pago).
+  const { hasta } = rangoDia(fecha);
+  const desdeHist = new Date(inicioMesAnterior(fecha) + 'T00:00:00-05:00').toISOString();
+  const { data: registrados } = await sb().from('pagos_cargados').select('*').gte('creado_en', desdeHist).lte('creado_en', hasta).order('creado_en', { ascending: true }).limit(5000);
   let deSP = [];
   try { deSP = await pagosSharePoint(fecha); } catch (e) { console.error('[pagos] SharePoint:', e.message); }
-  const ya = new Set((registrados || []).map((p) => digitos(p.cedula)));
-  const vistosSP = new Set();
-  const extra = deSP.filter((p) => { const k = digitos(p.cedula) || p.archivo; if (ya.has(digitos(p.cedula)) || vistosSP.has(k)) return false; vistosSP.add(k); return true; });
-  const pagos = [...(registrados || []), ...extra].sort((a, b) => String(a.creado_en).localeCompare(String(b.creado_en)));
-  // Mes en curso (para contexto)
-  const inicioMes = new Date(fecha.slice(0, 7) + '-01T00:00:00-05:00').toISOString();
-  const { count: mesReg } = await sb().from('pagos_cargados').select('id', { count: 'exact', head: true }).gte('creado_en', inicioMes).lte('creado_en', hasta);
-  const mes = (mesReg || 0) + extra.length;
+  // Un pago = una cédula en un día (si está en el registro y en SharePoint, se cuenta una vez; manda el registro).
+  const porDia = {};
+  const claves = new Set();
+  const sumar = (p, dia) => { const k = dia + '|' + (digitos(p.cedula) || p.archivo); if (claves.has(k)) return; claves.add(k); (porDia[dia] = porDia[dia] || []).push(p); };
+  (registrados || []).forEach((p) => sumar(p, fechaBog(new Date(p.creado_en))));
+  deSP.forEach((p) => sumar(p, p.dia));
+  const pagos = (porDia[fecha] || []).slice().sort((a, b) => String(a.creado_en).localeCompare(String(b.creado_en)));
+  const contar = (desde, hastaDia) => Object.entries(porDia).filter(([d]) => d >= desde && d <= hastaDia).reduce((n, [, l]) => n + l.length, 0);
+  // Semana (lunes a hoy) vs. el mismo tramo de la semana pasada; mes al corte vs. el mismo corte del mes pasado.
+  const dow = (new Date(fecha + 'T12:00:00Z').getUTCDay() + 6) % 7; // 0 = lunes
+  const lunes = sumarDias(fecha, -dow);
+  const semana = contar(lunes, fecha), semanaAnt = contar(sumarDias(lunes, -7), sumarDias(fecha, -7));
+  const inicioMes = fecha.slice(0, 7) + '-01';
+  const mesAnt0 = inicioMesAnterior(fecha);
+  const diaN = +fecha.slice(8, 10);
+  const corteAnt = mesAnt0.slice(0, 8) + String(Math.min(diaN, diasDelMes(mesAnt0))).padStart(2, '0');
+  const mes = contar(inicioMes, fecha), mesAntCorte = contar(mesAnt0, corteAnt), mesAntTotal = contar(mesAnt0, sumarDias(inicioMes, -1));
+  const promedio = diaN ? mes / diaN : 0;
+  const proyeccion = Math.round(promedio * diasDelMes(fecha));
+  const serie = Array.from({ length: diaN }, (_, k) => { const d = inicioMes.slice(0, 8) + String(k + 1).padStart(2, '0'); return { dia: d, n: (porDia[d] || []).length }; });
+  const canalesMes = {}, quienMes = {};
+  Object.entries(porDia).filter(([d]) => d >= inicioMes && d <= fecha).forEach(([, l]) => l.forEach((p) => {
+    canalesMes[p.canal || 'Otro'] = (canalesMes[p.canal || 'Otro'] || 0) + 1;
+    if (p.cargado_por && p.cargado_por !== '—') quienMes[p.cargado_por] = (quienMes[p.cargado_por] || 0) + 1;
+  }));
+  const tendencia = { semana, semanaAnt, mes, mesAntCorte, mesAntTotal, promedio, proyeccion, serie, canalesMes, quienMes, mejorDia: serie.reduce((m, x) => (x.n > (m ? m.n : -1) ? x : m), null) };
   // Pendientes de pago: contrato FIRMADO, el caso no está en "Cliente" ni "Cierre perdido" y no hay pago cargado de esa cédula.
   const hace60 = new Date(Date.now() - 60 * 864e5).toISOString();
   const { data: firmas } = await sb().from('firmas_contrato').select('*').eq('estado', 'firmado').gte('firmado_en', hace60).order('firmado_en', { ascending: true }).limit(500);
@@ -88,7 +111,7 @@ async function datosInforme(fecha) {
     const { data } = await sb().from('pagos_cargados').select('cedula').in('cedula', cedulas.slice(i, i + 100));
     (data || []).forEach((r) => pagadas.add(r.cedula));
   }
-  pagos.forEach((p) => pagadas.add(digitos(p.cedula)));
+  Object.values(porDia).forEach((l) => l.forEach((p) => pagadas.add(digitos(p.cedula))));
   const vistos = new Set();
   const pendientes = [];
   for (const f of firmas || []) {
@@ -101,10 +124,35 @@ async function datosInforme(fecha) {
       asesor: (caso && caso.asesor) || '', firmado: f.firmado_en, dias: Math.floor((Date.now() - new Date(f.firmado_en).getTime()) / 864e5) });
   }
   pendientes.sort((a, b) => b.dias - a.dias);
-  return { fecha, pagos, mes: mes || 0, pendientes };
+  return { fecha, pagos, mes, pendientes, tendencia };
 }
 
-function htmlInforme({ fecha, pagos, mes, pendientes }) {
+function htmlTendencia(fecha, t) {
+  if (!t) return '';
+  const nombreMes = new Intl.DateTimeFormat('es-CO', { month: 'long', timeZone: 'UTC' }).format(new Date(fecha + 'T12:00:00Z'));
+  const var_ = (a, b) => { if (!b) return a ? '<span style="color:#17663b">▲ nuevo</span>' : '<span style="color:#8a979f">= sin datos previos</span>';
+    const p = Math.round((a - b) * 100 / b); return p > 0 ? `<span style="color:#17663b">▲ ${p}%</span>` : p < 0 ? `<span style="color:#9b1c13">▼ ${Math.abs(p)}%</span>` : '<span style="color:#8a979f">= igual</span>'; };
+  const caja = (n, t1, t2) => `<td style="padding:6px;width:25%"><div style="background:#fbfaf6;border:1px solid #e1dac5;border-radius:10px;padding:12px 14px">
+    <div style="font-size:24px;font-weight:800;color:#0b1f3a;line-height:1">${n}</div><div style="font-size:12px;color:#5b6b78;margin-top:6px">${t1}</div><div style="font-size:12px;margin-top:4px">${t2}</div></div></td>`;
+  const max = Math.max(1, ...t.serie.map((x) => x.n));
+  const barras = t.serie.map((x) => { const h = Math.round((x.n / max) * 90); const hoy = x.dia === fecha;
+    return `<td valign="bottom" align="center" style="padding:0 1px;font-size:9px;color:#5b6b78">${x.n ? `<div style="font-size:10px;color:#0b1f3a;font-weight:700">${x.n}</div>` : ''}
+      <div style="width:100%;min-width:8px;height:${Math.max(h, 2)}px;background:${hoy ? '#b6912f' : x.n ? '#1f5c4d' : '#e1dac5'};border-radius:3px 3px 0 0"></div><div>${+x.dia.slice(8)}</div></td>`; }).join('');
+  const lista = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<b>${esc(k)}</b> ${v}`).join(' · ');
+  return `<h3 style="margin:24px 6px 8px;font-size:16px;color:#0b1f3a">📈 Tendencia y consolidado de ${esc(nombreMes)}</h3>
+    <table style="width:100%;border-collapse:separate"><tr>
+      ${caja(t.semana, 'Esta semana (lun. a hoy)', var_(t.semana, t.semanaAnt) + ' <span style="color:#8a979f">vs. ' + t.semanaAnt + ' sem. pasada</span>')}
+      ${caja(t.mes, 'En el mes al corte', var_(t.mes, t.mesAntCorte) + ' <span style="color:#8a979f">vs. ' + t.mesAntCorte + ' mes pasado</span>')}
+      ${caja(t.promedio.toFixed(1), 'Promedio por día', '<span style="color:#8a979f">mejor día: ' + (t.mejorDia && t.mejorDia.n ? +t.mejorDia.dia.slice(8) + ' (' + t.mejorDia.n + ')' : '—') + '</span>')}
+      ${caja(t.proyeccion, 'Proyección cierre de mes', '<span style="color:#8a979f">mes pasado cerró en ' + t.mesAntTotal + '</span>')}
+    </tr></table>
+    <div style="margin:10px 6px 0;font-size:12px;color:#5b6b78">Pagos por día de ${esc(nombreMes)} (en dorado, hoy):</div>
+    <table style="width:100%;border-collapse:collapse;margin:6px 0 4px;height:120px"><tr>${barras}</tr></table>
+    ${Object.keys(t.canalesMes).length ? `<p style="font-size:13px;color:#5b6b78;margin:10px 6px 2px">En el mes por canal: ${lista(t.canalesMes)}</p>` : ''}
+    ${Object.keys(t.quienMes).length ? `<p style="font-size:13px;color:#5b6b78;margin:2px 6px">En el mes por quién cargó: ${lista(t.quienMes)}</p>` : ''}`;
+}
+
+function htmlInforme({ fecha, pagos, mes, pendientes, tendencia }) {
   const porCanal = {};
   pagos.forEach((p) => { const k = p.canal || 'Otro'; porCanal[k] = (porCanal[k] || 0) + 1; });
   const fechaLarga = new Intl.DateTimeFormat('es-CO', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' }).format(new Date(fecha + 'T12:00:00Z'));
@@ -124,16 +172,17 @@ function htmlInforme({ fecha, pagos, mes, pendientes }) {
     <div style="font-size:22px;font-weight:800;color:#fff;margin-top:6px">Pagos cargados hoy</div>
     <div style="font-size:13px;margin-top:4px">${esc(fechaLarga.charAt(0).toUpperCase() + fechaLarga.slice(1))} · corte ${esc(HORA_ENVIO())}</div></div>
    <div style="background:#fff;border-radius:0 0 14px 14px;padding:18px 18px 24px">
-    <table style="width:100%;border-collapse:separate"><tr>${kpi(pagos.length, 'Pagos cargados hoy', '#1f5c4d')}${kpi(mes, 'Pagos en el mes', '#b6912f')}${kpi(pendientes.length, 'Firmados sin pago', pendientes.length ? '#c0392b' : '#1f5c4d')}</tr></table>
+    <table style="width:100%;border-collapse:separate"><tr>${kpi(pagos.length, 'Pagos cargados hoy', '#1f5c4d')}${kpi(tendencia ? tendencia.semana : 0, 'Pagos esta semana', '#1c3a63')}${kpi(mes, 'Pagos en el mes', '#b6912f')}${kpi(pendientes.length, 'Firmados sin pago', pendientes.length ? '#c0392b' : '#1f5c4d')}</tr></table>
     ${Object.keys(porCanal).length ? `<p style="font-size:13px;color:#5b6b78;margin:10px 6px">Por canal: ${Object.entries(porCanal).map(([k, v]) => `<b>${esc(k)}</b> ${v}`).join(' · ')}</p>` : ''}
     <h3 style="margin:18px 6px 8px;font-size:16px;color:#0b1f3a">✅ Pagos cargados hoy (${pagos.length})</h3>
     ${pagos.length ? `<table style="width:100%;border-collapse:collapse;font-size:13px"><tr>${th('Hora')}${th('Cliente')}${th('Cédula/NIT')}${th('Canal')}${th('Cargado por')}${th('Soporte')}</tr>${pagos.map(filaPago).join('')}</table>`
       : '<p style="margin:6px;color:#5b6b78">Hoy no se cargaron soportes de pago.</p>'}
+    ${htmlTendencia(fecha, tendencia)}
     <h3 style="margin:22px 6px 8px;font-size:16px;color:#0b1f3a">⏳ Pendientes de pago: contrato firmado, sin soporte (${pendientes.length})</h3>
     ${pendientes.length ? `<table style="width:100%;border-collapse:collapse;font-size:13px"><tr>${th('Cliente')}${th('Cédula/NIT')}${th('Celular')}${th('Asesor')}${th('Firmó hace')}</tr>${pendientes.map(filaPend).join('')}</table>
       <p style="font-size:12px;color:#5b6b78;margin:8px 6px">En rojo: 3 días o más desde la firma. Sugerencia: llamarlos o pedirle a Daniela un seguimiento (botón "Encargar a Daniela").</p>`
       : '<p style="margin:6px;color:#5b6b78">No hay clientes con contrato firmado pendientes de pago. 🎉</p>'}
-    <p style="font-size:11px;color:#8a979f;margin:20px 6px 0">Incluye los soportes de pago cargados por Daniela (asistente del panel, WhatsApp y Chattigo) y los soportes de pago con fecha de hoy que están en las carpetas de SharePoint (canal "SharePoint").</p>
+    <p style="font-size:11px;color:#8a979f;margin:20px 6px 0">Incluye los soportes de pago cargados por Daniela (asistente del panel, WhatsApp y Chattigo) y los soportes de pago que están en las carpetas de SharePoint (canal "SharePoint"; la tendencia los toma desde el mes anterior). Un pago = una cédula por día.</p>
    </div></div></div>`;
 }
 
@@ -148,7 +197,7 @@ async function enviarInforme({ fecha = fechaBog(), para, forzar = false } = {}) 
   const destinatarios = para || String(process.env.INFORME_PAGOS_PARA || '').split(/[;,]/).map((x) => x.trim()).filter(Boolean);
   const lista = destinatarios.length ? destinatarios : PARA_DEFECTO;
   try {
-    await sp.enviarCorreo({ remitente: REMITENTE(), destinatarios: lista, asunto: `📊 Pagos cargados hoy: ${d.pagos.length} · pendientes de pago: ${d.pendientes.length} (${fecha})`, html: htmlInforme(d), adjuntos: [] });
+    await sp.enviarCorreo({ remitente: REMITENTE(), destinatarios: lista, asunto: `📊 Pagos hoy: ${d.pagos.length} · semana: ${d.tendencia.semana} · mes: ${d.tendencia.mes} · pendientes: ${d.pendientes.length} (${fecha})`, html: htmlInforme(d), adjuntos: [] });
   } catch (e) {
     if (!forzar) await sb().from('informes_diarios').delete().eq('tipo', 'pagos').eq('fecha', fecha); // se reintenta en el siguiente minuto
     throw e;

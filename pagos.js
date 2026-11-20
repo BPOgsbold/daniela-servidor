@@ -28,12 +28,51 @@ async function registrarPago({ cedula, nombre, telefono, canal, cargado_por, arc
   } catch (e) { console.error('[pagos] registrarPago:', e.message); }
 }
 
+// Soportes de pago que están en SharePoint con fecha de hoy (subidos por Daniela antes de que existiera el registro, o a mano).
+let cacheSP = { fecha: null, t: 0, lista: [] };
+async function pagosSharePoint(fecha) {
+  if (cacheSP.fecha === fecha && Date.now() - cacheSP.t < 10 * 60e3) return cacheSP.lista;
+  const sp = require('./sharepoint');
+  if (!sp.configurado || !sp.configurado()) return [];
+  const carpetas = (await sp.listarCarpetasClientes()) || [];
+  const lista = [];
+  let i = 0;
+  const trabajar = async () => {
+    while (i < carpetas.length) {
+      const c = carpetas[i++];
+      try {
+        const r = await sp.listarDocumentosDeCarpeta(String(c.id));
+        for (const a of (r && r.archivos) || []) {
+          if (!/pago/i.test(String(a.tipo || '') + ' ' + String(a.nombre || '')) || /upme/i.test(String(a.nombre || ''))) continue;
+          const dia = a.modificado ? fechaBog(new Date(a.modificado)) : '';
+          if (dia !== fecha && !String(a.nombre || '').includes(fecha)) continue;
+          const nomCarpeta = String(c.nombre || (r && r.carpeta) || '');
+          const m = nomCarpeta.match(/^(\d{5,12})\s*-\s*(.+)$/);
+          lista.push({ cedula: m ? m[1] : '', nombre: m ? m[2].trim() : nomCarpeta, canal: 'SharePoint', cargado_por: '—', archivo: a.nombre,
+            link: (r && r.webUrl) || null, creado_en: a.modificado || new Date(fecha + 'T12:00:00-05:00').toISOString() });
+        }
+      } catch (_) { /* una carpeta con problema no detiene el informe */ }
+    }
+  };
+  await Promise.all(Array.from({ length: 6 }, trabajar));
+  cacheSP = { fecha, t: Date.now(), lista };
+  return lista;
+}
+
 async function datosInforme(fecha) {
   const { desde, hasta } = rangoDia(fecha);
-  const { data: pagos } = await sb().from('pagos_cargados').select('*').gte('creado_en', desde).lte('creado_en', hasta).order('creado_en', { ascending: true });
+  const { data: registrados } = await sb().from('pagos_cargados').select('*').gte('creado_en', desde).lte('creado_en', hasta).order('creado_en', { ascending: true });
+  // Se suman los soportes de pago de hoy que están en SharePoint y no quedaron en el registro (misma cédula = mismo pago).
+  let deSP = [];
+  try { deSP = await pagosSharePoint(fecha); } catch (e) { console.error('[pagos] SharePoint:', e.message); }
+  const ya = new Set((registrados || []).map((p) => digitos(p.cedula)));
+  const vistosSP = new Set();
+  const extra = deSP.filter((p) => { const k = digitos(p.cedula) || p.archivo; if (ya.has(digitos(p.cedula)) || vistosSP.has(k)) return false; vistosSP.add(k); return true; });
+  const pagos = [...(registrados || []), ...extra].sort((a, b) => String(a.creado_en).localeCompare(String(b.creado_en)));
   // Mes en curso (para contexto)
   const inicioMes = new Date(fecha.slice(0, 7) + '-01T00:00:00-05:00').toISOString();
-  const { count: mes } = await sb().from('pagos_cargados').select('id', { count: 'exact', head: true }).gte('creado_en', inicioMes).lte('creado_en', hasta);
+  const { count: mesReg } = await sb().from('pagos_cargados').select('id', { count: 'exact', head: true }).gte('creado_en', inicioMes).lte('creado_en', hasta);
+  const mes = (mesReg || 0) + extra.length;
   // Pendientes de pago: contrato FIRMADO, el caso no está en "Cliente" ni "Cierre perdido" y no hay pago cargado de esa cédula.
   const hace60 = new Date(Date.now() - 60 * 864e5).toISOString();
   const { data: firmas } = await sb().from('firmas_contrato').select('*').eq('estado', 'firmado').gte('firmado_en', hace60).order('firmado_en', { ascending: true }).limit(500);
@@ -49,6 +88,7 @@ async function datosInforme(fecha) {
     const { data } = await sb().from('pagos_cargados').select('cedula').in('cedula', cedulas.slice(i, i + 100));
     (data || []).forEach((r) => pagadas.add(r.cedula));
   }
+  pagos.forEach((p) => pagadas.add(digitos(p.cedula)));
   const vistos = new Set();
   const pendientes = [];
   for (const f of firmas || []) {
@@ -61,7 +101,7 @@ async function datosInforme(fecha) {
       asesor: (caso && caso.asesor) || '', firmado: f.firmado_en, dias: Math.floor((Date.now() - new Date(f.firmado_en).getTime()) / 864e5) });
   }
   pendientes.sort((a, b) => b.dias - a.dias);
-  return { fecha, pagos: pagos || [], mes: mes || 0, pendientes };
+  return { fecha, pagos, mes: mes || 0, pendientes };
 }
 
 function htmlInforme({ fecha, pagos, mes, pendientes }) {
@@ -93,7 +133,7 @@ function htmlInforme({ fecha, pagos, mes, pendientes }) {
     ${pendientes.length ? `<table style="width:100%;border-collapse:collapse;font-size:13px"><tr>${th('Cliente')}${th('Cédula/NIT')}${th('Celular')}${th('Asesor')}${th('Firmó hace')}</tr>${pendientes.map(filaPend).join('')}</table>
       <p style="font-size:12px;color:#5b6b78;margin:8px 6px">En rojo: 3 días o más desde la firma. Sugerencia: llamarlos o pedirle a Daniela un seguimiento (botón "Encargar a Daniela").</p>`
       : '<p style="margin:6px;color:#5b6b78">No hay clientes con contrato firmado pendientes de pago. 🎉</p>'}
-    <p style="font-size:11px;color:#8a979f;margin:20px 6px 0">Incluye los soportes de pago cargados por Daniela (asistente del panel, WhatsApp y Chattigo). Los archivos subidos a mano directo en SharePoint no se cuentan.</p>
+    <p style="font-size:11px;color:#8a979f;margin:20px 6px 0">Incluye los soportes de pago cargados por Daniela (asistente del panel, WhatsApp y Chattigo) y los soportes de pago con fecha de hoy que están en las carpetas de SharePoint (canal "SharePoint").</p>
    </div></div></div>`;
 }
 

@@ -9,6 +9,7 @@ const path = require('path');
 const crypto = require('crypto');
 const express_urlencoded = require('express').urlencoded({ extended: false, limit: '50kb' });
 const { sincronizarTodo } = require('./wasapi_caso');
+const T = require('./terminos');
 const { llamarClaude, parsearJSON, limpiarTexto, tarifaUpme } = require('./wasapi').ia;
 
 const GUIA = fs.readFileSync(path.join(__dirname, 'prompt_chattigo.md'), 'utf8');
@@ -33,6 +34,7 @@ FORMA DE TRABAJO EN ESTA HERRAMIENTA (manda sobre la guía cuando hablen de lo m
 - En "nota_equipo" escribe directo la pregunta (sin saludos ni firmas ni marcadores como [nombre bot]); incluye nombre y celular del cliente solo si salen de la conversación del CLIENTE o de la ficha.
 - Si el chat no es del beneficio tributario (cita médica, técnico-mecánica, arrendamiento), accion = "no_atender".
 - Si algo requiere aprobación del equipo o no está en la guía, accion = "preguntar_grupo", escribe en "nota_equipo" la pregunta para el grupo de Teams "GLA Novedades atención" y en "respuesta" un mensaje que no afirme nada sobre ese punto.
+- TÉRMINOS Y CONDICIONES (SURA, reemplazan el contrato): cuando el cliente ya conoce el servicio y quiere avanzar (o sus documentos están en orden) y la ficha dice que AÚN NO se le enviaron los términos, pon "enviar_terminos" con el servicio que le corresponde: "completo" (UPME + DIAN, $714.000), "solo_dian" (ya tiene certificado UPME, $357.000) o "cita_dian" (solo la cita DIAN, $297.500), y en "respuesta" UNA frase corta presentándolos (el sistema envía el texto completo justo después; tú NO lo redactes ni lo resumas). Los términos ya incluyen la cuenta de pago. Si ya se enviaron y el cliente no los ha aceptado, recuérdale con amabilidad que para avanzar responda "ACEPTO los términos y condiciones", su nombre completo y su cédula (no los reenvíes salvo que lo pida). Si ya los aceptó, agradécele y pídele el soporte de pago de los honorarios.
 - PAGO SIN ESPERAS: en cuanto los documentos estén en orden y el cliente quiera avanzar, en ESE MISMO mensaje pide la certificación bancaria (vigencia inferior a 30 días, cuenta a su nombre, no bancos digitales como Nu o Lulo) Y compártele de una vez los datos de pago de los honorarios, tal cual la sección 6 de la guía: cuenta de ahorros Bancolombia 43600005898, a nombre de GOMEZ LEGAL ABOGADOS, NIT 901964467-0, o la llave @gomezlegalabogad. Recuérdale el valor de los honorarios que ya se le informó y pídele que envíe el soporte de pago por este mismo chat para iniciar de inmediato ante la UPME. Nunca digas "cuando nos envíe X le enviaremos los datos de pago". Si ya se le dieron (medios_pago_informados = true), no los repitas completos: recuérdale amablemente el pago y el soporte. Marca "medios_pago_informados": true en el perfil cuando los compartas.
 - Si factura, RUT vigente y cédula están completos y cuadran, NO preguntes al grupo si puedes proceder: procede (datos de pago + certificación bancaria + transferir_cierre). Con accion "preguntar_grupo", "respuesta" NUNCA va vacía: siempre un mensaje breve de acompañamiento para el cliente.
 - Revisa TODO el historial (también lo que se habló antes de transferencias) y todo lo leído en los documentos (ficha y notas) antes de decidir: no vuelvas a pedir algo que el cliente ya envió.
@@ -41,7 +43,7 @@ FORMA DE TRABAJO EN ESTA HERRAMIENTA (manda sobre la guía cuando hablen de lo m
 - Si un archivo no se puede leer, usa la respuesta fija de la guía y accion = "preguntar_grupo".
 
 RESPONDE SOLO con un JSON válido (sin texto alrededor):
-{"respuesta":"mensaje sugerido para el cliente o vacío","accion":"responder|preguntar_grupo|transferir_cierre|no_atender","nota_equipo":"texto para el grupo de Teams o null","alertas":["empresa","dos_propietarios","rut_vencido","iva_19","leasing","otro..."],"faltan":["lo que falta del expediente"],"archivos_tipos":[],"datos_archivos":"resumen breve de lo leído en los archivos nuevos o null","encargo_cumplido":"solo si hay TAREA ENCARGADA de tipo seguimiento: true si lo que se buscaba ya se cumplió (el cliente respondió, envió lo pedido o pagó), si no false","resumen_cierre":"solo si accion = transferir_cierre: resumen consolidado para la asesora de cierre (nombre completo, cédula/NIT, vehículo, fecha de factura, valor sin IVA, IVA, titular de la factura, RUT vigente sí/no, documentos recibidos, servicio que quiere, alertas) o null","perfil":{"nombre":null,"nombre_completo":null,"cedula":null,"correo":null,"marca_modelo":null,"tipo_vehiculo":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"medios_pago_informados":null,"documentos_recibidos":[],"pago_honorarios_recibido":null,"dos_propietarios":null,"notas":null}}
+{"respuesta":"mensaje sugerido para el cliente o vacío","accion":"responder|preguntar_grupo|transferir_cierre|no_atender","nota_equipo":"texto para el grupo de Teams o null","alertas":["empresa","dos_propietarios","rut_vencido","iva_19","leasing","otro..."],"faltan":["lo que falta del expediente"],"archivos_tipos":[],"datos_archivos":"resumen breve de lo leído en los archivos nuevos o null","enviar_terminos":"completo|solo_dian|cita_dian o null (solo si hay que enviar ahora los términos)","encargo_cumplido":"solo si hay TAREA ENCARGADA de tipo seguimiento: true si lo que se buscaba ya se cumplió (el cliente respondió, envió lo pedido o pagó), si no false","resumen_cierre":"solo si accion = transferir_cierre: resumen consolidado para la asesora de cierre (nombre completo, cédula/NIT, vehículo, fecha de factura, valor sin IVA, IVA, titular de la factura, RUT vigente sí/no, documentos recibidos, servicio que quiere, alertas) o null","perfil":{"nombre":null,"nombre_completo":null,"cedula":null,"correo":null,"marca_modelo":null,"tipo_vehiculo":null,"fecha_compra":null,"titular_factura":null,"tiene_certificado_upme":null,"ciudad":null,"valor_sin_iva":null,"interesado":null,"precio_informado":null,"acepta_avanzar":null,"medios_pago_informados":null,"documentos_recibidos":[],"pago_honorarios_recibido":null,"dos_propietarios":null,"notas":null}}
 En "perfil" pon solo lo que sepas (se conserva lo anterior). "cedula": solo números (si la factura es de empresa, el NIT sin dígito de verificación). "fecha_compra" en formato AAAA-MM-DD si la sabes. "archivos_tipos": un tipo por cada ARCHIVO NUEVO adjunto en este mensaje, en el mismo orden: "factura", "rut", "cedula", "certificacion_bancaria", "certificado_upme", "soporte_pago" u "otro".`;
 
 // Modo autónomo: Daniela envía ella misma (PC dedicado con la extensión v2.3).
@@ -164,6 +166,30 @@ Y cuéntenos:
 👥 Si el vehículo está a nombre de más de una persona, o si tiene más de un vehículo eléctrico o híbrido.
 
 Al enviarnos sus documentos, nos autoriza a tratar sus datos personales solo para gestionar este trámite, conforme a la Ley 1581 de 2012 y a nuestra política de tratamiento de datos, que podrá consultar en www.gomezlegalabogados.co`;
+
+const nrmTxt = (mensajes) => String(((mensajes || []).filter((m) => m.rol === 'cliente').slice(-2).map((m) => m.texto).join(' ')) || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+
+// Registro de términos SURA (tabla terminos_sura + historial del caso + aviso en Teams al aceptar).
+async function casoPorTelefono(sb, tel) {
+  if (!tel || tel.length !== 10) return null;
+  try { const { data } = await sb.from('Perfilamiento_y_ventas_GLA').select('id,nombre_cliente,numero_identificacion').eq('telefono', tel).order('created_at', { ascending: false }).limit(1); return (data || [])[0] || null; } catch (_) { return null; }
+}
+async function registrarEnvioTerminos(sb, { tel, nombre, servicio, por, canal }) {
+  const caso = await casoPorTelefono(sb, tel);
+  const { error } = await sb.from('terminos_sura').insert({ telefono: tel ? '57' + tel : null, nombre: nombre || (caso && caso.nombre_cliente) || null, cedula: (caso && caso.numero_identificacion) || null,
+    caso_id: caso ? String(caso.id) : null, servicio, enviado_por: por || null, canal: canal || 'Chattigo' });
+  if (error) console.error('terminos_sura (¿falta terminos_sura.sql?):', error.message);
+  if (caso) await sb.from('panel_historial').insert({ caso_id: caso.id, campo: 'terminos_sura', valor_anterior: null, valor_nuevo: 'Términos y condiciones enviados: ' + T.NOMBRES[servicio], usuario_email: por || 'Daniela (Chattigo)' }).then(() => {}, () => {});
+}
+async function registrarAceptacion(sb, { perfil, tel, nombre, ac, ensayo }) {
+  if (ensayo || tel.length !== 10) return;
+  const caso = await casoPorTelefono(sb, tel);
+  const { data: ult } = await sb.from('terminos_sura').select('id').eq('telefono', '57' + tel).is('aceptado_en', null).order('enviado_en', { ascending: false }).limit(1);
+  if (ult && ult[0]) await sb.from('terminos_sura').update({ aceptado_en: perfil._terminos.aceptado_en, aceptado_texto: ac.texto, aceptado_cedula: ac.cedula }).eq('id', ult[0].id);
+  if (caso) await sb.from('panel_historial').insert({ caso_id: caso.id, campo: 'terminos_sura', valor_anterior: 'Términos enviados', valor_nuevo: 'Términos ACEPTADOS por el cliente (' + T.NOMBRES[perfil._terminos.servicio] + '): "' + ac.texto.slice(0, 200) + '"', usuario_email: 'cliente (mensaje de datos, Ley 527)' }).then(() => {}, () => {});
+  await avisarTeams({ titulo: '✍️ Cliente aceptó los términos y condiciones', nombre: perfil.nombre_completo || perfil.nombre || nombre, telefono: '57' + tel,
+    texto: T.NOMBRES[perfil._terminos.servicio] + '\nRespuesta del cliente: "' + ac.texto.slice(0, 300) + '"' + (ac.cedula ? '\nCédula indicada: ' + ac.cedula : '') + '\nSigue: soporte de pago de los honorarios.' });
+}
 
 function fichaVisible(p) { const o = {}; for (const [k, v] of Object.entries(p || {})) if (!k.startsWith('_')) o[k] = v; return o; }
 
@@ -312,6 +338,26 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
     res.json({ ok: true });
   });
 
+  // ---------- Términos SURA: textos (para el botón Copiar del copiloto) y registro del envío
+  app.get('/api/terminos/textos', (req, res) => res.json({ textos: T.TEXTOS, partes: T.PARTES, nombres: T.NOMBRES }));
+  app.post('/api/terminos/enviado', async (req, res) => {
+    if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
+    const { telefono, nombre, servicio, por, canal, ensayo } = req.body || {};
+    if (!T.VALIDOS.includes(servicio)) return res.status(400).json({ error: 'Servicio no válido.' });
+    const tel = digitos(telefono).slice(-10);
+    if (ensayo) return res.json({ ok: true, ensayo: true });
+    const sb = sbServicio();
+    if (tel.length === 10) {
+      const clave = 'chattigo-57' + tel;
+      const { data: fila } = await sb.from('wasapi_conversaciones').select('perfil').eq('wa_id', clave).maybeSingle();
+      const perfil = Object.assign({ origen: 'SURA' }, (fila && fila.perfil) || {});
+      perfil._terminos = { servicio, enviado_en: new Date().toISOString(), por: por || null };
+      await sb.from('wasapi_conversaciones').upsert({ wa_id: clave, perfil, estado: 'copiloto', actualizado_en: new Date().toISOString() }, { onConflict: 'wa_id' });
+    }
+    await registrarEnvioTerminos(sb, { tel, nombre, servicio, por, canal });
+    res.json({ ok: true });
+  });
+
   // La extensión pregunta si un chat pausado ya tiene respuesta del equipo.
   app.post('/api/chattigo/pendientes', async (req, res) => {
     if (!tokenOk(req)) return res.status(401).json({ error: 'Token del copiloto no válido.' });
@@ -375,6 +421,7 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
       const t = tarifaUpme(perfil.valor_sin_iva);
       const sistema = GUIA + '\n' + SALIDA + (autonomo ? '\n' + SALIDA_AUTO : '') +
         '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(fichaVisible(perfil)) +
+        '\nTÉRMINOS Y CONDICIONES: ' + (!perfil._terminos ? 'AÚN NO se le han enviado (servicio sugerido: ' + T.NOMBRES[T.servicioSugerido(perfil)] + ').' : perfil._terminos.aceptado_en ? 'ENVIADOS (' + T.NOMBRES[perfil._terminos.servicio] + ') y ACEPTADOS por el cliente el ' + String(perfil._terminos.aceptado_en).slice(0, 16) + '.' : 'ENVIADOS (' + T.NOMBRES[perfil._terminos.servicio] + ') el ' + String(perfil._terminos.enviado_en).slice(0, 16) + ', el cliente AÚN NO los acepta.') +
         (real ? '\n\n' + real : '') +
         (aprend.length ? '\n\nRESPUESTAS RECIENTES DEL EQUIPO A PREGUNTAS DE DANIELA (están aprobadas; úsalas como guía si el caso es igual, sin inventar más allá):\n' + aprend.map((a) => '- P: ' + String(a.pregunta).slice(0, 300) + '\n  R: ' + String(a.respuesta).slice(0, 400)).join('\n') : '') +
         (encargo && encargo.instruccion ? '\n\nTAREA ENCARGADA POR EL EQUIPO PARA ESTE CLIENTE (' + (encargo.tipo === 'seguimiento' ? 'SEGUIMIENTO n.º ' + ((Number(encargo.veces) || 0) + 1) + ': si lo que se busca ya se cumplió según la conversación, deja "respuesta" vacía y pon "encargo_cumplido": true; si no, escribe un recordatorio amable y breve, distinto a los anteriores' : 'hazla AHORA') + '; escríbele al cliente con tus palabras, sin decir que alguien te lo pidió; accion "responder" salvo que la tarea diga transferir o preguntar):\n' + String(encargo.instruccion).slice(0, 1500) : '') +
@@ -411,6 +458,15 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
       if (Array.isArray(j.alertas) && j.alertas.length) perfil.alertas = Array.from(new Set([...(perfil.alertas || []), ...j.alertas.map(String)]));
 
       let accion = ['responder', 'preguntar_grupo', 'transferir_cierre', 'no_atender'].includes(j.accion) ? j.accion : 'responder';
+      // ¿El cliente aceptó los términos? (respuesta "ACEPTO los términos y condiciones", nombre y cédula)
+      if (perfil._terminos && !perfil._terminos.aceptado_en) {
+        const ac = T.buscarAceptacion(mensajes);
+        if (ac) {
+          perfil._terminos.aceptado_en = new Date().toISOString(); perfil._terminos.aceptado_texto = ac.texto; perfil._terminos.aceptado_cedula = ac.cedula;
+          perfil.acepta_avanzar = true;
+          await registrarAceptacion(sb, { perfil, tel, nombre, ac, ensayo });
+        }
+      }
       // Regla fija: expediente completo (factura + RUT + cédula, RUT no vencido) => pasa a cierre y se avisa en Teams.
       const norm = (x) => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
       const docs = new Set([...Object.values(perfil._tipos || {}), ...(perfil._docs || []), ...(Array.isArray(perfil.documentos_recibidos) ? perfil.documentos_recibidos : [])].map(norm));
@@ -419,7 +475,14 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
       const alertasAhora = (perfil.alertas || []).map(norm);
       const BLOQUEAN = ['rut_vencido', 'dos_propietarios', 'leasing', 'iva_19', 'empresa'];
       const notaPrevia = accion === 'preguntar_grupo' ? j.nota_equipo : null;
-      if (completo && ['responder', 'preguntar_grupo'].includes(accion) && !alertasAhora.some((a) => BLOQUEAN.some((b) => a.includes(b)))) {
+      const sinBloqueo = !alertasAhora.some((a) => BLOQUEAN.some((b) => a.includes(b)));
+      const terminosOk = !!(perfil._terminos && perfil._terminos.aceptado_en);
+      // SURA: con el expediente completo, primero los términos y su aceptación; luego pasa a cierre.
+      if (completo && sinBloqueo && !terminosOk && ['responder', 'preguntar_grupo'].includes(accion)) {
+        if (!perfil._terminos && !j.enviar_terminos) j.enviar_terminos = T.servicioSugerido(perfil);
+        if (accion === 'preguntar_grupo' && !perfil._terminos) { accion = 'responder'; j.nota_equipo = null; }
+      }
+      if (completo && terminosOk && ['responder', 'preguntar_grupo'].includes(accion) && sinBloqueo) {
         accion = 'transferir_cierre';
         j.nota_equipo = null;
         if (!j.resumen_cierre) j.resumen_cierre = [perfil.nombre_completo || perfil.nombre, perfil.cedula && 'Cédula/NIT: ' + perfil.cedula, perfil.marca_modelo && 'Vehículo: ' + perfil.marca_modelo,
@@ -437,6 +500,12 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
         j.respuesta = `${nom ? nom + ', r' : 'R'}evisamos sus documentos y todo está en orden. ` + (falta ? 'Para avanzar, por favor compártanos su certificación bancaria con vigencia menor a 30 días, de una cuenta a su nombre. ' : '') + pago + ' Un asesor de nuestro equipo continúa acompañándole en su proceso.';
         perfil.medios_pago_informados = true;
       }
+      let terminos = null;
+      const pedidoT = String(j.enviar_terminos || '').toLowerCase();
+      if (T.VALIDOS.includes(pedidoT) && (!perfil._terminos || /reenv|otra vez|de nuevo|no me lleg/.test(nrmTxt(mensajes)))) {
+        terminos = { servicio: pedidoT, nombre: T.NOMBRES[pedidoT], texto: T.TEXTOS[pedidoT], partes: T.PARTES[pedidoT] };
+        if (!String(j.respuesta || '').trim()) j.respuesta = 'Le comparto los términos y condiciones de su servicio. Para avanzar, respóndanos por aquí con "ACEPTO los términos y condiciones", su nombre completo y su número de cédula.';
+      }
       let transferirA = null;
       // Si el equipo indicó a quién transferir, se respeta; si no, se alterna entre las asesoras de cierre.
       const nrm = (x) => String(x || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
@@ -450,7 +519,7 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
       if (tel.length === 10) {
         const conTipo = todos.map((a) => ({ ...a, tipo: perfil._tipos[a.hash] })).filter((a) => a.tipo);
         await sincronizarTodo({ perfil, waId: '57' + tel, archivos: conTipo, sb, bajarArchivo: null,
-          opciones: { sinContrato: !!ensayo, canal: 'Chattigo', asesor: 'Daniela (Chattigo' + (asesor ? ' · ' + String(asesor).slice(0, 40) : '') + ')', prefijo: 'ct', origen: 'chattigo' } });
+          opciones: { sinContrato: !!ensayo || process.env.CHATTIGO_CONTRATO_AUTO !== '1', canal: 'Chattigo', asesor: 'Daniela (Chattigo' + (asesor ? ' · ' + String(asesor).slice(0, 40) : '') + ')', prefijo: 'ct', origen: 'chattigo' } });
       }
       await sb.from('wasapi_conversaciones').upsert({ wa_id: clave, perfil, estado: 'copiloto', from_id: null, actualizado_en: new Date().toISOString(),
         mensajes: (mensajes || []).slice(-60).map((m) => ({ rol: m.rol === 'cliente' ? 'cliente' : 'agente', texto: String(m.texto || '').slice(0, 2000), hora: m.hora || null })) }, { onConflict: 'wa_id' });
@@ -495,7 +564,8 @@ ${p.respondido_en ? `<div class="ok">Ya respondida por ${escH(p.respondido_por |
         caso = data || null;
       }
       res.json({
-        respuesta: limpiarTexto(String(j.respuesta || '')),
+        respuesta: limpiarTexto(String(j.respuesta || '')), terminos,
+        terminos_estado: !perfil._terminos ? 'pendiente' : perfil._terminos.aceptado_en ? 'aceptados' : 'enviados', terminos_sugerido: T.servicioSugerido(perfil),
         accion, transferir_a: transferirA, nota_equipo: j.nota_equipo || null, encargo_cumplido: j.encargo_cumplido === true, resumen_cierre: j.resumen_cierre || null, aviso_cierre: !!perfil._aviso_cierre,
         alertas: perfil.alertas || [], faltan: Array.isArray(j.faltan) ? j.faltan : [],
         caso, documentos: perfil._docs || [], contrato_pedido: !!perfil._contrato_pedido,

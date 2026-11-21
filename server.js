@@ -3125,7 +3125,8 @@ app.get('/api/sp/enlace', async (req, res) => {
 // ---- Correo "Solicitud cita DIAN" (cuando el cliente pasa de Certificado UPME emitido a Pendiente cita DIAN) ----
 app.post('/api/solicitud-cita-dian', async (req, res) => {
   const ctx = await exigirEquipo(req, res); if (!ctx) return;
-  const { clienteId, reenviar } = req.body || {};
+  const { clienteId, reenviar, documentos } = req.body || {};
+  const elegidos = Array.isArray(documentos) ? documentos.map(String) : null; // los que el equipo marcó en el panel
   const sbx = ctx.sb;
   let reclamado = false;
   try {
@@ -3151,11 +3152,12 @@ app.post('/api/solicitud-cita-dian', async (req, res) => {
     const lista = await listarDocumentosPorCedula(ced);
     if (!lista.encontrada) throw new Error('No encontré la carpeta del cliente en SharePoint (cédula ' + ced + ').');
     let archivos = lista.archivos.filter((a) => a.tipo !== 'Contrato' && !/CONTRATO|BORRADOR/i.test(a.nombre));
+    if (elegidos && elegidos.length) archivos = archivos.filter((a) => elegidos.includes(String(a.id)));
     // Cliente con varios vehículos: solo viajan los documentos del vehículo de ESTA tarjeta (su placa)
     // más los comunes (sin ninguna placa en el nombre: cédula, RUT, certificación bancaria...).
     const normPl = (t) => String(t || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
     const miPlaca = normPl(cli.placa);
-    if (miPlaca.length >= 5) {
+    if (miPlaca.length >= 5 && !(elegidos && elegidos.length)) {
       const { data: otros } = await sbx.from('BD_Cliente_GLA').select('placa').eq('numero_identificacion', cli.numero_identificacion).neq('id', cli.id);
       const otrasPlacas = (otros || []).map((o) => normPl(o.placa)).filter((x) => x.length >= 5 && x !== miPlaca);
       if (otrasPlacas.length) archivos = archivos.filter((a) => { const n = normPl(a.nombre); return !otrasPlacas.some((pl) => n.includes(pl)); });

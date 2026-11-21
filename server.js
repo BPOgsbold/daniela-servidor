@@ -3135,10 +3135,11 @@ app.post('/api/solicitud-cita-dian', async (req, res) => {
     if (error || !cli) return res.status(404).json({ error: 'No encontré el cliente.' });
     if (!cli.fecha_certificado_upme_emitido) return res.status(400).json({ error: 'El cliente aún no tiene "Certificado UPME emitido".' });
     if (String(cli.resultado_certificado_upme || '').toLowerCase() === 'rechazado') return res.status(400).json({ error: 'El certificado UPME quedó Rechazado: no se solicita cita DIAN.' });
-    if (cli.correo_cita_dian_enviado_en && !reenviar) return res.json({ ok: true, yaEnviado: true, enviado_en: cli.correo_cita_dian_enviado_en });
+    // Regla: el paquete GLA se envía UNA sola vez por cliente (no hay reenvíos).
+    if (cli.correo_cita_dian_enviado_en) return res.json({ ok: true, yaEnviado: true, enviado_en: cli.correo_cita_dian_enviado_en });
     // Reserva atómica: evita que dos clics/pestañas manden el mismo correo dos veces.
     const ahora = new Date().toISOString();
-    if (!reenviar) {
+    {
       const { data: tomado } = await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: ahora }).eq('id', cli.id).is('correo_cita_dian_enviado_en', null).select('id');
       if (!tomado || !tomado.length) return res.json({ ok: true, yaEnviado: true });
       reclamado = true;

@@ -3176,7 +3176,7 @@ app.post('/api/solicitud-cita-dian', async (req, res) => {
     const asunto = (ES_REAL() ? '' : '[PRUEBA] ') + `Solicitud cita DIAN – ${cli.nombre_cliente || ''} (CC ${ced}${cli.placa ? ' · placa ' + cli.placa : ''}${cli.ciudad ? ' · ' + cli.ciudad : ''})`;
     await enviarCorreo({ remitente: REMITENTE(), destinatarios: DESTINOS(), asunto, html: htmlCorreo({ cli, archivos: paquete.lista, paquete: paquete.nombreZip }), adjuntos });
     await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: ahora }).eq('id', cli.id);
-    if (cli.caso_id) await sbx.from('panel_historial').insert({ caso_id: cli.caso_id, campo: 'correo_cita_dian', valor_anterior: null, valor_nuevo: `Enviado a ${DESTINOS().length} destinatarios con 1 carpeta (${paquete.lista.length} documentos)`, usuario_email: ctx.email }).then(() => {}, () => {});
+    if (cli.caso_id) await sbx.from('panel_historial').insert({ caso_id: cli.caso_id, campo: 'correo_cita_dian', valor_anterior: null, valor_nuevo: `${ES_REAL() ? '' : '[PRUEBA] '}${reenviar ? 'Reenvío: ' : ''}Enviado a ${DESTINOS().length} destinatarios (${DESTINOS().join(', ')}) con 1 carpeta (${paquete.lista.length} documentos)`, usuario_email: ctx.email }).then(() => {}, () => {});
     console.log(`[cita-dian] ${ctx.email} → correo de ${ced} con carpeta de ${paquete.lista.length} documentos`);
     res.json({ ok: true, adjuntos: paquete.lista.length, destinatarios: DESTINOS().length });
   } catch (err) {

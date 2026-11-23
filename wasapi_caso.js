@@ -60,8 +60,19 @@ function datosDelPerfil(p, waId, canal) {
   return datos;
 }
 
+// Candado: dos atenciones del MISMO cliente al mismo tiempo (Daniela autónoma + copiloto de un agente, o dos ciclos)
+// se hacen una detrás de la otra. Así la segunda encuentra el caso que creó la primera y no crea otro.
+let colaCasos = Promise.resolve();
+function enFila(fn) {
+  const r = colaCasos.then(fn, fn);
+  colaCasos = r.then(() => {}, () => {});
+  return r;
+}
+const DE_DANIELA = /^(ct|wa)-/;
+
 // Crea el caso la primera vez (si no existe por teléfono/cédula) y lo mantiene al día. Devuelve el id del caso.
-async function sincronizarCaso(p, waId, sb, o = {}) {
+function sincronizarCaso(p, waId, sb, o = {}) { return enFila(() => sincronizarCasoUnico(p, waId, sb, o)); }
+async function sincronizarCasoUnico(p, waId, sb, o = {}) {
   if (!p.nombre && !p.nombre_completo) return null; // sin nombre todavía no se crea nada
   const datos = datosDelPerfil(p, waId, o.canal);
   const estado = estadoSegunPerfil(p);
@@ -77,9 +88,30 @@ async function sincronizarCaso(p, waId, sb, o = {}) {
       caso = dup.casos.slice().sort((x, y) => String(y.updated_at || y.created_at || '').localeCompare(String(x.updated_at || x.created_at || '')))[0];
     }
   }
+  // Si el cliente ya tiene historial con esa cédula en un caso MÁS ANTIGUO, se sigue en ese (no se duplica).
+  if (caso && datos.numero_identificacion && DE_DANIELA.test(String(caso.session_id || ''))) {
+    const otros = await buscarDuplicados({ numero_identificacion: datos.numero_identificacion, excluirId: caso.id });
+    const viejo = (otros.casos || []).filter((x) => String(x.created_at || '') < String(caso.created_at || '')).sort((x, y) => String(x.created_at).localeCompare(String(y.created_at)))[0];
+    if (viejo) {
+      console.log(`[wasapi-caso] ${caso.id} es duplicado de ${viejo.id} (misma cédula): se sigue en ${viejo.id}`);
+      await quitarDuplicado(sb, caso, viejo);
+      caso = viejo;
+    }
+  }
+  if (!caso) {
+    // Última verificación justo antes de crear (por si otro proceso lo creó hace un instante).
+    const otra = await buscarDuplicados({ telefono: datos.telefono, numero_identificacion: datos.numero_identificacion });
+    if (otra.casos && otra.casos.length) caso = otra.casos[otra.casos.length - 1];
+  }
   if (!caso) {
     const nuevo = await crearCaso(`${o.prefijo || 'wa'}-${digitos(waId)}`, o.asesor || ASESOR, { ...datos, estado_pipeline: estado });
     console.log(`[wasapi-caso] caso NUEVO ${nuevo.id}: ${datos.nombre_cliente} (${datos.telefono})`);
+    // Control después de crear: si aparece otro caso del mismo cliente creado antes, se queda el más antiguo.
+    try {
+      const des = await buscarDuplicados({ telefono: datos.telefono, numero_identificacion: datos.numero_identificacion, excluirId: nuevo.id });
+      const viejo = (des.casos || []).sort((x, y) => String(x.created_at).localeCompare(String(y.created_at)))[0];
+      if (viejo) { await quitarDuplicado(sb, nuevo, viejo); return viejo.id; }
+    } catch (e) { console.error('[wasapi-caso] control de duplicado:', e.message); }
     return nuevo.id;
   }
   // Ya existe: no se crea otro. Solo se completan los datos vacíos (no se pisa lo que llenó el asesor)
@@ -157,6 +189,28 @@ async function pedirContratoSiListo(p, sb, o = {}) {
   p._contrato_pedido = new Date().toISOString();
   console.log(`[wasapi-caso] contrato pedido automáticamente para ${fila.nombre_cliente} (${fila.cedula})`);
   return true;
+}
+
+// Borra un caso que Daniela acaba de duplicar (solo los creados por Daniela, recientes y sin cliente cerrado),
+// pasando antes al caso antiguo los datos que a este le faltan. Si no se puede borrar, queda registrado en el log.
+async function quitarDuplicado(sb, dup, viejo) {
+  try {
+    if (!DE_DANIELA.test(String(dup.session_id || '')) || ['Cliente', 'Cierre perdido'].includes(dup.estado_pipeline)) return;
+    if (Date.now() - new Date(dup.created_at || Date.now()).getTime() > 7 * 86400000) return;
+    const { data: completo } = await sb.from('Perfilamiento_y_ventas_GLA').select('*').eq('id', dup.id).maybeSingle();
+    const cambios = {};
+    for (const [k, v] of Object.entries(completo || {})) {
+      if (['id', 'session_id', 'created_at', 'updated_at', 'estado_pipeline', 'asesor'].includes(k)) continue;
+      if (v !== null && v !== '' && (viejo[k] === null || viejo[k] === undefined || viejo[k] === '')) cambios[k] = v;
+    }
+    if (Object.keys(cambios).length) await actualizarCaso(viejo.id, cambios);
+    for (const t of ['panel_historial', 'solicitudes_contrato', 'pagos_cargados', 'terminos_sura']) {
+      await sb.from(t).update({ caso_id: t === 'pagos_cargados' || t === 'terminos_sura' ? String(viejo.id) : viejo.id }).eq('caso_id', t === 'pagos_cargados' || t === 'terminos_sura' ? String(dup.id) : dup.id).then(() => {}, () => {});
+    }
+    const { error } = await sb.from('Perfilamiento_y_ventas_GLA').delete().eq('id', dup.id);
+    if (error) console.error(`[wasapi-caso] no pude borrar el duplicado ${dup.id}:`, error.message);
+    else console.log(`[wasapi-caso] duplicado ${dup.id} borrado; queda ${viejo.id}`);
+  } catch (e) { console.error('[wasapi-caso] quitar duplicado:', e.message); }
 }
 
 // Todo junto, después de responder al cliente (nunca bloquea ni rompe la conversación).

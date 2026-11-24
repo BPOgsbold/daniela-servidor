@@ -10,7 +10,7 @@
 
 const { createClient } = require('@supabase/supabase-js');
 
-const PARA_DEFECTO = ['auxiliar@bpogs.com', 'jcifuentes@bpogs.com', 'arolong@bpogs.com', 'aarcila@bpogs.com'];
+const PARA_DEFECTO = ['auxiliar@bpogs.com', 'jcifuentes@bpogs.com', 'arolong@bpogs.com', 'aarcila@bpogs.com', 'mfsierra@bpogs.com'];
 const HORA_ENVIO = () => String(process.env.INFORME_SEGUIMIENTO_HORA || '20:00');
 const UMBRAL = () => Number(process.env.INFORME_SEGUIMIENTO_UMBRAL || 3);      // días sin moverse para entrar en alerta
 const ROJO = 10;

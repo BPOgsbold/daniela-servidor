@@ -113,11 +113,37 @@ function parseMonto(v) {
   const n = Number(t);
   return isFinite(n) && n > 0 ? n : null;
 }
+// 24/11/2026: el valor sin IVA puede traer VARIOS vehículos ("$95.000.000 / $60.000.000 / $45.000.000" o "3 carros: 95M, 60M y 45M").
+// Antes se pegaban todos los dígitos en un solo número gigante y la tarifa salía al tope (275 UVT ≈ $14,4 millones). Error grave.
+// Ahora se separan los montos y se SUMAN: la UPME cobra UN solo pago por el registro (un proyecto con todos los vehículos),
+// liquidado sobre el valor total.
+function montosSinIva(v) {
+  if (typeof v === 'number') return isFinite(v) && v > 0 ? [v] : [];
+  const txt = String(v || '');
+  const piezas = txt.match(/\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d{4,}(?:[.,]\d{1,2})?/g) || [];
+  const out = [];
+  for (const p of piezas) {
+    let n = parseMonto(p);
+    if (!n) continue;
+    // "95 millones" / "95M" / "95 mill"
+    if (n < 1000) continue;
+    out.push(n);
+  }
+  // Cifras escritas en millones ("95 millones", "60M")
+  if (!out.length) {
+    const mill = txt.match(/(\d+(?:[.,]\d+)?)\s*(?:millones|mill?\.?|m\b)/gi) || [];
+    for (const m of mill) { const n = Number(m.replace(/[^\d.,]/g, '').replace(',', '.')) * 1e6; if (n > 0) out.push(n); }
+  }
+  return out;
+}
 const GESTION_PAGO_UPME = () => Number(process.env.UPME_GESTION_PAGO) || 15000;
 function tarifaUpme(valorSinIva) {
   const UVT = Number(process.env.UPME_UVT) || 52374;
-  const precio = parseMonto(valorSinIva);
-  if (!precio || precio < 1000000) return null;
+  const montos = montosSinIva(valorSinIva).filter((n) => n >= 1000000);
+  const precio = montos.reduce((x, y) => x + y, 0);
+  // Ningún vehículo vale más de $1.500 millones: si el total es absurdo, NO se cotiza (mejor preguntar al equipo que dar una cifra errada).
+  if (!precio || precio < 1000000 || montos.some((n) => n > 1500000000)) return null;
+  const nVeh = montos.length;
   const uvtEq = Math.round(precio * 100 / UVT) / 100;
   let total;
   if (uvtEq < 275) total = 1.2;
@@ -128,7 +154,8 @@ function tarifaUpme(valorSinIva) {
   const pesos = Math.round(total * UVT);
   const fmt = (n, d = 0) => n.toLocaleString('es-CO', { minimumFractionDigits: d, maximumFractionDigits: d });
   return { pesos, uvt: Math.round(total * 100) / 100, uvtProyecto: uvtEq, valor: precio, uvtValor: UVT,
-    texto: `$${fmt(pesos)} (${fmt(Math.round(total * 100) / 100, 2)} UVT; su carro sin IVA, $${fmt(precio)}, equivale a ${fmt(uvtEq, 2)} UVT; UVT 2026 = $${fmt(UVT)}). Si el cliente prefiere que nosotros hagamos el pago de la UPME, el total sería $${fmt(pesos + GESTION_PAGO_UPME())} (tarifa + $${fmt(GESTION_PAGO_UPME())} por la gestión del pago)` };
+    vehiculos: nVeh,
+    texto: `$${fmt(pesos)} en total, UN SOLO PAGO a la UPME (${fmt(Math.round(total * 100) / 100, 2)} UVT; ${nVeh > 1 ? `sus ${nVeh} vehículos se registran juntos en un solo proyecto y sus valores sin IVA suman $${fmt(precio)}` : `su carro sin IVA, $${fmt(precio)}`}, equivale a ${fmt(uvtEq, 2)} UVT; UVT 2026 = $${fmt(UVT)}). NUNCA multipliques esta tarifa por el número de vehículos: es un solo registro y un solo pago. Si el cliente prefiere que nosotros hagamos el pago de la UPME, el total sería $${fmt(pesos + GESTION_PAGO_UPME())} (tarifa + $${fmt(GESTION_PAGO_UPME())} por la gestión del pago)` };
 }
 
 function parsearJSON(t) {

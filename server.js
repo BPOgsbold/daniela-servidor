@@ -3370,6 +3370,7 @@ require('./firma')(app, { sbServicio, exigirEquipo });
 require('./chattigo')(app, { sbServicio });
 require('./pagos').montarPagos(app); // informe diario de pagos cargados (8:00 p. m.)
 require('./informe_seguimiento').montarInformeSeguimiento(app, { exigirEquipo }); // informe gerencial diario del tablero de Seguimiento (8:00 p. m.)
+require('./aviso_pago_upme').montarAvisoPagoUpme(app, { exigirEquipo, sbServicio }); // aviso a Teams al pasar a Pendiente pago UPME
 require('./portal')(app, { sbServicio, exigirEquipo });
 
 app.listen(PORT, () => {

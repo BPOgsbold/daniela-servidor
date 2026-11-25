@@ -4,2629 +4,3375 @@ const path = require('path');
 const express = require('express');
 const cors = require('cors');
 
-const db = require('./supabase');
-const { responderAyuda, iaDisponible } = require('./claude');
+const { responderAyuda } = require('./claude');
+const {
+  crearCaso: crearCasoBase,
+  actualizarCaso,
+  guardarEscalamientoJuridico,
+  guardarConocimiento,
+  obtenerConocimientoReciente,
+  buscarCasoPorTermino,
+  obtenerVehiculosReferencia,
+  guardarVehiculoNoListado,
+} = require('./supabase');
+const { buscarDuplicados, eliminarCasoDeSesion } = require('./duplicados');
+
+const { htmlCorreo, REMITENTE, DESTINOS, ES_REAL, mb: mbCorreo, ordenarArchivos, sinRepetidos, armarPaquete } = require('./correo_cita');
+const { descargarArchivo, enviarCorreo, TIPOS_DOC, configurado: sharepointConfigurado, subirDocumento, moverACliente, esClienteDefinitivo, listarDocumentosPorCedula, listarDocumentosDeCarpeta, listarCarpetasClientes, enlaceDeArchivo } = require('./sharepoint');
+
+
+// Todas las creaciones de casos pasan por aquí: si ya existe un cliente con ese
+// teléfono o cédula/NIT NO se crea otro (solo se permite con "Mismo cliente, otro vehículo").
+// Si llegan dos solicitudes de crear caso casi al mismo tiempo desde la misma sesión (doble clic, reintento de red),
+// la segunda espera a la primera y recibe EL MISMO caso: no se crean dos.
+const creacionesEnCurso = new Map();
+async function crearCaso(sessionId, asesor, datos) {
+  if (creacionesEnCurso.has(sessionId)) return creacionesEnCurso.get(sessionId);
+  const p = crearCasoUnico(sessionId, asesor, datos);
+  creacionesEnCurso.set(sessionId, p);
+  try { return await p; } finally { creacionesEnCurso.delete(sessionId); }
+}
+async function crearCasoUnico(sessionId, asesor, datos) {
+  const ses = sesiones.get(sessionId);
+  if (!(ses && ses.otroVehiculo)) {
+    let dup = { casos: [], campo: null };
+    try {
+      dup = await buscarDuplicados({ telefono: datos.telefono, numero_identificacion: datos.numero_identificacion });
+    } catch (errDup) {
+      console.error('No se pudo verificar duplicados (se BLOQUEA por seguridad):', errDup.message);
+      const e0 = new Error('No pude verificar si el cliente ya existe. Intenta de nuevo en un momento (no se creó nada).');
+      e0.code = 'DUPLICADO';
+      throw e0;
+    }
+    if (dup.casos.length) {
+      const e = new Error(`Ya existe un cliente con ese ${dup.campo === 'telefono' ? 'teléfono' : 'número de documento'} (${dup.casos[0].nombre_cliente || 'sin nombre'}). No se crea otro: retómalo con "buscar cliente".`);
+      e.code = 'DUPLICADO';
+      throw e;
+    }
+  }
+  const registro = await crearCasoBase(sessionId, asesor, datos);
+  if (ses) ses.casoCreadoEnSesion = registro.id;
+  return registro;
+}
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '6mb' }));
-// ⚡ Velocidad del panel: respuestas JSON grandes comprimidas (gzip) y caché corta en memoria
-const zlib = require('zlib');
-const CACHE = new Map();
-app.use((req, res, next) => {
-  const orig = res.json.bind(res);
-  res.json = (obj) => {
-    const txt = JSON.stringify(obj);
-    if (txt.length < 30000 || !/gzip/.test(req.headers['accept-encoding'] || '')) return orig(obj);
-    zlib.gzip(txt, { level: 6 }, (err, buf) => {
-      if (err) { res.set('Content-Type', 'application/json; charset=utf-8'); return res.send(txt); }
-      if (res.locals.guardarCache && res.statusCode === 200) res.locals.guardarCache(buf);
-      res.set({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', Vary: 'Accept-Encoding' });
-      res.send(buf);
-    });
-    return res;
-  };
-  next();
-});
-// Cualquier cambio desde el panel (subir OCM, bases, editar ventas…) borra la caché; el chat de los asesores no, para no anularla
-app.use((req, res, next) => { if (req.method !== 'GET' && req.path.startsWith('/api/panel/')) CACHE.clear(); next(); });
-// Guarda la respuesta comprimida unos segundos: si otro usuario (o el mismo) pide lo mismo, sale al instante
-const cachear = (ms) => (req, res, next) => {
-  if (req.query.fresco) return next();
-  const k = req.path + '?' + Object.entries(req.query).sort().map(([a, b]) => a + '=' + b).join('&');
-  const c = CACHE.get(k);
-  if (c && Date.now() - c.t < ms && /gzip/.test(req.headers['accept-encoding'] || '')) {
-    res.set({ 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', Vary: 'Accept-Encoding', 'X-Cache': 'hit' });
-    return res.send(c.buf);
-  }
-  res.locals.guardarCache = (buf) => { CACHE.set(k, { t: Date.now(), buf }); while (CACHE.size > 40) CACHE.delete(CACHE.keys().next().value); };
-  next();
-};
-// Registro de peticiones en los logs de Render (para diagnosticar errores de los asesores)
-app.use((req, res, next) => {
-  if (req.path === '/api/health') return next();
-  const t = Date.now();
-  res.on('finish', () => {
-    if (req.path === '/api/chat' || res.statusCode >= 400 || Date.now() - t > 4000) {
-      console.log(`[peticion] ${req.method} ${req.path} → ${res.statusCode} · ${Date.now() - t} ms · ${String(req.headers['x-forwarded-for'] || req.ip || '').split(',')[0]} · ${req.body?.cedula ? 'cc ' + String(req.body.cedula).slice(-4) : req.body?.asesor || ''}`);
-    }
-  });
-  next();
-});
+// Los documentos adjuntos llegan en base64: este endpoint admite hasta ~25mb.
+app.use('/api/adjuntar', express.json({ limit: '35mb' }));
+app.use('/api/sp/subir', express.json({ limit: '35mb' }));
+app.use('/api/chattigo', express.json({ limit: '35mb' }));
+// Límite subido de 100kb (default de Express) a 2mb: una entrada de
+// conocimiento larga (ej. un Excel convertido a texto) puede pesar más de
+// 100kb y Express la rechazaría con un error 413 antes de llegar a la
+// validación de MAX_TEXTO_CONOCIMIENTO de abajo.
+app.use(express.json({ limit: '2mb' }));
 
 const PORT = process.env.PORT || 3000;
-const leer = (archivo) => fs.readFileSync(path.join(__dirname, archivo), 'utf8');
-// Se leen en cada mensaje: si editas los archivos de config no hace falta reiniciar.
-const CAMPOS = () => JSON.parse(leer('campos.json'));
 
-// ---------------------------------------------------------------------------
-// Interruptores que el back prende/apaga desde el panel (tabla marce_config).
-// Se guardan 30 s en memoria para no consultar Supabase en cada mensaje.
-// ---------------------------------------------------------------------------
-let CONFIG = { datos: {}, ts: 0 };
-async function refrescarConfig(forzar) {
-  if (!forzar && Date.now() - CONFIG.ts < 30000) return CONFIG.datos;
-  try {
-    CONFIG = { datos: await db.leerConfig(), ts: Date.now() };
-  } catch (e) {
-    CONFIG.ts = Date.now(); // si la tabla no existe todavía, todo queda apagado
-  }
-  return CONFIG.datos;
-}
-const activo = (clave) => Boolean(CONFIG.datos[clave]?.valor);
+const CAMPOS = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'campos.json'), 'utf8')
+);
+const SOP_TEXT = fs.readFileSync(path.join(__dirname, 'sop.md'), 'utf8');
+const OBJECIONES_TEXT = fs.readFileSync(
+  path.join(__dirname, 'objeciones.md'),
+  'utf8'
+);
 
-// ---------------------------------------------------------------------------
-// Asesores: cada uno entra con su cédula; el nombre sale de la tabla "asesores".
-// ---------------------------------------------------------------------------
-const ASESORES = new Map(); // cédula → { fila, ts }
-const soloDigitos = (v) => String(v || '').replace(/\D/g, '');
-async function resolverAsesor(cedula) {
-  const ced = soloDigitos(cedula);
-  if (!ced) return null;
-  const guardado = ASESORES.get(ced);
-  if (guardado && Date.now() - guardado.ts < 60000) return guardado.fila;
-  const fila = await db.buscarAsesor(ced);
-  ASESORES.set(ced, { fila, ts: Date.now() });
-  return fila;
-}
-const AVISO_CEDULA = {
-  no_existe: '⚠️ Tu cédula no está registrada en Marce. Pídele a tu supervisor que te agregue en el panel (pestaña 👥 Asesores).',
-  inactivo: '⚠️ Tu usuario está desactivado en Marce. Habla con tu supervisor.',
-};
-
-
-// ---------------------------------------------------------------------------
-// Sesiones (una por ventana de chat). Viven en memoria del servidor.
-// ---------------------------------------------------------------------------
 const sesiones = new Map();
+
+// --- Conocimiento adicional ("enseñarle" cosas nuevas a Daniela) ---
+// Se guarda en Supabase (tabla `conocimiento`) para que sobreviva reinicios
+// del servidor, y se mantiene en memoria (con una actualización cada vez que
+// se agrega algo nuevo) para no consultar la base de datos en cada mensaje.
+// Conocimiento con BÚSQUEDA: en vez de pasarle a Claude TODO lo enseñado en
+// cada duda, se indexa en trozos y solo se envían los que se parecen a la
+// pregunta. Lo corto que se enseña a mano ("principios", avisos) se sigue
+// enviando siempre, como antes; lo largo o cargado en lote (la guía) se busca.
+let conocimientoCache = { siempre: [], trozos: [], idf: new Map(), at: 0 };
+const CONOCIMIENTO_TTL_MS = 60 * 1000;
+const MAX_SIEMPRE = 20;          // entradas manuales cortas que siempre van
+const MAX_TROZOS_RESPUESTA = 6;  // trozos de la guía que se envían por duda
+const MAX_CARACTERES_BUSQUEDA = 12000;
+const UMBRAL_LARGO = 4000;       // desde aquí una entrada manual se busca en vez de enviarse completa
+const TAM_TROZO = 1800;
+
+const STOP = new Set(('de la el los las un una unos unas y o u e a al del en con por para que se su sus lo le les me mi mis te tu tus es son ser fue era soy eres este esta estos estas ese esa esos esas eso esto como mas pero si no ya muy hay han ha he tiene tienen tengo puede pueden quiero cual cuales cuando donde quien quienes cuanto cuantos cuanta cuantas sobre entre desde hasta tambien solo sin ni nos ante bajo cada otro otra otros otras alguno alguna algun todo toda todos todas'.split(' ')));
+
+function tokensBusqueda(t) {
+  return String(t || '')
+    .toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9ñ ]+/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length >= 3 && !STOP.has(w))
+    .map((w) => (w.length > 6 ? w.slice(0, 6) : w.replace(/(es|s)$/, '')));
+}
+
+function trocearTexto(texto, tam = TAM_TROZO) {
+  const bloques = String(texto).split(/\n{2,}/);
+  const trozos = [];
+  let actual = '';
+  for (const b of bloques) {
+    if (actual && (actual.length + b.length + 2) > tam) { trozos.push(actual); actual = ''; }
+    actual += (actual ? '\n\n' : '') + b;
+    while (actual.length > tam * 1.6) { trozos.push(actual.slice(0, tam)); actual = actual.slice(tam); }
+  }
+  if (actual.trim()) trozos.push(actual);
+  return trozos;
+}
+
+function esDeBusqueda(e) {
+  const autor = String(e.agregado_por || '');
+  if (/^principios/i.test(autor)) return false;           // siempre se envían
+  return /^gu[ií]a/i.test(autor) || String(e.texto || '').length > UMBRAL_LARGO;
+}
+
+function etiquetaEntrada(e) {
+  const fecha = e.created_at ? new Date(e.created_at).toLocaleDateString('es-CO') : '';
+  return [e.titulo, e.agregado_por, fecha].filter(Boolean).join(' · ');
+}
+
+function formatearConocimiento(entradas) {
+  if (!entradas || entradas.length === 0) return '';
+  return entradas
+    .map((e) => {
+      const encabezado = etiquetaEntrada(e);
+      return encabezado ? `### ${encabezado}\n${e.texto}` : e.texto;
+    })
+    .join('\n\n');
+}
+
+async function cargarConocimientoCache() {
+  const { createClient } = require('@supabase/supabase-js');
+  const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+  const { data, error } = await sb
+    .from('conocimiento')
+    .select('id, titulo, texto, agregado_por, created_at')
+    .eq('activo', true)
+    .order('created_at', { ascending: false })
+    .limit(3000);
+  if (error) throw error;
+  const siempre = [];
+  const trozos = [];
+  for (const e of data || []) {
+    if (!esDeBusqueda(e)) { if (siempre.length < MAX_SIEMPRE) siempre.push(e); continue; }
+    const titulo = e.titulo || '';
+    trocearTexto(e.texto).forEach((t, i, arr) => {
+      const tk = tokensBusqueda(titulo + ' ' + titulo + ' ' + titulo + ' ' + t); // el título pesa x3
+      const tf = new Map();
+      tk.forEach((w) => tf.set(w, (tf.get(w) || 0) + 1));
+      trozos.push({ titulo: titulo + (arr.length > 1 ? ` (parte ${i + 1})` : ''), texto: t, tf, autor: e.agregado_por, created_at: e.created_at });
+    });
+  }
+  const df = new Map();
+  trozos.forEach((t) => t.tf.forEach((_, w) => df.set(w, (df.get(w) || 0) + 1)));
+  const N = Math.max(trozos.length, 1);
+  const idf = new Map();
+  df.forEach((n, w) => idf.set(w, Math.log(1 + N / n)));
+  conocimientoCache = { siempre, trozos, idf, at: Date.now() };
+}
+
+// Devuelve el texto de conocimiento para esta duda: lo "siempre" + los trozos
+// de la guía más parecidos a la pregunta. Sin pregunta, solo lo "siempre".
+async function obtenerConocimientoTexto(pregunta = '', forzar = false) {
+  if (typeof pregunta === 'boolean') { forzar = pregunta; pregunta = ''; }
+  if (forzar || Date.now() - conocimientoCache.at > CONOCIMIENTO_TTL_MS) {
+    try {
+      await cargarConocimientoCache();
+    } catch (err) {
+      console.error('No se pudo cargar el conocimiento adicional:', err.message);
+      // seguimos con lo último que había en caché
+    }
+  }
+  const { siempre, trozos, idf } = conocimientoCache;
+  let texto = formatearConocimiento(siempre);
+  const q = [...new Set(tokensBusqueda(pregunta))];
+  if (q.length && trozos.length) {
+    const puntuados = trozos
+      .map((t) => {
+        let sc = 0;
+        for (const w of q) { const f = t.tf.get(w); if (f) sc += (idf.get(w) || 0) * (1 + Math.log(f)); }
+        return { t, sc };
+      })
+      .filter((x) => x.sc > 0)
+      .sort((a, b) => b.sc - a.sc);
+    if (puntuados.length) {
+      const corte = puntuados[0].sc * 0.4;
+      let total = 0;
+      const elegidos = [];
+      for (const { t, sc } of puntuados) {
+        if (elegidos.length >= MAX_TROZOS_RESPUESTA || sc < corte) break;
+        if (total + t.texto.length > MAX_CARACTERES_BUSQUEDA) break;
+        elegidos.push(t); total += t.texto.length;
+      }
+      if (elegidos.length) {
+        const bloque = elegidos.map((t) => `### ${t.titulo}${t.autor ? ' · ' + t.autor : ''}\n${t.texto}`).join('\n\n');
+        texto += (texto ? '\n\n' : '') + '## Respuestas de la guía más parecidas a la pregunta\n' + bloque;
+      }
+    }
+  }
+  return texto;
+}
+
 function nuevaSesion() {
   return {
-    modo: 'libre', // 'libre' | 'captura' | 'buscar' | 'seleccion' | 'duplicado'
-    captura: null, // { tipo, campos, paso, datos }
-    cliente: null, // cliente abierto (fila de "interesados" + venta)
-    resultados: [], // resultados de la última búsqueda
-    accionPendiente: null, // acción a ejecutar cuando se elija un cliente
+    estado: 'inactivo',
+    tipo: null,
+    stepIndex: 0,
+    data: {},
+    casoId: null,
+    pendienteEscalamiento: null,
+    pendienteBusqueda: false,
+    avisoDuplicadoMostrado: false,
+    otroVehiculo: false,
+    casoCreadoEnSesion: null,
+    // Cuando el asesor responde "No" a "¿lograste el contacto?", le
+    // preguntamos si quiere cerrar la interacción con ese cliente ahí mismo
+    // (ya quedó guardado como "Contacto") o seguir igual con las preguntas.
+    pendienteCierre: false,
+    // Último caso único que encontró una búsqueda ("buscar cliente" / "ya
+    // fue atendido"), para que el botón "Retomar este caso" sepa cuál es sin
+    // tener que volver a buscar.
+    candidatoRetomar: null,
+    // Progreso en las 3 preguntas de negociación (estado de interés,
+    // negociación, cliente acepta todo) que se hacen una vez el caso ya
+    // tiene todos sus datos. Ver GATES_NEGOCIACION.
+    negociacion: null,
   };
 }
 
-// ---------------------------------------------------------------------------
-// Utilidades de texto
-// ---------------------------------------------------------------------------
-const norm = (s) =>
-  String(s || '')
+// Las 3 preguntas de negociación, en orden. Cada una es un gate Sí/No: si es
+// "No" pide un motivo (con botones) y luego si cerrar la interacción; si es
+// "Sí" pasa a la siguiente (la última pide el siguiente paso en vez de eso).
+const GATES_NEGOCIACION = [
+  {
+    id: 'interes',
+    pregunta: '¿El cliente sigue interesado en el proceso?',
+    motivoCampo: 'motivo_no_interes',
+    motivos: [
+      'Tecnología del vehículo',
+      'Antigüedad',
+      'Segundo propietario',
+      'No entrega información',
+      'No le interesa el proceso',
+    ],
+  },
+  {
+    id: 'negociacion',
+    pregunta: '¿El cliente acepta la propuesta?',
+    motivoCampo: 'motivo_negociacion',
+    motivos: ['Lo pensará', 'Pide volver a llamar', 'Va a consultar un tercero'],
+  },
+  {
+    id: 'acepta',
+    pregunta: '¿Finalizaste la negociación con el cliente?',
+    motivoCampo: 'motivo_rechazo',
+    motivos: ['No confía en el proceso', 'Precio', 'Tiempo limitado para el proceso'],
+    siguientePasoOpciones: ['Pendiente de contrato', 'Pendiente de firma', 'Pendiente de pago', 'Proceso completado'],
+    servicioOpciones: ['Solo DIAN', 'Solo cita DIAN', 'Servicio completo', 'Solo UPME'],
+  },
+];
+
+// Última pregunta del flujo de negociación: cómo quedan los documentos del
+// cliente al momento de escalar el caso (una vez ya se registró el servicio
+// contratado).
+const OPCIONES_ESCALAR_DOCUMENTOS = ['Escalar con documentos completos', 'Escalar con documentos pendientes'];
+
+// Botones que se muestran en cada una de las 3 preguntas de negociación
+// (interés, negociación, acepta): además de Sí/No, "Cerrar interacción" para
+// cuando el cliente deja de responder a mitad de la gestión — así el asesor
+// no queda trabado esperando una respuesta Sí/No que puede que nunca llegue;
+// el caso ya está guardado en Supabase con lo que se alcanzó a registrar.
+const OPCIONES_GATE_PREGUNTA = ['Sí', 'No', 'Cerrar interacción'];
+const ETIQUETA_CERRAR_INTERACCION = 'Cerrar interacción';
+function esCerrarInteraccion(mensaje) {
+  return normalizarTexto(mensaje).trim() === normalizarTexto(ETIQUETA_CERRAR_INTERACCION).trim();
+}
+
+// Convierte un registro ya guardado en Supabase de vuelta al formato de
+// `sesion.data` (id de campo -> valor), para poder "retomar" un caso
+// existente sin volver a preguntar los datos que ya tiene. Solo se incluyen
+// los campos que sí tienen valor: los que falten quedan pendientes, tal como
+// los detecta `siguienteIndicePendiente`.
+const CAMPOS_RETOMABLES = [
+  'canal', 'fuente', 'nombre_cliente', 'telefono', 'contacto_logrado',
+  'tipo_identificacion', 'numero_identificacion', 'email', 'id_rrss',
+  'tipo_cuenta', 'nombre_empresa', 'cuenta',
+  'tipo_persona', 'vehiculo', 'tecnologia', 'placa', 'fecha_compra',
+  'valor_sin_iva', 'tiene_certificado_upme',
+];
+function datosDeCasoExistente(caso) {
+  const datos = {};
+  for (const id of CAMPOS_RETOMABLES) {
+    if (caso[id] !== null && caso[id] !== undefined && caso[id] !== '') {
+      datos[id] = caso[id];
+    }
+  }
+  return datos;
+}
+
+// Cuando un mismo cliente vuelve con un SEGUNDO vehículo (se gestiona como un
+// caso aparte, con su propio pipeline), reutilizamos solo sus datos de
+// identidad/contacto — nunca los del vehículo — para no volver a preguntar
+// nombre, teléfono, cédula, etc., pero sí pedir de cero los datos del carro
+// nuevo (vehículo, tecnología, placa, fecha de compra, valor, certificado).
+const CAMPOS_CLIENTE_COMPARTIDOS = CAMPOS_RETOMABLES.filter(
+  (id) => !['vehiculo', 'tecnologia', 'placa', 'fecha_compra', 'valor_sin_iva', 'tiene_certificado_upme'].includes(id)
+);
+function datosClienteExistente(caso) {
+  const datos = {};
+  for (const id of CAMPOS_CLIENTE_COMPARTIDOS) {
+    if (caso[id] !== null && caso[id] !== undefined && caso[id] !== '') {
+      datos[id] = caso[id];
+    }
+  }
+  return datos;
+}
+
+// Arma una respuesta legible con los casos que ya existen en Supabase para
+// un cliente, para que el asesor pueda confirmar rápido si ya fue atendido
+// antes en vez de crear un caso duplicado.
+function formatearResultadosBusqueda(casos, termino) {
+  if (!casos || casos.length === 0) {
+    return `No encontré ningún caso ya registrado que coincida con "${termino}". Puede ser un cliente nuevo, o el dato no coincide exactamente (revisa que el nombre, la cédula/NIT o la placa estén bien escritos). Si es nuevo, dime "tengo un cliente nuevo" y arrancamos.`;
+  }
+
+  const bloques = casos.map((c) => {
+    const fecha = c.updated_at || c.created_at;
+    const fechaTexto = fecha
+      ? new Date(fecha).toLocaleDateString('es-CO', { year: 'numeric', month: 'long', day: 'numeric' })
+      : 'fecha no registrada';
+
+    let estadoTexto = 'en gestión, todavía sin resultado final';
+    if (c.resultado === 'radicado') {
+      const detalleRadicado = [
+        c.numero_radicado_dian ? `radicado ${c.numero_radicado_dian}` : null,
+        c.seccional ? `seccional ${c.seccional}` : null,
+      ]
+        .filter(Boolean)
+        .join(', ');
+      estadoTexto = `ya quedó radicado${detalleRadicado ? ` (${detalleRadicado})` : ''}`;
+    } else if (c.resultado === 'no_aplica') {
+      estadoTexto = `no aplicó${c.motivo_no_aplica ? ` (motivo: ${c.motivo_no_aplica})` : ''}`;
+    }
+
+    // Motivo de negociación: mostramos el más reciente que tenga dato (si el
+    // caso avanzó, un gate anterior puede haber quedado sin motivo porque se
+    // respondió "Sí").
+    const motivoNegociacion = c.motivo_rechazo || c.motivo_negociacion || c.motivo_no_interes || null;
+
+    return (
+      `• ${c.nombre_cliente || 'Sin nombre'} — ${c.tipo_identificacion || 'ID'} ${c.numero_identificacion || '—'}, ` +
+      `placa ${c.placa || '—'}, vehículo ${c.vehiculo || '—'}.\n` +
+      `  Estado del pipeline: ${c.estado_pipeline || 'sin definir'}${
+        c.estado_pipeline && descripcionEstadoPipeline(c.estado_pipeline)
+          ? ` (${descripcionEstadoPipeline(c.estado_pipeline)})`
+          : ''
+      }. Trámite ante la DIAN: ${estadoTexto}.` +
+      ` Última comunicación: ${fechaTexto}.` +
+      (c.siguiente_paso ? ` Siguiente paso: ${c.siguiente_paso}.` : '') +
+      (c.servicio_contratado ? ` Servicio contratado: ${c.servicio_contratado}.` : '') +
+      (c.escalamiento_documentos ? ` ${c.escalamiento_documentos}.` : '') +
+      (motivoNegociacion ? ` Motivo: ${motivoNegociacion}.` : '') +
+      (c.info_completa ? ` Información: ${c.info_completa}.` : '') +
+      (c.observaciones ? ` Observaciones: ${c.observaciones}.` : '')
+    );
+  });
+
+  const intro =
+    casos.length === 1
+      ? `Sí, encontré un caso ya registrado con "${termino}":`
+      : `Encontré ${casos.length} casos que coinciden con "${termino}" (el más reciente primero):`;
+
+  return `${intro}\n\n${bloques.join('\n\n')}\n\nAsí evitamos duplicar: si es el mismo trámite, sigue gestionando ese caso en vez de crear uno nuevo.`;
+}
+
+// Arma la respuesta de una búsqueda de cliente. Si hay una coincidencia exacta
+// por cédula/NIT o placa, se queda solo con esa. Si quedan varios, ofrece un
+// botón por cada uno para ELEGIR (antes no había forma de escoger).
+function resolverBusqueda(sesion, termino, resultados) {
+  const t = String(termino || '').trim();
+  const tPlaca = t.toUpperCase().replace(/[\s-]+/g, '');
+  const exactos = (resultados || []).filter(
+    (c) =>
+      (c.numero_identificacion && String(c.numero_identificacion).trim() === t) ||
+      (c.placa && String(c.placa).toUpperCase().replace(/[\s-]+/g, '') === tPlaca)
+  );
+  const lista = exactos.length > 0 ? exactos : resultados || [];
+  sesion.candidatoRetomar = null;
+  sesion.candidatosLista = null;
+  const reply = formatearResultadosBusqueda(lista, termino);
+  if (lista.length === 1) {
+    sesion.candidatoRetomar = lista[0];
+    return { reply, opciones: ['Retomar este caso', 'Mismo cliente, otro vehículo'] };
+  }
+  if (lista.length > 1) {
+    sesion.candidatosLista = lista.slice(0, 5);
+    const opciones = sesion.candidatosLista.map((c, i) => {
+      const dato = c.numero_identificacion || c.placa || '';
+      return `Elegir ${i + 1}: ${c.nombre_cliente || 'Sin nombre'}${dato ? ' · ' + dato : ''}`;
+    });
+    return {
+      reply: reply.replace(/\n\nAsí evitamos duplicar[^]*$/, '') +
+        '\n\nToca el cliente que buscas (o escríbeme su cédula/placa exacta) para retomarlo.',
+      opciones,
+    };
+  }
+  return { reply };
+}
+
+function siguienteIndicePendiente(campos, data) {
+  const idx = campos.findIndex((c) => !(c.id in data));
+  return idx === -1 ? campos.length : idx;
+}
+
+function resumenCampos(campos, data) {
+  return campos.map((c) => `• ${c.label}: ${data[c.id] ?? '—'}`).join('\n');
+}
+
+// Botón universal que se agrega a TODAS las preguntas de captura de datos:
+// si el cliente no tiene o no quiso dar ese dato, el asesor puede darle clic
+// y seguir sin quedar trabado esperando una respuesta que no va a llegar.
+const ETIQUETA_SALTAR = 'No tiene este dato';
+
+// Cuando al asesor le mostramos varias líneas candidatas de un vehículo (ver
+// más abajo, desambiguación) y ninguna es la correcta, le damos la opción de
+// escribir la referencia completa de una vez, en vez de solo poder saltar
+// directo a preguntar la tecnología a mano.
+const ETIQUETA_OTRO_VEHICULO = 'Otro (escribir la referencia completa)';
+
+// Cuando el campo que se le está preguntando al asesor tiene opciones fijas
+// (tipo "botones"/"botones_opcional"), se las mandamos a la extensión en
+// `opciones` para que las pinte como botones clicables, además del texto. A
+// esas opciones (o, si el campo es de texto libre, como única opción) se le
+// suma siempre el botón de "No tiene este dato".
+function conOpciones(base, campo) {
+  if (!campo) return base;
+  const opcionesCampo = campo.opciones || [];
+  // Los campos marcados "sinSaltar" son obligatorios: no se les agrega el
+  // botón de "No tiene este dato" (ej. nombre, teléfono, si se logró el
+  // contacto).
+  if (campo.sinSaltar) {
+    return opcionesCampo.length ? { ...base, opciones: opcionesCampo } : base;
+  }
+  return { ...base, opciones: [...opcionesCampo, ETIQUETA_SALTAR] };
+}
+
+// Normaliza algunas respuestas cortas a una etiqueta completa y legible.
+const TIPO_PERSONA_MAP = {
+  '1': 'Persona natural',
+  natural: 'Persona natural',
+  'persona natural': 'Persona natural',
+  particular: 'Persona natural',
+  '2': 'Persona jurídica',
+  juridica: 'Persona jurídica',
+  jurídica: 'Persona jurídica',
+  'persona juridica': 'Persona jurídica',
+  'persona jurídica': 'Persona jurídica',
+  empresa: 'Persona jurídica',
+  sociedad: 'Persona jurídica',
+  compañia: 'Persona jurídica',
+  compañía: 'Persona jurídica',
+};
+
+const TECNOLOGIA_MAP = {
+  electrico: 'Eléctrico',
+  eléctrico: 'Eléctrico',
+  electrica: 'Eléctrico',
+  eléctrica: 'Eléctrico',
+  ev: 'Eléctrico',
+  hibrido: 'Híbrido',
+  híbrido: 'Híbrido',
+  hibrida: 'Híbrido',
+  híbrida: 'Híbrido',
+  hybrid: 'Híbrido',
+  'hibrido enchufable': 'Híbrido enchufable',
+  'híbrido enchufable': 'Híbrido enchufable',
+  'hibrida enchufable': 'Híbrido enchufable',
+  'híbrida enchufable': 'Híbrido enchufable',
+  enchufable: 'Híbrido enchufable',
+  phev: 'Híbrido enchufable',
+  'plug-in': 'Híbrido enchufable',
+  'plug in': 'Híbrido enchufable',
+  reev: 'Híbrido de rango extendido',
+  'rango extendido': 'Híbrido de rango extendido',
+  'de rango extendido': 'Híbrido de rango extendido',
+};
+
+// ====== Base de referencia de vehículos que aplican al beneficio ======
+// Se usa para autocompletar/validar la tecnología apenas el asesor escribe
+// el vehículo del cliente. La base puede no estar completa todavía, así que
+// si un vehículo no aparece NO se bloquea el caso — solo se avisa al asesor
+// para que confirme bien que aplica, y queda registrado para ir creciendo la
+// base con el tiempo (tabla vehiculos_no_listados).
+let vehiculosReferenciaCache = null;
+let vehiculosReferenciaCacheEn = 0;
+const VEHICULOS_REFERENCIA_TTL_MS = 5 * 60 * 1000; // 5 minutos
+
+async function obtenerVehiculosReferenciaCacheada() {
+  const ahora = Date.now();
+  if (vehiculosReferenciaCache && ahora - vehiculosReferenciaCacheEn < VEHICULOS_REFERENCIA_TTL_MS) {
+    return vehiculosReferenciaCache;
+  }
+  try {
+    vehiculosReferenciaCache = await obtenerVehiculosReferencia();
+    vehiculosReferenciaCacheEn = ahora;
+  } catch (err) {
+    console.error('Error cargando la base de referencia de vehículos:', err);
+    // Si falla, seguimos con lo que hubiera en caché (aunque esté vencido) o
+    // con una lista vacía — nunca bloqueamos el flujo por esto.
+    vehiculosReferenciaCache = vehiculosReferenciaCache || [];
+  }
+  return vehiculosReferenciaCache;
+}
+
+function normalizarParaComparar(s) {
+  return (s || '')
+    .toString()
+    .toUpperCase()
     .normalize('NFD')
     .replace(/[̀-ͯ]/g, '')
+    .replace(/[^A-Z0-9 ]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Busca el vehículo que escribió el asesor (texto libre, ej. "Toyota
+ * Corolla Cross Hybrid") dentro de la base de referencia. No exige que
+ * coincida exactamente: alcanza con que la marca aparezca en el texto y que
+ * al menos una palabra significativa del modelo también aparezca.
+ *
+ * Devuelve TODAS las líneas que empatan en el mayor número de palabras
+ * coincidentes (no solo la "mejor"), para poder distinguir un match único de
+ * uno ambiguo. Ej.: "Toyota Corolla" a secas empata igual contra "Corolla
+ * Cross Seg Hev", "Corolla Xei Hv" y "Corolla Xli Hv" (solo coincide la
+ * palabra "Corolla" en los tres) — ahí no se puede adivinar cuál es, hay que
+ * preguntar. En cambio "Toyota Corolla Cross" ya coincide en 2 palabras
+ * ("Corolla" + "Cross") contra esa línea puntual, así que gana ella sola.
+ *
+ * Primero intenta anclar por marca + modelo (más confiable). Si el asesor no
+ * escribió la marca (ej. escribió solo "Corolla" sin "Toyota"), eso no debe
+ * hacer que el vehículo quede sin detectar — así que si esa primera pasada no
+ * encuentra nada, se reintenta comparando solo por el modelo.
+ */
+function buscarVehiculosEnReferencia(textoVehiculo, referencia) {
+  const texto = normalizarParaComparar(textoVehiculo);
+  if (!texto) return [];
+  const conMarca = coincidenciasVehiculo(texto, referencia, true);
+  if (conMarca.length > 0) return conMarca;
+  return coincidenciasVehiculo(texto, referencia, false);
+}
+
+// Distancia de edición (Levenshtein) entre dos palabras — cuenta cuántas
+// letras hay que cambiar/agregar/quitar para pasar de una a la otra. Se usa
+// para tolerar errores de tipeo (ej. "porolla" en vez de "Corolla") sin
+// tener que escribir la palabra exacta.
+function distanciaLevenshtein(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const fila = new Array(n + 1);
+  for (let j = 0; j <= n; j++) fila[j] = j;
+  for (let i = 1; i <= m; i++) {
+    let anterior = fila[0];
+    fila[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const temp = fila[j];
+      const costo = a[i - 1] === b[j - 1] ? 0 : 1;
+      fila[j] = Math.min(fila[j] + 1, fila[j - 1] + 1, anterior + costo);
+      anterior = temp;
+    }
+  }
+  return fila[n];
+}
+
+// Cuántas letras de diferencia se toleran antes de considerar que dos
+// palabras ya no son "la misma, con un error de tipeo". Palabras muy cortas
+// (3 letras o menos, ej. "KIA", "MG") no toleran ningún error, para no
+// confundir marcas distintas que se parecen; palabras más largas toleran 1
+// o 2 letras de diferencia.
+function toleranciaTipeo(longitud) {
+  if (longitud <= 3) return 0;
+  if (longitud <= 7) return 1;
+  return 2;
+}
+
+// Compara una palabra de la referencia (ej. "COROLLA") contra todas las
+// palabras que escribió el asesor, aceptando tanto coincidencia exacta como
+// un error de tipeo pequeño (ej. "POROLLA" o "COROLA").
+function algunaPalabraCoincide(palabraReferencia, palabrasTexto) {
+  const tolerancia = toleranciaTipeo(palabraReferencia.length);
+  for (const palabraTexto of palabrasTexto) {
+    if (palabraTexto === palabraReferencia) return true;
+    if (tolerancia === 0) continue;
+    // Si la diferencia de longitud ya supera la tolerancia, ni vale la pena
+    // calcular la distancia completa.
+    if (Math.abs(palabraTexto.length - palabraReferencia.length) > tolerancia) continue;
+    if (distanciaLevenshtein(palabraTexto, palabraReferencia) <= tolerancia) return true;
+  }
+  return false;
+}
+
+function coincidenciasVehiculo(texto, referencia, exigirMarca) {
+  const palabrasTexto = texto.split(' ').filter(Boolean);
+  let mejores = [];
+  let mejorCoincidencias = 0;
+  for (const v of referencia) {
+    if (exigirMarca) {
+      const marcaNorm = normalizarParaComparar(v.marca);
+      if (!marcaNorm) continue;
+      const marcaCoincide = texto.includes(marcaNorm) || algunaPalabraCoincide(marcaNorm, palabrasTexto);
+      if (!marcaCoincide) continue;
+    }
+    const palabrasModelo = normalizarParaComparar(v.modelo)
+      .split(' ')
+      .filter((p) => p.length >= 3);
+    if (palabrasModelo.length === 0) continue;
+    const coincidencias = palabrasModelo.filter(
+      (p) => texto.includes(p) || algunaPalabraCoincide(p, palabrasTexto)
+    ).length;
+    if (coincidencias === 0) continue;
+    if (coincidencias > mejorCoincidencias) {
+      mejorCoincidencias = coincidencias;
+      mejores = [v];
+    } else if (coincidencias === mejorCoincidencias) {
+      mejores.push(v);
+    }
+  }
+  return mejores;
+}
+
+/**
+ * Arma la pregunta para que el asesor precise cuál de varias líneas
+ * candidatas es la correcta. Se dirige al asesor por su nombre y suena a
+ * pregunta de conversación normal (ej. "Migue, ¿el cliente tiene un Toyota
+ * Corolla Cross, Seg, Xei o Xli?"), en vez de mostrar solo una lista fría de
+ * referencias técnicas.
+ */
+function construirPreguntaDesambiguarVehiculo(candidatos, asesor) {
+  const saludo = asesor ? `${asesor}, ` : '';
+  const marca = candidatos[0].marca;
+  // Palabras del modelo que se repiten en TODAS las líneas candidatas (ej.
+  // "COROLLA" en Corolla Cross/Seg/Xei/Xli) — sirven para nombrar el modelo
+  // en la pregunta ("Toyota Corolla") y no solo la marca ("Toyota").
+  const palabrasComunes = normalizarParaComparar(candidatos[0].modelo)
+    .split(' ')
+    .filter((p) => candidatos.every((c) => normalizarParaComparar(c.modelo).split(' ').includes(p)));
+  const modeloComun = palabrasComunes.length > 0 ? ` ${palabrasComunes.join(' ')}` : '';
+  const lista = candidatos.map((c, i) => `${i + 1}. ${c.marca} ${c.modelo}`).join('\n');
+  return (
+    `${saludo}encontré varias versiones de ${marca}${modeloComun} que podrían ser — no quiero adivinar cuál le queda al cliente. ` +
+    `¿Cuál de estas es exactamente?\n\n${lista}\n\nResponde con el número, dale clic a "${ETIQUETA_OTRO_VEHICULO}" si es otra línea distinta y me escribes la referencia completa, o a "${ETIQUETA_SALTAR}" si de plano no la sabes.`
+  );
+}
+
+// Botones para la pregunta de desambiguar vehículo: uno por cada línea
+// candidata (para poder responder con un clic), más "Otro" (para escribir la
+// referencia completa cuando ninguna de las opciones listadas es la
+// correcta) y "No tiene este dato" (para cuando el asesor de verdad no sabe
+// cuál es) — no debe quedar bloqueado sin poder avanzar por ninguno de los
+// dos motivos.
+function opcionesDesambiguarVehiculo(candidatos) {
+  return [...candidatos.map((c) => `${c.marca} ${c.modelo}`), ETIQUETA_OTRO_VEHICULO, ETIQUETA_SALTAR];
+}
+
+const TIPO_IDENTIFICACION_MAP = {
+  cc: 'CC',
+  'c.c': 'CC',
+  'c.c.': 'CC',
+  cedula: 'CC',
+  cédula: 'CC',
+  'cedula de ciudadania': 'CC',
+  'cédula de ciudadanía': 'CC',
+  ce: 'CE',
+  'c.e': 'CE',
+  'c.e.': 'CE',
+  'cedula de extranjeria': 'CE',
+  'cédula de extranjería': 'CE',
+  nit: 'NIT',
+  ti: 'TI',
+  'tarjeta de identidad': 'TI',
+  pasaporte: 'Pasaporte',
+  passport: 'Pasaporte',
+};
+
+// Pone en "Nombre Propio" un texto que el asesor escribió libremente (nombre
+// del cliente, vehículo, nombre del asesor): primera letra de cada palabra
+// en mayúscula, el resto en minúscula — así no importa si lo escriben todo
+// en mayúsculas, todo en minúsculas o mezclado, siempre queda parejo. Los
+// conectores cortos (de, del, la...) se dejan en minúscula salvo que sean la
+// primera palabra, para que se vea como un nombre real y no un título.
+const CONECTORES_NOMBRE = new Set(['de', 'del', 'la', 'las', 'los', 'y']);
+function capitalizarNombrePropio(texto) {
+  return texto
+    .trim()
+    .replace(/\s+/g, ' ')
     .toLowerCase()
+    .split(' ')
+    .map((palabra, i) => {
+      if (i > 0 && CONECTORES_NOMBRE.has(palabra)) return palabra;
+      return palabra.charAt(0).toUpperCase() + palabra.slice(1);
+    })
+    .join(' ');
+}
+
+function normalizarValorCampo(campoId, valorCrudo) {
+  const valor = valorCrudo.trim();
+  if (campoId === 'tipo_persona') {
+    return TIPO_PERSONA_MAP[valor.toLowerCase()] || valor;
+  }
+  if (campoId === 'tecnologia') {
+    return TECNOLOGIA_MAP[valor.toLowerCase()] || valor;
+  }
+  if (campoId === 'tipo_identificacion') {
+    return TIPO_IDENTIFICACION_MAP[valor.toLowerCase()] || valor;
+  }
+  if (campoId === 'placa') {
+    return valor.toUpperCase().replace(/[\s-]+/g, '');
+  }
+  if (campoId === 'nombre_cliente' || campoId === 'vehiculo') {
+    return capitalizarNombrePropio(valor);
+  }
+  if (campoId === 'email') {
+    return valor.toLowerCase();
+  }
+  return valor;
+}
+
+// Interpreta una respuesta de sí/no dicha de forma natural (no exige que el
+// asesor responda EXACTAMENTE "sí" o "no"). Ojo: \b de JS no funciona bien
+// con tildes (í, é...), así que en vez de \b delimitamos con espacios.
+function interpretarSiNo(texto) {
+  const limpio = texto
+    .toLowerCase()
+    .replace(/[.,;:!¿?¡]/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim();
-
-const OP = {
-  NUEVO: 'Tengo un cliente interesado',
-  BUSCAR: 'Buscar cliente',
-  RESUMEN: 'Resumen de hoy',
-  RESUMEN_EQUIPO: 'Resumen del equipo',
-  VENTA: 'Registrar venta',
-  NO_VENTA: 'No se interesó',
-  COBERTURA: 'Actualizar cobertura',
-  CANCELAR: 'Cancelar',
-  HOY: 'Mis clientes',
-  RESUMEN_MES: 'Resumen del mes',
-  RELLAMAR: 'Volver a llamar',
-  RELLAMADAS: 'Mis volver a llamar',
-  ESCALAMIENTOS: 'Mis escalamientos',
-  VENTAS: 'Mis ventas',
-  OT_ACTIVA: 'OT activa',
-  MIS_OT: 'Mis OT activas',
-  EDITAR: '✏️ Editar datos',
-  NOTA: '📝 Agregar nota',
-  ALERTAS: '🔥 Clientes recuperables',
-  ESCALAR: 'Escalamiento',
-};
-const MENU = [OP.NUEVO, OP.BUSCAR, OP.HOY, OP.RELLAMADAS, OP.RESUMEN];
-
-const INTENCIONES = [
-  ['cancelar', /^(cancelar|cancela|salir|olvidalo|reiniciar|empezar de nuevo)$/],
-  ['menu', /^(nuevo|nueva|menu|opciones|ayuda|inicio|hola+|holi+|oli+|ola+|hey|buenas|buen dia|buenos dias|buenas tardes|buenas noches|que mas|que hubo|quiubo|saludos|que puedes hacer|que haces|\+ ?nuevo)[\s.!?,]*(marce)?[.!?]*$/],
-  ['hoy', /clientes\s+de\s+hoy|mis\s+clientes|mi\s+historial|^historial|mis\s+interesados|interesados\s+de\s+hoy|los\s+de\s+hoy|registrados\s+hoy|lista\s+de\s+(hoy|clientes)/],
-  ['resumen_mes', /resumen\s+del\s+mes|como\s+voy\s+(en\s+)?(el|este)\s+mes|numeros\s+del\s+mes|en\s+el\s+mes/],
-  ['resumen_equipo', /resumen\s+(del|de\s+todo\s+el)\s+equipo|como\s+va\s+el\s+equipo|numeros\s+del\s+equipo/],
-  ['alertas', /alerta|recuperable|confirmo\s+cobertura|si\s+tenia\s+cobertura/],
-  ['resumen', /resumen|consolid|como\s+voy|mis\s+numeros|cuant[oa]s\s+(llevo|tengo|van|ventas|interesados)/],
-  ['venta', /registrar\s+(la\s+|una\s+)?venta|(es|fue|hubo|cerre|cerramos|se\s+hizo)\s+(una\s+)?venta|^venta$|ya\s+compro|acepto\s+la\s+oferta/],
-  ['no_venta', /no\s+se\s+intereso|no\s+le\s+intereso|no\s+(esta|estuvo)\s+interesad|^no\s+venta$|no\s+quiso|rechazo/],
-  ['cobertura', /(actualizar|cambiar|corregir)\s+(la\s+)?cobertura/],
-  ['misot', /mis\s+ot|ots?\s+activas|mis\s+ordenes|seguimiento\s+(de\s+)?ot/],
-  ['ot_activa', /ot\s+activa|tiene\s+(una\s+)?ot\b|orden\s+(de\s+trabajo\s+)?activa|^ot$/],
-  ['misventas', /mis\s+ventas|ventas\s+(del\s+mes|instaladas|pendientes)|como\s+van\s+mis\s+ventas|instalacion(es)?\s+pendientes/],
-  ['escalamientos', /mis\s+escalamientos|escalamientos\s+pendientes|como\s+van\s+(mis\s+)?escalamientos/],
-  ['escalar', /escalar|escalamiento|escalacion|crear\s+(la\s+)?direccion|validar\s+(la\s+)?cedula|cartera|factibilidad/],
-  ['nota', /agregar\s+(una\s+)?nota|dejar\s+(una\s+)?nota|poner\s+(una\s+)?nota|^nota$|^observaci/],
-  ['editar', /editar|corregir\s+(un\s+|el\s+|los\s+)?datos?|cambiar\s+(un\s+|el\s+|los\s+)?datos?|actualizar\s+(un\s+|el\s+|los\s+)?datos?|modificar|me\s+equivoque/],
-  ['rellamadas', /mis\s+volver\s+a\s+llamar|mis\s+rellamadas|rellamadas\s+(de\s+hoy|pendientes)|a\s+quien\s+(debo|tengo\s+que)\s+(volver\s+a\s+)?llamar|^rellamadas$|pendientes\s+por\s+llamar/],
-  ['rellamar', /volver\s+a\s+llamar|rellamar|reprogramar|agendar\s+(una\s+)?(llamada|rellamada)|llamar\s+(despues|mas\s+tarde|otro\s+dia|manana)/],
-  ['nuevo', /(tengo|hay|tenemos)\s+(un|una)?\s*(cliente|persona|prospecto)?\s*(interesad|nuev)|cliente\s+interesad|nuevo\s+(interesado|prospecto|cliente)|registrar\s+(un\s+)?interesado/],
-  ['buscar', /^(buscar|busca|buscame|consultar|consulta)\b|buscar\s+(a|al|el|la)?\s*cliente|(info|informacion|datos|estado|ficha)\s+(de|del)\s+|como\s+va\s+(el|la)?\s*cliente|ya\s+(fue|esta)\s+(registrad|atendid)/],
-];
-function detectarIntencion(texto) {
-  const t = norm(texto);
-  for (const [nombre, re] of INTENCIONES) if (re.test(t)) return nombre;
+  const t = ` ${limpio} `;
+  if (/ (no|aún no|aun no|todavía no|todavia no|negativo|no lo tiene|no la tiene|hay que tramitarlo|desde cero) /.test(t)) {
+    return 'no';
+  }
+  if (/ (s[ií]|claro|correcto|exacto|afirmativo|listo|ya lo tiene|ya la tiene|ya tiene) /.test(t)) {
+    return 'sí';
+  }
   return null;
 }
 
-// "buscar a maría gómez" → "maría gómez"
-function extraerTermino(texto) {
-  let t = String(texto || '').trim();
-  const quitar = [
-    /^por\s+favor\s+/i,
-    /^(buscar|busca|búscame|buscame|consultar|consulta|dame|traeme|tráeme|quiero|necesito)\s+/i,
-    /^(la|el)\s+/i,
-    /^(info|información|informacion|datos|estado|ficha)\s+/i,
-    /^(de la|del|de|al|a|el|la)\s+/i,
-    /^(cliente|clienta|señor|señora|sr\.?|sra\.?)(\s+|$)/i,
-  ];
-  for (let i = 0; i < 2; i++) for (const re of quitar) t = t.replace(re, '').trim();
-  t = t.replace(/[?¿!¡.]+$/g, '').trim();
-  return t.length >= 3 ? t : null;
-}
-
-const esCelular = (t) => /^3\d{9}$/.test(String(t).replace(/\D/g, '')) && String(t).replace(/[\d\s-]/g, '') === '';
-const esCedula = (t) => /^\d{6,10}$/.test(String(t).replace(/[\s.]/g, ''));
-
-// ---------------------------------------------------------------------------
-// Tarjetas y textos
-// ---------------------------------------------------------------------------
-const ESTADOS = { en_gestion: 'En gestión', venta: 'Venta', no_venta: 'No se interesó', volver_llamar: 'Volver a llamar', escalado: 'Escalado', ot_activa: 'OT activa' };
-
-// ---------------------------------------------------------------------------
-// Fechas de rellamada (hora Colombia)
-// ---------------------------------------------------------------------------
-const hoyCO = () => new Date(Date.now() - 5 * 3600 * 1000).toISOString().slice(0, 10);
-const sumarDias = (iso, n) => {
-  const d = new Date(iso + 'T12:00:00Z');
-  d.setUTCDate(d.getUTCDate() + n);
-  return d.toISOString().slice(0, 10);
-};
-const DIAS = ['domingo', 'lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado'];
-function fechaBonita(iso) {
-  if (!iso) return '';
-  const hoy = hoyCO();
-  if (iso === hoy) return 'hoy';
-  if (iso === sumarDias(hoy, 1)) return 'mañana';
-  return new Date(iso + 'T12:00:00Z').toLocaleDateString('es-CO', { timeZone: 'UTC', weekday: 'long', day: 'numeric', month: 'short' });
-}
-function textoRellamada(c) {
-  return [fechaBonita(c.rellamar_fecha), c.rellamar_hora].filter(Boolean).join(' · ');
-}
-// "hoy", "mañana", "pasado mañana", "viernes", "18/10", "18/10/2026", "en 3 dias"
-function validarFechaFutura(crudo) {
-  const t = norm(crudo).replace(/[.,]/g, ' ').replace(/\s+/g, ' ').trim();
-  const hoy = hoyCO();
-  let iso = null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) iso = t;
-  else if (/^hoy\b/.test(t)) iso = hoy;
-  else if (/^pasado\s*manana/.test(t)) iso = sumarDias(hoy, 2);
-  else if (/^manana/.test(t)) iso = sumarDias(hoy, 1);
-  else if (/^en\s+(\d{1,2})\s+dias?/.test(t)) iso = sumarDias(hoy, parseInt(t.match(/^en\s+(\d{1,2})/)[1], 10));
-  else {
-    const dia = DIAS.findIndex((d) => t.startsWith(d) || t.startsWith('el ' + d) || t.startsWith('este ' + d) || t.startsWith('proximo ' + d));
-    if (dia >= 0) {
-      const hoyDia = new Date(hoy + 'T12:00:00Z').getUTCDay();
-      let n = (dia - hoyDia + 7) % 7;
-      if (n === 0) n = 7;
-      iso = sumarDias(hoy, n);
-    } else {
-      const m = t.match(/^(\d{1,2})\s*[\/-]\s*(\d{1,2})(?:\s*[\/-]\s*(\d{2,4}))?$/);
-      if (m) {
-        let anio = m[3] ? parseInt(m[3], 10) : parseInt(hoy.slice(0, 4), 10);
-        if (anio < 100) anio += 2000;
-        const cand = `${anio}-${String(m[2]).padStart(2, '0')}-${String(m[1]).padStart(2, '0')}`;
-        const d = new Date(cand + 'T12:00:00Z');
-        if (!isNaN(d) && d.toISOString().slice(0, 10) === cand) iso = !m[3] && cand < hoy ? `${anio + 1}${cand.slice(4)}` : cand;
-      }
-    }
+// Valida y normaliza la respuesta del asesor para un campo. Los campos
+// marcados con tipo "si_no" se interpretan de forma conversacional en vez de
+// exigir una palabra exacta.
+function validarYNormalizarCampo(campo, mensajeCrudo) {
+  // El botón "No tiene este dato" funciona igual para cualquier tipo de
+  // campo (texto libre, botones, si_no): si el asesor le da clic (o lo
+  // escribe tal cual), se guarda null para ese dato y se sigue sin exigirlo.
+  // Va primero, antes de cualquier validación específica del tipo de campo.
+  // Los campos "sinSaltar" son obligatorios, así que ni siquiera aceptan
+  // esta frase como respuesta válida (queda igual que si la hubieran
+  // escrito como cualquier otro texto que no cumple el formato esperado).
+  if (!campo.sinSaltar && normalizarTexto(mensajeCrudo).trim() === normalizarTexto(ETIQUETA_SALTAR).trim()) {
+    return { ok: true, valor: null };
   }
-  if (!iso) return { ok: false };
-  if (iso < hoy) return { ok: false, mensaje: 'Esa fecha ya pasó. ¿Para cuándo quedó la nueva llamada?' };
-  return { ok: true, valor: iso };
-}
 
-// Fecha de una venta de días anteriores: desde hace 31 días hasta hoy.
-const DIAS_ATRAS = 31;
-function validarFechaPasada(crudo) {
-  const t = norm(crudo).replace(/^📅\s*/, '');
-  const hoy = hoyCO();
-  let iso = null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) iso = t;
-  else if (/^hoy\b/.test(t)) iso = hoy;
-  else if (/^antier|^anteayer/.test(t)) iso = sumarDias(hoy, -2);
-  else if (/^ayer/.test(t)) iso = sumarDias(hoy, -1);
-  else {
-    const m = t.match(/^(\d{1,2})\s*[\/-]\s*(\d{1,2})(?:\s*[\/-]\s*(\d{2,4}))?$/);
-    if (m) {
-      let anio = m[3] ? parseInt(m[3], 10) : parseInt(hoy.slice(0, 4), 10);
-      if (anio < 100) anio += 2000;
-      const cand = `${anio}-${String(m[2]).padStart(2, '0')}-${String(m[1]).padStart(2, '0')}`;
-      const d = new Date(cand + 'T12:00:00Z');
-      if (!isNaN(d) && d.toISOString().slice(0, 10) === cand) iso = !m[3] && cand > hoy ? `${anio - 1}${cand.slice(4)}` : cand;
-    }
+  if (campo.tipo === 'si_no') {
+    const valor = interpretarSiNo(mensajeCrudo);
+    if (!valor) return { ok: false };
+    return { ok: true, valor };
   }
-  if (!iso) return { ok: false };
-  if (iso > hoy) return { ok: false, mensaje: 'La venta no puede ser de una fecha futura.' };
-  if (iso < sumarDias(hoy, -DIAS_ATRAS)) return { ok: false, mensaje: `Solo se pueden registrar ventas de los últimos ${DIAS_ATRAS} días.` };
-  return { ok: true, valor: iso };
-}
 
-const TEXTO_TORRE = { instalado: '✅ Instalado', reagendado: '📅 Reagendado', cancelado: '🚫 Cancelado', pendiente: '⏳ Pendiente', iniciado: '🚚 Iniciado', sin_iniciar_am: '🕗 Sin iniciar AM', sin_iniciar_pm: '🕑 Sin iniciar PM' };
-const fechaDM = (iso) => (/^\d{4}-\d{2}-\d{2}/.test(iso || '') ? iso.slice(0, 10).split('-').reverse().join('/') : '');
-const textoTorre = (v) => v.torre_salida ? `Torre: ${TEXTO_TORRE[v.torre_salida] || v.torre_salida}${v.torre_fecha_reagenda ? ` → ${fechaDM(v.torre_fecha_reagenda)}` : ''}${v.torre_motivo ? ` (${v.torre_motivo})` : ''}` : '';
-const TEXTO_APROBACION = { cantada_viable: '✅ Cantada viable', cantada_no_viable: '⚖️ Cantada no viable (50/50)', rechazada: '⛔ Rechazada (no cantada)' };
-// Estado de instalación de una venta (lo marca el back office en el panel).
-function textoInstalacion(v) {
-  const fecha = v.instalacion_fecha
-    ? ' · ' + new Date(v.instalacion_fecha).toLocaleDateString('es-CO', { timeZone: 'America/Bogota', day: 'numeric', month: 'short' })
-    : '';
-  if (v.estado_instalacion === 'instalada') return '✅ Instalada' + fecha;
-  if (v.estado_instalacion === 'no_instalada') return '❌ No instalada' + fecha;
-  if (v.estado_instalacion === 'cancelada') return '🚫 Cancelada' + fecha;
-  return '⏳ Pendiente de instalación';
-}
-
-// Lo que el back office dijo sobre la cobertura (auditoría desde el panel).
-function textoAuditoria(c) {
-  if (c.auditoria_cobertura === 'confirmada') return ' · ✅ auditada';
-  if (c.auditoria_cobertura === 'sin_cobertura') return ' · ❌ auditoría: sin cobertura';
-  return '';
-}
-
-// 🔔 Alerta: el asesor marcó "No" y el back confirmó que SÍ tiene cobertura.
-// Se apaga sola cuando el asesor vuelve a gestionar al cliente (actualiza cobertura,
-// registra venta, no se interesó, volver a llamar…).
-function alertaCobertura(c) {
-  if (!c || c.auditoria_cobertura !== 'confirmada' || norm(c.cobertura_validada) !== 'no') return false;
-  if (c.resultado === 'venta') return false;
-  const aud = new Date(c.auditoria_fecha || 0).getTime();
-  const upd = new Date(c.updated_at || 0).getTime();
-  return !(upd - aud > 60000);
-}
-async function alertasDe(asesor) {
-  return (await db.alertasCobertura(asesor)).filter(alertaCobertura);
-}
-
-function tarjetaDe(c) {
-  const fecha = c.created_at
-    ? new Date(c.created_at).toLocaleString('es-CO', { timeZone: 'America/Bogota', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })
-    : '';
-  const cob = norm(c.cobertura_validada);
-  const detalles = [
-    ['Gestiona', c.asesor],
-    ['Teléfono', c.telefono],
-    ['Dirección', [c.direccion, c.ciudad, regionalDe(c.ciudad, c.datos?.departamento)].filter(Boolean).join(' · ')],
-    ['Cobertura', (cob === 'si' ? 'Sí' : cob === 'no' ? 'No' : 'Sin validar') + textoAuditoria(c)],
-    ['Registrado', fecha],
-  ];
-  if (alertaCobertura(c)) detalles.unshift(['🔥 Recuperable', 'El back confirmó que SÍ tiene cobertura — vuelve a llamarlo']);
-  if (c.venta) {
-    const v = c.venta;
-    if (v.datos?.registrada_el && v.created_at) {
-      detalles.push(['📅 Fecha venta', new Date(v.created_at).toLocaleDateString('es-CO', { timeZone: 'America/Bogota', day: 'numeric', month: 'short' }) + ' (fecha anterior)']);
-    }
-    detalles.push(['Tipo de venta', v.tipo_venta || v.datos?.tipo_venta]);
-    const serv = v.servicios_vendidos || v.datos?.servicios_vendidos;
-    if (serv) detalles.push(['Servicios vendidos', String(serv)]);
-    const multi = v.multiasistencia || v.datos?.multiasistencia;
-    if (multi) detalles.push(['Multiasistencia', norm(multi) === 'si' ? `Sí · ${v.multiasistencia_cual || v.datos?.multiasistencia_cual || ''}` : 'No']);
-    const ott = v.ott || v.datos?.ott;
-    if (ott) detalles.push(['OTT', norm(ott) === 'si' ? `Sí · ${v.ott_cual || v.datos?.ott_cual || ''}` : 'No']);
-    detalles.push(['Cédula', v.cedula], ['Plan', v.plan], ['OT', v.numero_ot], ['Cuenta', v.numero_cuenta]);
-    detalles.push(['Agenda', [v.fecha_agenda, v.hora_agenda].filter(Boolean).join(' · ')]);
-    detalles.push(['Instalación', textoInstalacion(v)]);
-    if (v.instalacion_nota) detalles.push([/no_instalada|cancelada/.test(v.estado_instalacion || '') ? 'Motivo' : 'Nota instalación', v.instalacion_nota]);
-    if (v.torre_salida) detalles.push(['Torre de control', textoTorre(v).replace(/^Torre: /, '')]);
-    if (v.aprobacion_bo) detalles.push(['Aprobación BO', TEXTO_APROBACION[v.aprobacion_bo] + (v.aprobacion_motivo ? ` · ${v.aprobacion_motivo}` : '')]);
+  // Campos con botones fijos (canal, origen, contacto logrado, certificado
+  // UPME): la extensión manda de vuelta exactamente el texto del botón que
+  // el asesor clickeó, así que comparamos ignorando mayúsculas/tildes por si
+  // lo escribe a mano en vez de dar clic.
+  if (campo.tipo === 'botones') {
+    const entrada = normalizarTexto(mensajeCrudo).trim();
+    const match = (campo.opciones || []).find((o) => normalizarTexto(o).trim() === entrada);
+    if (!match) return { ok: false };
+    return { ok: true, valor: match };
   }
-  if (c.resultado === 'no_venta' && c.motivo_no_interes) detalles.push(['Motivo', c.motivo_no_interes]);
-  if (c.ot_activa_numero) {
-    const est = c.ot_activa_estado === 'liberada' ? '✅ liberada' : '⏳ activa';
-    detalles.push(['🧾 OT activa', `${c.ot_activa_numero} · ${est}`]);
-    if (c.ot_activa_respuesta) detalles.push(['Respuesta back', c.ot_activa_respuesta]);
+
+  // Campo opcional con botón de "Saltar" (ej. ID de redes sociales): si el
+  // asesor da clic en el botón, o escribe algo como "no tiene"/"ninguno", se
+  // guarda como null y seguimos; si escribe cualquier otra cosa, se guarda
+  // tal cual.
+  if (campo.tipo === 'botones_opcional') {
+    const entrada = mensajeCrudo.trim();
+    const entradaNorm = normalizarTexto(entrada);
+    const esSaltar =
+      (campo.opciones || []).some((o) => normalizarTexto(o).trim() === entradaNorm) ||
+      /^(saltar|no tiene|ninguno|n\/a|no aplica|no)$/i.test(entrada);
+    if (esSaltar) return { ok: true, valor: null };
+    if (!entrada) return { ok: false };
+    return { ok: true, valor: entrada };
   }
-  if (c.escalamiento_tipo) {
-    const est = c.escalamiento_estado === 'resuelto' ? '✅ resuelto' : '⏳ pendiente';
-    detalles.push(['🛠 Escalamiento', `${c.escalamiento_tipo} · ${est}`]);
-    if (c.escalamiento_detalle) detalles.push(['Detalle', c.escalamiento_detalle]);
-    if (c.escalamiento_respuesta) detalles.push(['Respuesta back', c.escalamiento_respuesta]);
-  }
-  if (c.resultado === 'volver_llamar') {
-    detalles.push(['📞 Volver a llamar', textoRellamada(c)]);
-    if (c.rellamar_nota && norm(c.rellamar_nota) !== 'ninguna') detalles.push(['Nota', c.rellamar_nota]);
-  }
-  const obs = c.venta?.observaciones || c.observaciones;
-  if (obs && norm(obs) !== 'ninguna') detalles.push(['📝 Observaciones', obs]);
-  const estado = c.resultado || 'en_gestion';
-  const horaCorta = c.created_at
-    ? new Date(c.created_at).toLocaleTimeString('es-CO', { timeZone: 'America/Bogota', hour: 'numeric', minute: '2-digit' })
-    : '';
-  return {
-    id: c.id,
-    horaCorta,
-    nombre: c.nombre_cliente || 'Sin nombre',
-    estado,
-    estadoTexto: ESTADOS[estado] || estado,
-    detalles: detalles.filter(([, v]) => v).map(([label, valor]) => ({ label, valor: String(valor) })),
-  };
+
+  const regex = new RegExp(campo.regex);
+  if (!regex.test(mensajeCrudo.trim())) return { ok: false };
+  return { ok: true, valor: normalizarValorCampo(campo.id, mensajeCrudo) };
 }
 
-function accionesPara(c) {
-  if (!c) return MENU;
-  const sinCobertura = norm(c.cobertura_validada) === 'no';
-  if (c.resultado === 'venta') return [OP.NOTA, OP.EDITAR, OP.BUSCAR, OP.NUEVO];
-  if (c.resultado === 'no_venta') return [OP.VENTA, OP.RELLAMAR, OP.OT_ACTIVA, OP.ESCALAR, OP.COBERTURA, OP.NOTA, OP.EDITAR];
-  if (sinCobertura) return [OP.COBERTURA, OP.ESCALAR, OP.NO_VENTA, OP.RELLAMAR, OP.NOTA, OP.EDITAR];
-  return [OP.VENTA, OP.NO_VENTA, OP.RELLAMAR, OP.OT_ACTIVA, OP.ESCALAR, OP.COBERTURA, OP.NOTA, OP.EDITAR];
+// Frases que disparan cada transición automáticamente, sin necesidad de
+// botones — el asesor simplemente cuenta cómo va el caso y Daniela
+// reacciona.
+//
+// Para el escalamiento a jurídico usamos un regex flexible (en vez de
+// frases exactas) para que funcione aunque el asesor meta palabras de por
+// medio, ej. "necesito escalar esto a jurídico" o "toca pasarlo a jurídico".
+const REGEX_ESCALAR_JURIDICO = /escalar.{0,25}jur[ií]dic|jur[ií]dic.{0,25}(escalar|revisa|decide|caso)|pasar.{0,20}a.{0,5}jur[ií]dic|consultar.{0,20}jur[ií]dic/;
+
+const FRASES_RADICADO = [
+  'ya se radicó', 'ya se radico', 'quedó radicado', 'quedo radicado', 'se radicó',
+  'se radico', 'radicamos el caso', 'ya radicamos', 'quedó bien radicado',
+  'quedo bien radicado', 'caso radicado', 'ya quedó en la dian', 'ya quedo en la dian',
+];
+const FRASES_NO_APLICA = [
+  'no aplica', 'no califica', 'no calificó', 'no califico', 'el carro no aplica',
+  'no cumple', 'se descartó', 'se descarto', 'no sigue el caso', 'no continuamos',
+  'cliente no sigue', 'el caso no procede', 'no procede el caso',
+];
+const FRASES_NUEVO_CASO = [
+  'tengo un cliente', 'tengo un caso', 'nuevo cliente', 'otro cliente',
+  'cliente interesado', 'quiere el trámite', 'quiere el tramite', 'quiere tramitar',
+  'nuevo caso', 'otro caso', 'siguiente cliente', 'siguiente caso', 'próximo cliente',
+  'proximo cliente', 'próximo caso', 'proximo caso', 'me llamó un cliente',
+  'me llamo un cliente', 'quiere el beneficio', 'pregunta por la devolución',
+  'pregunta por la devolucion', 'compró un carro eléctrico', 'compro un carro electrico',
+  'compró un híbrido', 'compro un hibrido', 'compró un eléctrico', 'compro un electrico',
+  'nueva gestión', 'nueva gestion', 'otro interesado', 'nuevo interesado',
+];
+
+// Frases para detectar cuando el asesor quiere revisar si un cliente ya fue
+// atendido antes (y traer su último caso), en vez de crear uno nuevo y
+// duplicar información. Es más específico que FRASES_NUEVO_CASO a propósito
+// (ej. exige "ya" + "atendido/gestionado/etc." o "duplicar"/"repetido") para
+// que "tengo un cliente nuevo" siga cayendo en __nuevo_caso__.
+// (Se agregaron además las variantes de "estado del caso"/"cómo va el caso":
+// un asesor preguntando "puedes brindarme estado del caso del cliente X" es
+// una consulta de estado tan válida como "buscar cliente", pero antes solo
+// caía en el flujo libre de IA, que no tiene acceso a Supabase y por eso
+// respondía que no podía consultar nada.)
+const REGEX_BUSCAR_CLIENTE = /(ya\s+(fue|lo|la|hab[ií]amos|est[aá]|estuvo)\s+(atendid|gestionad|contactad|llamad)|cliente\s+(repetid|duplicad)|ya\s+(ten[ií]a|tiene|hab[ií]a)\s+caso|ya\s+existe\s+(ese|el|la|este)?\s*cliente|buscar\s+(el\s+|la\s+)?cliente|buscar\s+(este|ese)\s+cliente|consultar\s+(el\s+|la\s+)?cliente|revisar\s+si\s+ya\s+(existe|est[aá]|lo\s+(tenemos|ten[ií]amos))|no\s+(quiero|queremos)\s+duplicar|ya\s+lo\s+hab[ií]amos\s+atendido|ya\s+hab[ií]amos\s+hablado\s+con|ya\s+es\s+cliente|verificar\s+si\s+ya|est[aá]\s+repetido|hist[oó]rico\s+de(l)?\s+cliente|revisar\s+(el\s+)?historial|estado\s+(actual\s+|actualizado\s+)?del?\s+(caso|cliente|tr[aá]mite)|c[oó]mo\s+va\s+(el|ese|su|este)?\s*(caso|tr[aá]mite)|en\s+qu[eé]\s+va\s+(el|ese|este)?\s*(caso|tr[aá]mite)|(brindar|dar|dame|darme|pasar|pasarme)(me)?\s+(el\s+)?(estado|informaci[oó]n)|informaci[oó]n\s+del\s+caso|info\s+del\s+caso|consultar\s+(el\s+)?estado)/i;
+
+// Si el mensaje que disparó "__buscar_cliente__" ya trae el nombre del
+// cliente (ej. "...del cliente michael barco"), lo extraemos para buscar de
+// una vez en vez de volver a preguntarle al asesor un dato que ya escribió.
+function extraerTerminoBusqueda(mensaje) {
+  const m = mensaje.match(/cliente\s+([a-záéíóúñ0-9.\-\s]{3,60})$/i);
+  if (!m) return null;
+  const termino = m[1].trim().replace(/[?.!¡¿]+$/g, '').trim();
+  if (!termino || /^(nuevo|repetido|duplicado|es)$/i.test(termino)) return null;
+  return termino;
 }
 
-// ---------------------------------------------------------------------------
-// Editar un dato de la ficha
-// ---------------------------------------------------------------------------
-// Datos que se pueden corregir: los del interesado siempre, los de la venta si tiene venta.
-const EDITABLES_INTERESADO = ['nombre_cliente', 'telefono', 'direccion', 'ciudad'];
-const EDITABLES_VENTA = ['tipo_venta', 'servicios_vendidos', 'multiasistencia', 'multiasistencia_cual', 'cedula', 'barrio', 'plan', 'numero_ot', 'numero_cuenta', 'fecha_agenda', 'hora_agenda', 'observaciones'];
-function campoEditable(id) {
-  const todos = [...(CAMPOS().interesado || []), ...(CAMPOS().venta || [])];
-  const def = todos.find((c) => c.id === id);
-  if (!def) return null;
-  if (id === 'observaciones') {
-    return { ...def, label: 'Observaciones', prompt: '📝 ¿Qué nota quieres dejar sobre este cliente? Escríbela como quieras 👇', opcionesSugeridas: undefined, regex: '^.{2,}$', errorMessage: 'Escribe la nota (mínimo 2 caracteres).' };
-  }
-  return { ...def, prompt: `✏️ Escribe el nuevo dato de **${def.label.toLowerCase()}**:`, opcionesSugeridas: undefined };
-}
-function editablesPara(c) {
-  const ids = [...EDITABLES_INTERESADO, ...(c?.venta ? EDITABLES_VENTA : ['observaciones'])];
-  return ids.map(campoEditable).filter(Boolean);
-}
-function valorActual(c, id) {
-  if (!c) return '';
-  if (id === 'observaciones') return c.venta?.observaciones || c.observaciones || '';
-  if (EDITABLES_VENTA.includes(id)) return c.venta?.[id] || '';
-  return c[id] || '';
-}
-function pedirNota(sesion) {
-  const c = sesion.cliente;
-  const campo = campoEditable('observaciones');
-  sesion.modo = 'captura';
-  sesion.captura = { tipo: 'editar', campoId: 'observaciones', campos: [campo], paso: 0, datos: {} };
-  const actual = valorActual(c, 'observaciones');
-  const previa = actual && norm(actual) !== 'ninguna' ? `Nota actual:\n${actual}\n\nLo que escribas se **agrega** (no se borra lo anterior).\n\n` : '';
-  return { reply: `${previa}📝 ¿Qué nota quieres dejar sobre **${c.nombre_cliente || 'este cliente'}**? Escríbela como quieras 👇`, opciones: [OP.CANCELAR] };
-}
-function pedirQueEditar(sesion) {
-  const c = sesion.cliente;
-  if (!c) return { reply: 'Primero abre la ficha del cliente (búscalo por nombre o celular).', opciones: [OP.BUSCAR, OP.HOY] };
-  sesion.modo = 'editar_elegir';
-  return {
-    reply: `✏️ ¿Qué dato de **${c.nombre_cliente || 'este cliente'}** deseas actualizar?`,
-    opciones: [...editablesPara(c).map((f) => f.label), OP.CANCELAR],
-  };
+// Quita tildes para comparar texto sin importar acentos.
+function normalizarTexto(s) {
+  return (s || '')
+    .toString()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '');
 }
 
-function preguntar(campo, cap) {
-  const resp = {
-    reply: campo.prompt,
-    progreso: { actual: cap.paso + 1, total: cap.campos.length, titulo: TITULOS[cap.tipo] },
-  };
-  const ops = campo.opciones || campo.opcionesSugeridas;
-  if (ops) resp.opciones = [...ops];
-  // Al preguntar la cobertura, se muestra la dirección en Google Maps para que el asesor la confirme.
-  const dir = cap.datos.direccion || cap.datos._direccion;
-  if (campo.id === 'cobertura' && dir) {
-    const ciudad = cap.datos.ciudad || cap.datos._ciudad || '';
-    const texto = [dir, ciudad].filter(Boolean).join(', ');
-    resp.reply = `📍 Esta es la dirección en Google Maps:\n**${texto}**\n¿La validaste bien?\n\n${campo.prompt}`;
-    const paraMapa = [cap.datos.direccion_original || dir, ciudad].filter(Boolean).join(', ');
-    resp.enlace = { texto: '🗺 Ver dirección en Google Maps', url: 'https://www.google.com/maps/search/?api=1&query=' + encodeURIComponent(paraMapa + ', Colombia') };
-  }
-  if (campo.entrada) {
-    resp.entrada = { tipo: campo.entrada, formato: campo.formato || 'iso' };
-    if (campo.tipo === 'fecha_pasada') Object.assign(resp.entrada, { min: sumarDias(hoyCO(), -DIAS_ATRAS), max: hoyCO() });
-    // Venta de un día anterior: la instalación pudo quedar agendada desde ese día.
-    // Fecha de instalación: se permite una fecha anterior a hoy (backlog), hasta 90 días atrás.
-    if (campo.id === 'fecha_agenda') resp.entrada.min = sumarDias(hoyCO(), -90);
-  }
-  return resp;
-}
-const TITULOS = { interesado: 'Nuevo interesado', venta: 'Registro de venta', no_venta: 'No se interesó', cobertura: 'Cobertura', rellamar: 'Volver a llamar', escalamiento: 'Escalamiento', ot_activa: 'OT activa', editar: 'Editar dato' };
+// Los 8 estados del pipeline comercial que define el negocio (distintos del
+// resultado final del trámite ante la DIAN, que es otra cosa: radicado /
+// no_aplica). El asesor los cambia escribiéndole a Daniela en lenguaje
+// natural, ej. "cambia el estado a cliente" o "márcalo como en proceso upme".
+// El pipeline llega hasta "Cliente" (ahí ya está ganado el caso). Lo que
+// pasa DESPUÉS de ganar (trámite UPME, DIAN, desembolso) ya NO es un estado
+// de este pipeline: vive aparte en la columna "estado_actual_cliente", que
+// por ahora solo se maneja desde el panel web (no por chat).
+const ESTADOS_PIPELINE = [
+  {
+    label: 'Registro',
+    frases: ['registro'],
+    descripcion: 'se intentó el contacto pero no se logró (el cliente no respondió o no se pudo hablar con él).',
+  },
+  {
+    label: 'Contacto',
+    frases: ['contacto'],
+    descripcion: 'el cliente se comunicó pero no brindó todos los datos.',
+  },
+  {
+    label: 'Interesado',
+    frases: ['interesado'],
+    descripcion: 'es el que llega y ya se completaron todos los datos que el cliente brinda.',
+  },
+  {
+    label: 'Negociación',
+    frases: ['negociacion', 'en negociacion', 'negociando'],
+    descripcion: 'el cliente ya confirmó que sigue interesado y se está negociando la propuesta (aceptación, siguiente paso, servicio contratado).',
+  },
+  {
+    label: 'Cliente',
+    frases: ['cliente'],
+    descripcion: 'ya tenemos todos los documentos que debe enviar el cliente, la firma del contrato y el pago realizado.',
+  },
+  {
+    label: 'Cierre perdido',
+    frases: ['cierre perdido'],
+    descripcion: 'el cliente no firmó contrato, no envió documentación y/o no realizó el pago.',
+  },
+];
 
-const conCliente = (sesion) => (sesion.cliente ? ` de ${sesion.cliente.nombre_cliente}` : '');
-
-// ---------------------------------------------------------------------------
-// Capturas (interesado, venta, no venta, cobertura)
-// ---------------------------------------------------------------------------
-// Salta los campos ya respondidos y los que dependen de otra respuesta (ej. "¿Cuál multiasistencia?" solo si dijo Sí).
-function avanzar(cap) {
-  while (cap.paso < cap.campos.length) {
-    const c = cap.campos[cap.paso];
-    if (c.id in cap.datos) { cap.paso += 1; continue; }
-    if (c.siCampo && norm(cap.datos[c.siCampo.id]) !== norm(c.siCampo.valor)) { cap.datos[c.id] = null; cap.paso += 1; continue; }
-    break;
-  }
-}
-function iniciarCaptura(sesion, tipo, datosPrevios = {}) {
-  const campos = CAMPOS()[tipo];
-  const cap = { tipo, campos, paso: 0, datos: { ...datosPrevios } };
-  // Campos que solo aparecen si el back los activó en el panel (ej. fecha de venta anterior).
-  for (const c of campos) if (c.soloSi && !activo(c.soloSi) && !(c.id in cap.datos)) cap.datos[c.id] = null;
-  avanzar(cap);
-  sesion.modo = 'captura';
-  sesion.captura = cap;
-  return preguntar(campos[cap.paso], cap);
+// Devuelve la explicación de negocio de un estado del pipeline (para
+// mostrársela al asesor junto con el estado, no solo la etiqueta).
+function descripcionEstadoPipeline(label) {
+  const encontrado = ESTADOS_PIPELINE.find((e) => e.label === label);
+  return encontrado ? encontrado.descripcion : null;
 }
 
-// ---------------------------------------------------------------------------
-// Ciudades / municipios de Colombia (1.119, fuente DANE). El asesor escribe y
-// Marce la reconoce aunque venga sin tilde o con errores de digitación.
-// ---------------------------------------------------------------------------
-let MUNICIPIOS = null;
-function municipios() {
-  if (!MUNICIPIOS) {
-    const lista = JSON.parse(leer('municipios.json'));
-    const repetidos = new Set(lista.map((m) => m[0]).filter((n, i, a) => a.indexOf(n) !== i));
-    MUNICIPIOS = lista.map(([nombre, depto]) => ({
-      nombre,
-      depto,
-      etiqueta: repetidos.has(nombre) ? `${nombre} (${depto})` : nombre,
-      llave: llaveCiudad(nombre),
-    }));
+// Compara el texto capturado como "estado destino" contra los estados
+// conocidos. Las frases de UNA sola palabra (cliente, contacto, interesado)
+// exigen coincidencia EXACTA (después de quitar artículos como "el/la/un") —
+// si aceptáramos "contiene", frases ya usadas en la app para otra cosa (ej.
+// "otro cliente" de FRASES_NUEVO_CASO) dispararían un cambio de estado por
+// error. Las frases de 2+ palabras (más específicas, ej. "proceso upme") sí
+// aceptan que el texto capturado las contenga, para tolerar variaciones
+// como "ya está en proceso upme".
+function identificarEstadoPipeline(textoCrudo) {
+  const norm = normalizarTexto(textoCrudo).trim().replace(/^(el|la|un|una|de|en)\s+/, '');
+  if (!norm) return null;
+
+  const candidatos = ESTADOS_PIPELINE.flatMap((e) =>
+    e.frases.map((f) => ({ label: e.label, frase: normalizarTexto(f) }))
+  );
+
+  for (const c of candidatos) {
+    if (norm === c.frase) return c.label;
   }
-  return MUNICIPIOS;
+  for (const c of candidatos) {
+    if (c.frase.split(' ').length >= 2 && norm.includes(c.frase)) return c.label;
+  }
+  return null;
 }
-function llaveCiudad(s) {
-  return norm(s)
-    .replace(/\b(d\.?\s?c\.?|distrito capital|distrito)\b/g, ' ')
-    .replace(/[^a-z0-9 ]/g, ' ')
+
+// Frases que indican que el asesor quiere CAMBIAR el estado del pipeline de
+// un cliente: un verbo de cambio ("cambia", "marca", "pasa", "actualiza",
+// "pon"...) seguido, en algún punto, de "a"/"como"/"en" + el estado destino
+// al final del mensaje. Solo capturamos el texto final (grupo 3): así, si el
+// mensaje también menciona "cliente <nombre>" antes (ej. "cambia el estado
+// del cliente juan pérez a cliente"), el nombre del cliente no se confunde
+// con la palabra "cliente" usada como estado destino.
+const REGEX_VERBO_CAMBIO_ESTADO = /\b(cambia|cambiar|actualiza|actualizar|pon|poner|marca|marcar|m[aá]rcal[oa]|pasa|pasar|p[aá]sal[oa]|mueve|mover|mu[eé]vel[oa])\b/i;
+
+// Saca el nombre del cliente de la parte del mensaje ANTES del conector que
+// introduce el estado destino. Primero intenta la frase explícita
+// "cliente <nombre>"; si no aparece (ej. "marca a michael barco como..."),
+// quita el verbo de cambio y palabras de relleno ("el estado", "del caso",
+// artículos) y usa lo que sobre como nombre — pero solo si sobra algo con
+// pinta de nombre real, para no terminar usando "estado" o "" como si fuera
+// un cliente.
+function extraerNombreDeCambioEstado(antes) {
+  const t = antes.trim();
+  const conCliente = t.match(/cliente\s+([a-záéíóúñ0-9.\-\s]{3,60})$/i);
+  if (conCliente) {
+    const nombre = conCliente[1].trim().replace(/[?.!¡¿]+$/g, '').trim();
+    if (nombre) return nombre;
+  }
+
+  // Solo miramos el texto que viene DESPUÉS de la última aparición del
+  // verbo de cambio, para no arrastrar palabras de relleno que el asesor
+  // haya escrito antes del verbo (ej. "necesito cambiar el estado a
+  // cliente" no debe capturar "necesito" como si fuera el nombre).
+  const verbos = [...t.matchAll(new RegExp(REGEX_VERBO_CAMBIO_ESTADO.source, 'gi'))];
+  const ultimoVerbo = verbos[verbos.length - 1];
+  const desdeVerbo = ultimoVerbo ? t.slice(ultimoVerbo.index + ultimoVerbo[0].length) : t;
+
+  const resto = desdeVerbo
+    .replace(/\b(el|la|los|las|del|de|al|a|un|una|como)\b/gi, ' ')
+    .replace(/\b(estado|pipeline|caso)\b/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-}
-const ALIAS_CIUDAD = { bogota: 'Bogotá D.C.', bta: 'Bogotá D.C.', 'cartagena de indias': 'Cartagena', 'san jose de cucuta': 'Cúcuta', mede: 'Medellín', 'santafe de bogota': 'Bogotá D.C.',
-  villavo: 'Villavicencio', bquilla: 'Barranquilla', 'b quilla': 'Barranquilla', bmanga: 'Bucaramanga', 'b manga': 'Bucaramanga',
-  'santa fe de bogota': 'Bogotá D.C.', 'bogota dc': 'Bogotá D.C.' };
-function distancia(a, b) {
-  if (Math.abs(a.length - b.length) > 3) return 99;
-  const f = Array.from({ length: b.length + 1 }, (_, i) => i);
-  for (let i = 1; i <= a.length; i++) {
-    let prev = f[0];
-    f[0] = i;
-    for (let j = 1; j <= b.length; j++) {
-      const tmp = f[j];
-      f[j] = Math.min(f[j] + 1, f[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
-      prev = tmp;
-    }
-  }
-  return f[b.length];
-}
-const DEJAR = '✍️ Dejar: ';
-function validarMunicipio(crudo) {
-  const texto = String(crudo || '').trim();
-  if (texto.startsWith(DEJAR)) {
-    const v = texto.slice(DEJAR.length).replace(/^"|"$/g, '').trim();
-    return v.length >= 3 ? { ok: true, valor: v } : { ok: false };
-  }
-  const lista = municipios();
-  // Botón elegido: "Granada (Meta)" o nombre exacto
-  const porEtiqueta = lista.find((m) => norm(m.etiqueta) === norm(texto));
-  if (porEtiqueta) return { ok: true, valor: porEtiqueta.etiqueta, extra: { departamento: porEtiqueta.depto } };
-  const k = llaveCiudad(texto);
-  if (k.length < 3) return { ok: false };
-  const alias = ALIAS_CIUDAD[k];
-  const exactos = alias ? lista.filter((m) => m.nombre === alias) : lista.filter((m) => m.llave === k);
-  if (exactos.length === 1) return { ok: true, valor: exactos[0].etiqueta, extra: { departamento: exactos[0].depto } };
-  if (exactos.length > 1) {
-    return { ok: false, mensaje: `Hay varios municipios llamados "${exactos[0].nombre}". ¿Cuál es?`, sugerencias: exactos.map((m) => m.etiqueta) };
-  }
-  const candidatos = lista
-    .map((m) => {
-      let d = distancia(k, m.llave);
-      if (m.llave.startsWith(k)) d = Math.min(d, 0.5);
-      else if (k.length >= 4 && m.llave.includes(k)) d = Math.min(d, 1);
-      return { m, d };
-    })
-    .filter((x) => x.d <= (k.length >= 7 ? 2 : 1))
-    .sort((a, b) => a.d - b.d || a.m.nombre.length - b.m.nombre.length)
-    .slice(0, 5);
-  if (candidatos.length === 1 && candidatos[0].d <= 1 && !candidatos[0].m.llave.startsWith(k)) {
-    // Un solo parecido muy cercano (ej. "medelin" → Medellín): lo tomamos de una.
-    const m = candidatos[0].m;
-    return { ok: true, valor: m.etiqueta, extra: { departamento: m.depto } };
-  }
-  return {
-    ok: false,
-    mensaje: candidatos.length
-      ? `No encontré "${texto}" exacto. ¿Es alguna de estas?`
-      : `No encontré "${texto}" entre los municipios de Colombia. Revisa cómo está escrito, o déjalo así si estás seguro.`,
-    sugerencias: [...candidatos.map((x) => x.m.etiqueta), `${DEJAR}${texto}`],
-  };
+
+  return resto.length >= 3 ? resto : null;
 }
 
-// ---------------------------------------------------------------------------
-// Direcciones homologadas (nomenclatura IGAC / Agustín Codazzi)
-// Ej.: "calle 6c # 82a-25 torre 1 apto 1103" → "CL 6C # 82A - 25 TO 1 AP 1103"
-// ---------------------------------------------------------------------------
-const VIAS = [
-  [/^(AVENIDA|AV|AVE|AVDA)\s*(CALLE|CL|CLL)$/, 'AC'],
-  [/^(AVENIDA|AV|AVE|AVDA)\s*(CARRERA|KR|CR|CRA|KRA)$/, 'AK'],
-  [/^(CALLE|CALL|CALLLE|CLL|CLLE|CL|CAL|CLE)$/, 'CL'],
-  [/^(CARRERA|CARERA|CARRRERA|CRA|CRR|CARR|CR|KRA|KR|KRR|CRRA|CAR)$/, 'KR'],
-  [/^(AVENIDA|AV|AVE|AVDA|AVN)$/, 'AV'],
-  [/^(DIAGONAL|DIAG|DG|DGNAL|DIAGNAL)$/, 'DG'],
-  [/^(TRANSVERSAL|TRANSV|TRANSVER|TRV|TR|TV|TRASVERSAL|TRANVERSAL)$/, 'TV'],
-  [/^(CIRCULAR|CIR|CIRC)$/, 'CIR'],
-  [/^(CIRCUNVALAR|CRV|CIRCUNV)$/, 'CRV'],
-  [/^(AUTOPISTA|AUTOP|AU)$/, 'AU'],
-  [/^(CARRETERA|CARRET|CT)$/, 'CT'],
-  [/^(VEREDA|VDA|VRDA)$/, 'VDA'],
-  [/^(KILOMETRO|KM)$/, 'KM'],
-];
-const COMPLEMENTOS = [
-  [/^(APARTAMENTO|APARTAMENT|APTO|APT|AP|APART|APTOS|DPTO|DEPARTAMENTO)$/, 'AP'],
-  [/^(TORRE|TORR|TOR|TO|T)$/, 'TO'],
-  [/^(BLOQUE|BLQ|BL|BLOQ)$/, 'BL'],
-  [/^(CASA|CS|CA)$/, 'CA'],
-  [/^(INTERIOR|INT|IN)$/, 'IN'],
-  [/^(PISO|PI|P)$/, 'PI'],
-  [/^(LOCAL|LC|LOC)$/, 'LC'],
-  [/^(OFICINA|OFI|OF)$/, 'OF'],
-  [/^(MANZANA|MZ|MZA|MANZ)$/, 'MZ'],
-  [/^(LOTE|LT|LTE)$/, 'LT'],
-  [/^(ETAPA|ET)$/, 'ET'],
-  [/^(CONJUNTO|CONJ|CJ|CONJUNTOS)$/, 'CONJ'],
-  [/^(EDIFICIO|EDIF|ED)$/, 'ED'],
-  [/^(URBANIZACION|URB|UR)$/, 'UR'],
-  [/^(BARRIO|BRR|BR|BARR)$/, 'BR'],
-  [/^(SECTOR|SEC|SC)$/, 'SC'],
-  [/^(UNIDAD|UND|UN)$/, 'UN'],
-  [/^(PORTERIA|PT)$/, 'PT'],
-  [/^(SOTANO|SS)$/, 'SS'],
-  [/^(FINCA|FCA)$/, 'FCA'],
-];
-const CARDINAL = { SUR: 'SUR', ESTE: 'ESTE', NORTE: 'NORTE', OESTE: 'OESTE', OCC: 'OESTE', OCCIDENTE: 'OESTE' };
-const mapear = (lista, w) => { for (const [re, v] of lista) if (re.test(w)) return v; return null; };
+// Devuelve { estadoLabel, nombre } si el mensaje pide cambiar el estado de un
+// cliente a un estado reconocido, o null si no aplica. Busca todas las
+// apariciones de "a"/"como" como conector y prueba desde la más cercana al
+// final hacia atrás: la primera cuyo texto siguiente coincide con uno de los
+// 8 estados conocidos es la que separa "a quién" de "a qué estado". Esto
+// evita depender de una sola conjetura de dónde está el conector correcto
+// cuando el mensaje tiene varias apariciones de "a" (una para el cliente,
+// otra para el estado).
+function detectarCambioEstado(mensaje) {
+  if (!REGEX_VERBO_CAMBIO_ESTADO.test(mensaje)) return null;
 
-function homologarDireccion(texto) {
-  const original = String(texto || '').trim();
-  let t = original
-    .toUpperCase()
-    .normalize('NFD').replace(/[̀-ͯ]/g, '')
-    .replace(/N[°º]\s*|\bNO\.\s*|\bNUMERO\b|\bNRO\.?\b/g, ' # ')
-    .replace(/[,;:()]/g, ' ')
-    .replace(/[#]/g, ' # ')
-    .replace(/[-–]/g, ' - ')
-    .replace(/\./g, ' ')
-    // separar números pegados a letras: 58ASUR → 58 A SUR ; TORRE2 → TORRE 2 ; AP1103 → AP 1103
-    .replace(/([A-Z]{2,})(\d)/g, '$1 $2')
-    .replace(/(\d)([A-Z]+)/g, (m, d, l) => {
-      if (l === 'BIS') return `${d} BIS`;
-      const m2 = l.match(/^([A-Z]?)(BIS)?([A-Z]?)(SUR|ESTE|NORTE|OESTE)?$/);
-      return m2 ? `${d} ${[m2[1], m2[2], m2[3], m2[4]].filter(Boolean).join(' ')}` : `${d} ${l}`;
-    })
-    .replace(/\s+/g, ' ')
-    .trim();
-  let w = t.split(' ').filter(Boolean);
-  // Tipo de vía (también "AVENIDA CALLE")
-  let via = null;
-  if (w.length >= 2) { via = mapear(VIAS, w[0] + ' ' + w[1]) ? mapear(VIAS, w[0] + ' ' + w[1]) : null; if (via && /^(AC|AK)$/.test(via)) w = w.slice(2); else via = null; }
-  if (!via && w.length) { via = mapear(VIAS, w[0]); if (via) w = w.slice(1); }
-  if (!via) return { ok: false, original };
-  if (via === 'VDA' || via === 'KM' || via === 'CT' || via === 'AU') {
-    return { ok: true, valor: [via, ...w.filter((x) => x !== '#' && x !== '-')].join(' '), original };
+  const conectorRegex = /\b(a|como|en)\b/gi;
+  const posiciones = [];
+  let match;
+  while ((match = conectorRegex.exec(mensaje)) !== null) {
+    posiciones.push({ inicio: match.index, fin: match.index + match[0].length });
   }
-  // Separar complementos (torre, apto...) que pueden venir en cualquier parte
-  const principal = [];
-  const comp = [];
-  for (let i = 0; i < w.length; i++) {
-    const c = mapear(COMPLEMENTOS, w[i]);
-    // "T" o "P" sueltas solo cuentan como complemento si van seguidas de un número
-    if (c && !((w[i] === 'T' || w[i] === 'P' || w[i] === 'CA' || w[i] === 'IN') && !/^\d/.test(w[i + 1] || ''))) {
-      const partes = [c];
-      if (['CONJ', 'ED', 'UR', 'BR', 'SC', 'FCA', 'UN'].includes(c)) {
-        // Complementos con nombre: "CONJ LOS PINOS", "ED TORRES DEL PARQUE"
-        while (i + 1 < w.length && !mapear(COMPLEMENTOS, w[i + 1]) && !/^[#-]$/.test(w[i + 1]) && !/^\d/.test(w[i + 1])) partes.push(w[++i]);
-        comp.push(partes.join(' '));
-        continue;
-      }
-      while (i + 1 < w.length && w[i + 1] !== '#' && !mapear(COMPLEMENTOS, w[i + 1]) && (/^\d/.test(w[i + 1]) || /^[A-Z]$/.test(w[i + 1]) || partes.length === 1)) {
-        partes.push(w[++i]);
-        if (/^\d/.test(partes[partes.length - 1]) && !/^[A-Z]$/.test(w[i + 1] || '')) break;
-      }
-      comp.push(partes.join(' '));
-    } else principal.push(w[i]);
+
+  for (let i = posiciones.length - 1; i >= 0; i--) {
+    const despues = mensaje.slice(posiciones[i].fin).trim();
+    const estadoLabel = identificarEstadoPipeline(despues);
+    if (estadoLabel) {
+      // "antes" excluye el propio conector ("a"/"como"), para que no se
+      // cuele como parte del nombre del cliente (ej. "...jimenez a" en vez
+      // de "...jimenez").
+      const antes = mensaje.slice(0, posiciones[i].inicio);
+      const nombre = extraerNombreDeCambioEstado(antes);
+      return { estadoLabel, nombre };
+    }
   }
-  // Grupos numéricos: vía (6C BIS SUR) # cruce (82A) - placa (25)
-  const grupos = [];
-  let cardinales = [];
-  let actual = null;
-  const sobrantes = [];
-  // Nombre de la vía (ej. "AV BOYACA 16B - 53"): palabras antes del primer número.
-  const nombreVia = [];
-  while (principal.length && !/^\d/.test(principal[0]) && principal[0] !== '#' && principal[0] !== '-' && !CARDINAL[principal[0]] && !mapear(VIAS, principal[0])) nombreVia.push(principal.shift());
-  for (const x of principal) {
-    if (mapear(VIAS, x)) { if (actual) { grupos.push(actual); actual = null; } continue; } // "CL 20 CR 77-80": la segunda vía es el cruce
-    if (x === '#' || x === '-' || x === 'CON') { if (actual) { grupos.push(actual); actual = null; } continue; }
-    if (CARDINAL[x]) { cardinales.push(CARDINAL[x]); continue; }
-    if (/^\d+$/.test(x)) { if (actual) grupos.push(actual); actual = x; continue; }
-    if (actual && (/^[A-Z]$/.test(x) || x === 'BIS')) { actual += (x === 'BIS' ? ' BIS' : (/BIS$/.test(actual) ? ' ' + x : x)); continue; }
-    if (actual) { grupos.push(actual); actual = null; }
-    sobrantes.push(x);
-  }
-  if (actual) grupos.push(actual);
-  let valor, g3, resto;
-  if (nombreVia.length) {
-    if (grupos.length < 2) return { ok: false, original };
-    let g2;
-    [g2, g3, ...resto] = grupos;
-    valor = `${via} ${nombreVia.join(' ')} # ${g2} - ${g3}`;
-  } else {
-    if (grupos.length < 2) return { ok: false, original };
-    let g1, g2;
-    [g1, g2, g3, ...resto] = grupos;
-    valor = `${via} ${g1} # ${g2}`;
-    if (g3) valor += ` - ${g3}`;
-  }
-  if (cardinales.length) valor += ' ' + [...new Set(cardinales)].join(' ');
-  if (resto.length) valor += ' ' + resto.join(' ');
-  // Orden de complementos de lo general a lo particular (conjunto → torre → apartamento)
-  const ORDEN = ['UR', 'BR', 'SC', 'CONJ', 'UN', 'ED', 'MZ', 'LT', 'ET', 'BL', 'TO', 'IN', 'CA', 'PI', 'AP', 'LC', 'OF', 'PT', 'SS', 'FCA'];
-  comp.sort((a, b) => ORDEN.indexOf(a.split(' ')[0]) - ORDEN.indexOf(b.split(' ')[0]));
-  if (comp.length) valor += ' ' + comp.join(' ');
-  if (sobrantes.length) valor += ' ' + sobrantes.join(' ');
-  return { ok: Boolean(g3), parcial: !g3, valor: valor.replace(/\s+/g, ' ').trim(), original };
+  return null;
 }
 
-// El asesor escribe la dirección como sea; Marce la deja homologada.
-// ---------------------------------------------------------------------------
-// Regionales (R1–R5) según el departamento de la ciudad
-// ---------------------------------------------------------------------------
-const REGIONAL_DEPTO = {
-  atlantico: 'R1', bolivar: 'R1', cesar: 'R1', cordoba: 'R1', 'la guajira': 'R1', magdalena: 'R1', sucre: 'R1', 'archipielago de san andres': 'R1',
-  antioquia: 'R2', choco: 'R2', caldas: 'R2', quindio: 'R2', risaralda: 'R2',
-  caqueta: 'R3', cauca: 'R3', huila: 'R3', narino: 'R3', putumayo: 'R3', tolima: 'R3', 'valle del cauca': 'R3',
-  'bogota d.c.': 'R4', cundinamarca: 'R4',
-  meta: 'R5', boyaca: 'R5', santander: 'R5', 'norte de santander': 'R5', arauca: 'R5', casanare: 'R5', amazonas: 'R5', guainia: 'R5', guaviare: 'R5', vaupes: 'R5', vichada: 'R5',
-};
-// Barrios, corregimientos y nombres mal escritos que se ven en la operación → regional
-const REGIONAL_CIUDAD = {
-  'san antonio de prado': 'R2', manrique: 'R2', belen: 'R2', rionegro: 'R2', barbosa: 'R2', valparaiso: 'R2', armenia: 'R2', dosquebras: 'R2', 'dos quebradas': 'R2',
-  sohacha: 'R4', sobo: 'R4', bogoat: 'R4', bpgota: 'R4', boogota: 'R4', bgota: 'R4', fuza: 'R4',
-  rioacha: 'R1', satelcaribe: 'R1', guachaca: 'R1', 'san andes': 'R1', bayunca: 'R1', santamarta: 'R1', norosi: 'R1', 'puerto colombia': 'R1',
-  restrepo: 'R5', sopata: 'R5', capinajeo: 'R5', florencia: 'R3', candelaria: 'R3',
-};
-// Departamentos escritos con errores ("CUNDINAMNARCA", "ANTIOQUIIA"…) → regional
-const REGIONAL_TEXTO = [
-  [/^valle( del)?( cau\w*)?$/, 'R3'], [/^cun\w*$|^cind\w*$|^cundi$/, 'R4'], [/^bog\w*( d ?c)?$/, 'R4'], [/^ant\w*qu\w*$|^antio\w*$/, 'R2'], [/^norte (de )?santander$/, 'R5'],
-  [/^san andres$/, 'R1'], [/^atlant\w*$/, 'R1'], [/^(la )?guajira$/, 'R1'], [/^mag\w*na$|^madal\w*$/, 'R1'], [/^cald\w*$/, 'R2'], [/^quind\w*$/, 'R2'], [/^risar\w*$/, 'R2'],
-  [/^(regional )?eje cafetero$/, 'R2'], [/^casanar\w*$/, 'R5'],
-];
-const CACHE_REGIONAL = new Map();
-function regionalDe(ciudad, depto) {
-  if (depto && REGIONAL_DEPTO[norm(depto)]) return REGIONAL_DEPTO[norm(depto)];
-  const t = String(ciudad || '').trim();
-  if (!t) return null;
-  if (CACHE_REGIONAL.has(t)) return CACHE_REGIONAL.get(t);
-  const k = norm(t).replace(/[^a-z0-9() ]/g, ' ').replace(/\s+/g, ' ').trim();
-  let r = REGIONAL_CIUDAD[k] || REGIONAL_DEPTO[k] || null;
-  if (!r) {
-    // Ciudad con departamento: "Granada (Meta)"
-    const conDepto = k.match(/\(([^)]+)\)\s*$/);
-    if (conDepto && REGIONAL_DEPTO[conDepto[1]]) r = REGIONAL_DEPTO[conDepto[1]];
-  }
-  if (!r) {
-    // Nombre exacto de municipio; si hay varios con ese nombre y todos son de la misma regional, se toma esa.
-    const iguales = municipios().filter((m) => m.llave === llaveCiudad(t));
-    const regs = [...new Set(iguales.map((m) => REGIONAL_DEPTO[norm(m.depto)]))];
-    if (regs.length === 1) r = regs[0] || null;
-  }
-  if (!r) for (const [re, reg] of REGIONAL_TEXTO) if (re.test(k)) { r = reg; break; }
-  if (!r) {
-    const m = validarMunicipio(t); // reconoce la ciudad aunque venga con errores de digitación
-    if (m.ok && m.extra?.departamento) r = REGIONAL_DEPTO[norm(m.extra.departamento)] || null;
-  }
-  CACHE_REGIONAL.set(t, r);
-  return r;
-}
-const conRegional = (f) => (f ? { ...f, regional: regionalDe(f.ciudad, f.datos?.departamento) } : f);
+function detectarIntencion(mensaje, sesion) {
+  if (sesion.pendienteEscalamiento || sesion.pendienteBusqueda) return null;
+  if (mensaje.startsWith('__')) return null; // ya es un comando literal
+  // Normaliza errores de tipeo comunes ("ciente" por "cliente", etc.) antes
+  // de comparar contra las frases, para que un typo no rompa la detección.
+  const t = mensaje.trim().toLowerCase().replace(/\bciente\b/g, 'cliente');
 
-function validarDireccion(crudo) {
-  const texto = String(crudo || '').trim();
-  if (texto.startsWith(DEJAR)) {
-    const v = texto.slice(DEJAR.length).replace(/^"|"$/g, '').trim();
-    return v.length >= 5 ? { ok: true, valor: v.toUpperCase(), extra: { direccion_original: v, direccion_sin_homologar: true } } : { ok: false };
+  if (REGEX_ESCALAR_JURIDICO.test(t)) return '__escalar_juridico__';
+
+  // Se revisa ANTES que "buscar cliente" porque frases como "cambia el
+  // estado del cliente juan a cliente" también contienen "estado del
+  // cliente", que REGEX_BUSCAR_CLIENTE reconocería como consulta de estado.
+  if (detectarCambioEstado(mensaje)) return '__cambiar_estado__';
+
+  if (REGEX_BUSCAR_CLIENTE.test(t)) return '__buscar_cliente__';
+
+  if (sesion.estado === 'caso_abierto') {
+    if (FRASES_RADICADO.some((f) => t.includes(f))) return '__radicado__';
+    if (FRASES_NO_APLICA.some((f) => t.includes(f))) return '__no_aplica__';
   }
-  if (texto.length < 5) return { ok: false };
-  const r = homologarDireccion(texto);
-  if (r.ok) return { ok: true, valor: r.valor, extra: { direccion_original: texto }, homologada: r.valor };
-  return {
-    ok: false,
-    mensaje: `No pude homologar "${texto}". Escríbela con el tipo de vía y los números, por ejemplo: **Calle 6C # 82A-25 Torre 1 Apto 1103**. Si es rural o especial, déjala así.`,
-    sugerencias: [`${DEJAR}${texto}`],
-  };
+
+  // "Nuevo caso" puede llegar en CUALQUIER momento, incluso a mitad de
+  // capturar los datos del caso anterior: si al asesor se le cayó la
+  // llamada y ya está en otra con un cliente distinto, no tiene sentido
+  // seguir insistiendo en los datos del que ya perdió.
+  if (FRASES_NUEVO_CASO.some((f) => t.includes(f))) {
+    return '__nuevo_caso__';
+  }
+
+  return null;
 }
 
-// Uno o varios celulares: "3001234567, 3109876543" → "3001234567 / 3109876543"
-function validarTelefonos(crudo) {
-  const partes = String(crudo || '').split(/[,;/|]|\s+y\s+|\s{2,}|\n/i).map((x) => x.replace(/\D/g, '')).filter(Boolean)
-    .map((x) => (x.length === 12 && x.startsWith('57') ? x.slice(2) : x));
-  // Si escribió los números seguidos sin separador (ej. "3001234567 3109876543"), se cortan de 10 en 10
-  const nums = partes.flatMap((x) => (x.length > 10 && x.length % 10 === 0 ? x.match(/\d{10}/g) : [x]));
-  const malos = nums.filter((x) => !/^(3\d{9}|60\d{8})$/.test(x));
-  if (!nums.length || malos.length) return { ok: false, mensaje: malos.length && nums.length > 1 ? `Revisa este número: ${malos.join(', ')}. Cada celular debe tener 10 dígitos y empezar en 3.` : '' };
-  return { ok: true, valor: [...new Set(nums)].slice(0, 5).join(' / ') };
-}
-const telefonosDe = (valor) => String(valor || '').split('/').map((x) => x.replace(/\D/g, '')).filter((x) => x.length >= 7);
-function validar(campo, crudo) {
-  if (campo.tipo === 'telefonos') return validarTelefonos(crudo);
-  if (campo.tipo === 'municipio') return validarMunicipio(crudo);
-  if (campo.tipo === 'direccion') return validarDireccion(crudo);
-  if (campo.tipo === 'fecha_futura') return validarFechaFutura(crudo);
-  if (campo.tipo === 'fecha_pasada') return validarFechaPasada(crudo);
-  let v = String(crudo || '').trim();
-  if (campo.normalizar === 'solo_numeros') v = v.replace(/\D/g, '');
-  if (campo.opciones) {
-    const op = campo.opciones.find((o) => norm(o) === norm(v) || norm(o).startsWith(norm(v)) && norm(v).length >= 2);
-    return op ? { ok: true, valor: op } : { ok: false };
-  }
-  if (campo.regex && !new RegExp(campo.regex, 'i').test(v)) return { ok: false };
-  return { ok: Boolean(v), valor: v };
+// Detecta si el mensaje es una duda/pregunta en vez de la respuesta directa
+// al dato que se le está pidiendo. No basta con mirar si termina en "?": el
+// asesor muchas veces escribe la duda sin signo de interrogación (ej. "el
+// cliente me pregunta por la ley cual es"). También cubre pedidos de ayuda
+// tipo "dime el script", "ayúdame con el guion", "qué le digo al cliente":
+// antes estas frases no entraban aquí y Daniela las trataba como si fueran
+// la respuesta al campo que estaba pidiendo, así que nunca llegaba a usar
+// el SOP/objeciones/conocimiento cargado para responderlas.
+const REGEX_PARECE_DUDA = /\?|pregunt|\bduda\b|no s[eé] qu[eé]|no s[eé] c[oó]mo|^(qu[eé]|c[oó]mo|cu[aá]l(es)?|cu[aá]ndo|d[oó]nde|por qu[eé]|cu[aá]nto|qui[eé]n)\b|\bscript\b|\bguion\b|\bguión\b|\blibreto\b|ay[uú]dame|necesito (ayuda|el script|saber)|qu[eé] le digo|c[oó]mo le (digo|respondo|explico)|explica(me)?|recu[eé]rdame|^dime (el|la|c[oó]mo|qu[eé])|env[ií]ame (el|la)/i;
+
+function pareceDuda(mensaje) {
+  return REGEX_PARECE_DUDA.test(mensaje.trim());
 }
 
-async function responderCaptura(sesion, asesor, texto) {
-  const cap = sesion.captura;
-  const campo = cap.campos[cap.paso];
-  const r = validar(campo, texto);
-  if (!r.ok && r.sugerencias) {
-    return { reply: r.mensaje, opciones: r.sugerencias, progreso: preguntar(campo, cap).progreso };
+function campoActualDe(sesion) {
+  if (sesion.pendienteEscalamiento) {
+    const campos = CAMPOS.escalamiento_juridico;
+    const campo = campos[sesion.pendienteEscalamiento.stepIndex];
+    return campo ? campo.prompt : null;
   }
-  if (!r.ok) {
-    const msg = r.mensaje ? `⚠️ ${r.mensaje}` : campo.opciones ? `Elige una de las opciones 👇` : `⚠️ ${campo.errorMessage || 'Revisa ese dato.'}`;
-    const p = preguntar(campo, cap);
-    return { ...p, reply: `${msg}\n\n${p.reply}` };
+  if (sesion.estado === 'capturando_caso') {
+    return CAMPOS.caso_nuevo[sesion.stepIndex]?.prompt ?? null;
   }
-  cap.datos[campo.id] = r.valor;
-  if (r.extra) Object.assign(cap.datos, r.extra);
-  cap.paso += 1;
-
-  // Al tener el teléfono de un interesado nuevo, revisamos si ya existe.
-  if (cap.tipo === 'interesado' && campo.id === 'telefono') {
-    try {
-      const previos = await db.buscarPorTelefono(r.valor);
-      if (previos.length) {
-        sesion.modo = 'duplicado';
-        sesion.resultados = previos;
-        return {
-          reply: avisoDuplicado(previos, asesor),
-          tarjetas: previos.map(tarjetaDe),
-          opciones: ['Sí, es el mismo', 'No, es otro cliente'],
-        };
-      }
-    } catch (e) {
-      console.error('No pude revisar duplicados:', e.message);
-    }
+  if (sesion.estado === 'capturando_resultado') {
+    return CAMPOS[sesion.tipo][sesion.stepIndex]?.prompt ?? null;
   }
-
-  avanzar(cap);
-  const siguiente = cap.paso < cap.campos.length ? preguntar(cap.campos[cap.paso], cap) : await finalizarCaptura(sesion, asesor);
-  if (r.homologada && siguiente?.reply) siguiente.reply = `📍 Dirección homologada: **${r.homologada}**\n\n${siguiente.reply}`;
-  return siguiente;
+  return null;
 }
 
-async function finalizarCaptura(sesion, asesor) {
-  const { tipo, datos } = sesion.captura;
-  const campoEditadoId = sesion.captura.campoId;
-  sesion.modo = 'libre';
-  sesion.captura = null;
-  try {
-    if (tipo === 'interesado') {
-      const creado = await db.crearInteresado(asesor, { ...datos, cobertura: norm(datos.cobertura) === 'si' ? 'sí' : 'no' });
-      sesion.cliente = { ...creado, venta: null };
-      const conCob = norm(datos.cobertura) === 'si';
-      return {
-        reply: conCob
-          ? '✅ ¡Interesado registrado con cobertura! Sigue con la oferta — si pone una objeción, escríbemela y te ayudo.'
-          : '✅ Interesado registrado. Quedó marcado **sin cobertura**; si después se valida, toca "Actualizar cobertura".',
-        tarjetas: [tarjetaDe(sesion.cliente)],
-        opciones: accionesPara(sesion.cliente),
-      };
-    }
-    const c = sesion.cliente;
-    if (tipo === 'venta') {
-      await db.guardarVenta(asesor, c, datos);
-      await db.actualizarInteresado(c.id, { resultado: 'venta', ciudad: datos.ciudad || c.ciudad || null });
-      sesion.cliente = await db.obtenerCliente(c.id);
-      return {
-        reply: '🎉 ¡Venta registrada! Excelente trabajo, así se hace.',
-        tarjetas: [tarjetaDe(sesion.cliente)],
-        opciones: [OP.NUEVO, OP.EDITAR, OP.RESUMEN],
-        celebrar: true,
-      };
-    }
-    if (tipo === 'no_venta') {
-      sesion.cliente = {
-        ...(await db.actualizarInteresado(c.id, {
-          resultado: 'no_venta',
-          motivo_no_interes: datos.motivo_no_interes || null,
-          observaciones: datos.observaciones || null,
-        })),
-        venta: c.venta,
-      };
-      return {
-        reply: 'Listo, quedó registrado. Ánimo, ¡el siguiente es tuyo! 💪',
-        tarjetas: [tarjetaDe(sesion.cliente)],
-        opciones: [OP.NUEVO, OP.BUSCAR, OP.RESUMEN],
-      };
-    }
-    if (tipo === 'editar') {
-      const id = campoEditadoId || Object.keys(datos)[0];
-      let valor = datos[id];
-      if (id === 'observaciones') {
-        const previa = valorActual(c, 'observaciones');
-        const cuando = new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
-        const nueva = `[${cuando}] ${valor}`;
-        valor = previa && norm(previa) !== 'ninguna' ? `${previa}\n${nueva}` : nueva;
-      }
-      const etiqueta = (campoEditable(id)?.label || id).toLowerCase();
-      if (EDITABLES_INTERESADO.includes(id) || id === 'observaciones') await db.actualizarInteresado(c.id, { [id]: valor });
-      if (c.venta && (EDITABLES_VENTA.includes(id) || EDITABLES_INTERESADO.includes(id))) await db.actualizarVenta(c.venta.id, { [id]: valor });
-      sesion.cliente = await db.obtenerCliente(c.id);
-      return {
-        reply: id === 'observaciones' ? '📝 ¡Nota guardada! Queda en la ficha del cliente y el back la ve en el panel.' : `✅ Listo, actualicé **${etiqueta}**: ${valor}`,
-        tarjetas: [tarjetaDe(sesion.cliente)],
-        opciones: [OP.EDITAR, ...accionesPara(sesion.cliente).filter((o) => o !== OP.EDITAR)].slice(0, 6),
-      };
-    }
-    if (tipo === 'ot_activa') {
-      const actualizado = await db.actualizarInteresado(c.id, {
-        resultado: 'ot_activa',
-        ot_activa_numero: datos.ot_activa_numero,
-        ot_activa_estado: 'activa',
-        ot_activa_fecha: new Date().toISOString(),
-        ot_activa_respuesta: null,
-        ot_activa_por: null,
-        ot_activa_liberada_fecha: null,
-      });
-      sesion.cliente = { ...actualizado, venta: c.venta };
-      return {
-        reply: `🧾 Listo, quedó registrado con **OT activa ${datos.ot_activa_numero}**. Lo ves en la pestaña "OT" para hacerle seguimiento; cuando el back office la marque como liberada te aviso.`,
-        tarjetas: [tarjetaDe(sesion.cliente)],
-        opciones: [OP.RELLAMAR, OP.NUEVO, OP.MIS_OT],
-      };
-    }
-    if (tipo === 'escalamiento') {
-      const actualizado = await db.actualizarInteresado(c.id, {
-        resultado: 'escalado',
-        escalamiento_tipo: datos.escalamiento_tipo,
-        escalamiento_detalle: datos.escalamiento_detalle,
-        escalamiento_estado: 'pendiente',
-        escalamiento_respuesta: null,
-        escalamiento_por: null,
-        escalamiento_fecha: new Date().toISOString(),
-      });
-      sesion.cliente = { ...actualizado, venta: c.venta };
-      return {
-        reply: `🛠 Listo, quedó escalado: **${datos.escalamiento_tipo}**. El back office lo ve en el panel y la respuesta te aparece en la ficha del cliente.`,
-        tarjetas: [tarjetaDe(sesion.cliente)],
-        opciones: [OP.RELLAMAR, OP.NUEVO, OP.BUSCAR],
-      };
-    }
-    if (tipo === 'rellamar') {
-      const actualizado = await db.actualizarInteresado(c.id, {
-        resultado: 'volver_llamar',
-        rellamar_fecha: datos.rellamar_fecha,
-        rellamar_hora: datos.rellamar_hora,
-        rellamar_nota: datos.rellamar_nota,
-        rellamar_veces: (c.rellamar_veces || 0) + 1,
-      });
-      sesion.cliente = { ...actualizado, venta: c.venta };
-      return {
-        reply: `📞 Listo, quedó para volver a llamar **${textoRellamada(sesion.cliente)}**. Te lo recuerdo en "Mis rellamadas".`,
-        tarjetas: [tarjetaDe(sesion.cliente)],
-        opciones: [OP.NUEVO, OP.RELLAMADAS, OP.BUSCAR],
-      };
-    }
-    if (tipo === 'cobertura') {
-      const valor = norm(datos.cobertura) === 'si' ? 'sí' : 'no';
-      sesion.cliente = { ...(await db.actualizarInteresado(c.id, { cobertura_validada: valor })), venta: c.venta };
-      return {
-        reply: `✅ Cobertura actualizada a **${valor === 'sí' ? 'Sí' : 'No'}**.`,
-        tarjetas: [tarjetaDe(sesion.cliente)],
-        opciones: accionesPara(sesion.cliente),
-      };
-    }
-  } catch (e) {
-    console.error('Error guardando:', e);
+// ===================== GENERACIÓN DE CONTRATO =====================
+// Daniela NO genera el contrato: deja una solicitud en la tabla
+// "solicitudes_contrato" de Supabase. El programa OCR del PC de la oficina
+// (worker_contratos.py) la toma, revisa los documentos en SharePoint, crea el
+// contrato y escribe aquí el resultado (listo / faltan documentos / error).
+function clienteSupabaseAdmin() {
+  const { createClient } = require('@supabase/supabase-js');
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+}
+
+const OPC_INICIO = ['Tengo un cliente nuevo', 'Buscar cliente', 'Generar contrato'];
+
+const TEXTO_DOCS_CONTRATO =
+  'Para crear el contrato necesito en la carpeta del cliente (SharePoint):\n' +
+  '• 📎 Cédula\n• 📎 RUT\n• 📎 Factura de compra del vehículo\n\n' +
+  'Adjúntalos con el clip 📎 (elige el tipo de documento). Cuando estén todos, toca "Crear contrato".';
+
+// Busca por celular (10 dígitos) o, si no, por cédula/NIT/placa/nombre.
+async function buscarParaContrato(termino) {
+  const t = String(termino || '').trim();
+  const digitos = t.replace(/\D/g, '');
+  const cel = digitos.length === 12 && digitos.startsWith('57') ? digitos.slice(2) : digitos;
+  if (/^3\d{9}$/.test(cel)) {
+    const sb = clienteSupabaseAdmin();
+    const { data, error } = await sb
+      .from('Perfilamiento_y_ventas_GLA')
+      .select('*')
+      .ilike('telefono', `%${cel}%`)
+      .order('updated_at', { ascending: false, nullsFirst: false })
+      .limit(5);
+    if (error) throw error;
+    if (data && data.length) return data;
+  }
+  return buscarCasoPorTermino(t);
+}
+
+function seleccionarCasoParaContrato(sesion, caso) {
+  sesion.estado = 'caso_abierto';
+  sesion.tipo = null;
+  sesion.casoId = caso.id;
+  sesion.data = datosDeCasoExistente(caso);
+  sesion.negociacion = null;
+  sesion.pendienteBusqueda = false;
+  sesion.pendienteContrato = null;
+  sesion.modoContrato = false;
+  sesion.candidatosLista = null;
+  sesion.candidatoRetomar = null;
+  const nombre = caso.nombre_cliente || 'el cliente';
+  if (!caso.numero_identificacion) {
     return {
-      reply: `No pude guardar en la base de datos (${e.message}). Los datos no se perdieron en esta ventana; avisa a soporte.`,
-      error: true,
-      opciones: MENU,
+      reply: `Encontré a ${nombre}, pero no tiene cédula registrada y la necesito para su carpeta. Dime "buscar cliente", retoma el caso y completa la cédula.`,
+      opciones: OPC_INICIO,
     };
   }
-  return { reply: 'Listo.', opciones: MENU };
+  return {
+    reply: `✅ Cliente: ${nombre} (cédula ${caso.numero_identificacion}).\n\n${TEXTO_DOCS_CONTRATO}`,
+    opciones: ['Crear contrato', 'Ver estado del contrato'],
+  };
 }
 
-// ---------------------------------------------------------------------------
-// Búsqueda
-// ---------------------------------------------------------------------------
-async function ejecutarBusqueda(sesion, termino) {
-  let resultados;
+async function crearSolicitudContrato(sesion, asesor) {
+  const sb = clienteSupabaseAdmin();
+  const cedula = String(sesion.data.numero_identificacion || '').trim();
+  const nombre = String(sesion.data.nombre_cliente || '').trim();
+  const { data: previas } = await sb
+    .from('solicitudes_contrato')
+    .select('id, estado, creado_en')
+    .eq('caso_id', sesion.casoId)
+    .in('estado', ['pendiente', 'procesando'])
+    .order('creado_en', { ascending: false })
+    .limit(1);
+  if (previas && previas.length && Date.now() - new Date(previas[0].creado_en).getTime() < 30 * 60 * 1000) {
+    return { yaExiste: true };
+  }
+  const fila = {
+    caso_id: sesion.casoId,
+    cedula,
+    nombre_cliente: nombre,
+    servicio: sesion.data.servicio_contratado || null,
+    asesor: asesor || null,
+    session_id: sesion.sessionId || null,
+  };
+  let { error } = await sb.from('solicitudes_contrato').insert(fila);
+  if (error && /session_id/.test(error.message || '')) {
+    // Si aún no se corrió el SQL nuevo, se guarda sin el aviso automático.
+    delete fila.session_id;
+    ({ error } = await sb.from('solicitudes_contrato').insert(fila));
+  }
+  if (error) throw error;
+  return { yaExiste: false };
+}
+
+function textoContratoListo(r) {
+  const borrador = (r.archivos || []).some((a) => /^BORRADOR_/i.test(a));
+  const lineas = [`${borrador ? '⚠️ Contrato generado como BORRADOR' : '✅ ¡Contrato listo!'} — ${r.nombre_cliente || 'cliente'}`];
+  if (r.mensaje) lineas.push(r.mensaje);
+  if (r.link_contrato) lineas.push(`📄 Contrato PDF: ${r.link_contrato}`);
+  if (r.link_word) lineas.push(`📝 Contrato Word (editable): ${r.link_word}`);
+  if (r.link_carpeta) lineas.push(`📁 Carpeta del cliente: ${r.link_carpeta}`);
+  if (!r.link_contrato && !r.link_word && (r.archivos || []).length) lineas.push(`Archivos: ${(r.archivos || []).join(', ')}`);
+  lineas.push(borrador ? 'Revisa lo marcado, corrígelo y toca "Crear contrato" de nuevo.' : 'Revísalo y, si está bien, envíalo a firma desde el panel (Casos → "Enviar contrato a firma").');
+  return lineas.join('\n\n');
+}
+
+// Avisos automáticos para la extensión del asesor: contratos de SU sesión que ya terminaron y no ha visto.
+app.get('/api/contrato/avisos', async (req, res) => {
+  // La extensión manda sus últimas sesiones (el asesor puede haber empezado otro caso mientras se generaba).
+  const ids = String(req.query.sessionIds || req.query.sessionId || '').split(',').map((x) => x.trim()).filter((x) => /^[A-Za-z0-9_-]{6,80}$/.test(x)).slice(0, 10);
+  if (!ids.length) return res.json({ avisos: [] });
   try {
-    resultados = await db.buscarClientes(termino);
-  } catch (e) {
-    console.error('Error buscando:', e);
-    sesion.modo = 'libre';
-    return { reply: `No pude consultar la base de datos (${e.message}). Intenta de nuevo en un momento.`, error: true };
-  }
-  if (!resultados.length) {
-    sesion.modo = 'libre';
-    sesion.accionPendiente = null;
-    return {
-      reply: `No encontré clientes con "${termino}". Revisa cómo está escrito, o si es nuevo regístralo.`,
-      opciones: [OP.NUEVO, OP.BUSCAR],
-    };
-  }
-  if (resultados.length === 1) return abrirCliente(sesion, resultados[0]);
-  sesion.modo = 'seleccion';
-  sesion.resultados = resultados;
-  return {
-    reply: `Encontré ${resultados.length} clientes con "${termino}". ¿Cuál es?`,
-    tarjetas: resultados.map((c, i) => ({ ...tarjetaDe(c), compacta: true, elegir: `${i + 1}. ${c.nombre_cliente || 'Sin nombre'}` })),
-    opciones: resultados.map((c, i) => `${i + 1}. ${c.nombre_cliente || 'Sin nombre'}`).concat(OP.CANCELAR),
-  };
-}
-
-// "Ojo: este cliente lo está gestionando Ana Torres…"
-const mismoAsesor = (a, b) => norm(a) === norm(b);
-function quienGestiona(c) {
-  const fecha = c.created_at
-    ? new Date(c.created_at).toLocaleDateString('es-CO', { timeZone: 'America/Bogota', day: 'numeric', month: 'short' })
-    : '';
-  const estado = (ESTADOS[c.resultado] || 'En gestión').toLowerCase();
-  return `**${c.asesor || 'otro asesor'}**${fecha ? ` (lo registró el ${fecha})` : ''} · estado: ${estado}`;
-}
-function avisoDuplicado(previos, asesor) {
-  const deOtros = previos.filter((c) => c.asesor && !mismoAsesor(c.asesor, asesor));
-  if (!deOtros.length) return '👀 Ojo: ese celular ya lo registraste antes. ¿Es el mismo cliente?';
-  const c = deOtros[0];
-  let txt = `⚠️ Ojo: este cliente ya lo está gestionando ${quienGestiona(c)}.`;
-  if (c.resultado === 'venta') txt += '\n\nYa tiene una **venta registrada** por ese asesor.';
-  return txt + '\n\n¿Es el mismo cliente?';
-}
-
-async function abrirCliente(sesion, cliente) {
-  sesion.cliente = cliente;
-  sesion.modo = 'libre';
-  sesion.resultados = [];
-  const pendiente = sesion.accionPendiente;
-  sesion.accionPendiente = null;
-  if (pendiente) {
-    const inicio = await arrancarAccion(sesion, pendiente);
-    return { ...inicio, tarjetas: [tarjetaDe(cliente)], reply: inicio.reply };
-  }
-  const otro = cliente.asesor && asesorActual && !mismoAsesor(cliente.asesor, asesorActual);
-  return {
-    reply:
-      (otro ? `⚠️ Este cliente lo está gestionando ${quienGestiona(cliente)}.\n\n` : '') +
-      `Este es el cliente${cliente.resultado === 'venta' ? ' — ya tiene venta registrada ✅' : ''}. ¿Qué hacemos?`,
-    tarjetas: [tarjetaDe(cliente)],
-    opciones: accionesPara(cliente),
-  };
-}
-
-function arrancarAccion(sesion, accion) {
-  const c = sesion.cliente;
-  if (accion === 'venta') {
-    if (c.resultado === 'venta') return { reply: 'Este cliente ya tiene una venta registrada ✅.', opciones: [OP.NUEVO, OP.BUSCAR] };
-    if (norm(c.cobertura_validada) === 'no') {
-      return { reply: 'Este cliente está marcado **sin cobertura**. Si ya se validó que sí tiene, actualízala primero.', opciones: [OP.COBERTURA, OP.NO_VENTA] };
+    const sb = clienteSupabaseAdmin();
+    const { data, error } = await sb.from('solicitudes_contrato').select('*')
+      .in('session_id', ids).in('estado', ['listo', 'falta_documentos', 'error']).is('avisado_en', null)
+      .order('creado_en', { ascending: true }).limit(5);
+    if (error) return res.json({ avisos: [] }); // columnas aún no creadas: sin avisos
+    const avisos = [];
+    for (const r of data || []) {
+      const { data: tomado } = await sb.from('solicitudes_contrato').update({ avisado_en: new Date().toISOString() }).eq('id', r.id).is('avisado_en', null).select('id');
+      if (!tomado || !tomado.length) continue;
+      if (r.estado === 'listo') avisos.push(textoContratoListo(r));
+      else if (r.estado === 'falta_documentos') avisos.push(`📎 ${r.nombre_cliente || 'Cliente'}: faltan documentos para el contrato: ${r.mensaje || 'revisa cédula, RUT y factura'}.${r.link_carpeta ? `\n\n📁 Carpeta: ${r.link_carpeta}` : ''}\n\nAdjúntalos y toca "Crear contrato" otra vez.`);
+      else avisos.push(`⚠️ ${r.nombre_cliente || 'Cliente'}: no se pudo crear el contrato: ${r.mensaje || 'error desconocido'}.`);
     }
-    return iniciarCaptura(sesion, 'venta', c.ciudad ? { ciudad: c.ciudad } : {});
-  }
-  if (accion === 'no_venta') {
-    // Sin preguntas: si campos.json no tiene campos para "no_venta", se registra de una vez.
-    if (!(CAMPOS().no_venta || []).length) {
-      sesion.modo = 'captura';
-      sesion.captura = { tipo: 'no_venta', campos: [], paso: 0, datos: {} };
-      return finalizarCaptura(sesion, asesorActual);
-    }
-    return iniciarCaptura(sesion, 'no_venta');
-  }
-  if (accion === 'cobertura') return iniciarCaptura(sesion, 'cobertura', { _direccion: c.direccion || '', _ciudad: c.ciudad || '' });
-  if (accion === 'escalar') return iniciarCaptura(sesion, 'escalamiento');
-  if (accion === 'editar') return pedirQueEditar(sesion);
-  if (accion === 'nota') return pedirNota(sesion);
-  if (accion === 'ot_activa') {
-    if (c.resultado === 'venta') return { reply: 'Este cliente ya tiene una venta registrada ✅.', opciones: [OP.NUEVO, OP.BUSCAR] };
-    return iniciarCaptura(sesion, 'ot_activa');
-  }
-  if (accion === 'rellamar') {
-    if (c.resultado === 'venta') return { reply: 'Este cliente ya tiene una venta registrada ✅.', opciones: [OP.NUEVO, OP.BUSCAR] };
-    return iniciarCaptura(sesion, 'rellamar');
-  }
-  return { reply: '¿Qué hacemos?', opciones: accionesPara(c) };
-}
-
-// ---------------------------------------------------------------------------
-// Mis clientes de hoy (para elegir sin tener el teléfono)
-// ---------------------------------------------------------------------------
-// Mis clientes: por periodo (hoy, últimos 7 días, este mes o todo el historial).
-const PERIODOS_CLIENTES = {
-  hoy: { texto: 'de hoy', chip: '📅 Hoy' },
-  semana: { texto: 'de los últimos 7 días', chip: '🗓 Últimos 7 días' },
-  mes: { texto: 'de este mes', chip: '📆 Este mes' },
-  todo: { texto: 'de todo tu historial', chip: '🗂 Todo mi historial' },
-};
-const chipsPeriodo = (actual) => Object.entries(PERIODOS_CLIENTES).filter(([k]) => k !== actual).map(([k, v]) => `Mis clientes · ${v.chip}`);
-async function clientesDeHoy(sesion, asesor, periodo = 'mes') {
-  const p = PERIODOS_CLIENTES[periodo] ? periodo : 'mes';
-  let lista;
-  try {
-    lista = await db.clientesDeHoy(asesor, p);
+    res.json({ avisos });
   } catch (e) {
-    console.error('Error listando clientes:', e);
-    return { reply: `No pude traer la lista (${e.message}).`, error: true };
+    console.error('contrato/avisos:', e);
+    res.json({ avisos: [] });
   }
-  if (!lista.length) {
-    sesion.modo = 'libre';
-    return { reply: `No tienes clientes ${PERIODOS_CLIENTES[p].texto}.`, opciones: [...chipsPeriodo(p), OP.BUSCAR] };
-  }
-  sesion.modo = 'seleccion';
-  sesion.resultados = lista;
-  const tope = lista.length >= 150 ? ' (los 150 más recientes; para uno más antiguo usa "Buscar cliente")' : '';
-  return {
-    reply: `Tus ${lista.length} cliente(s) ${PERIODOS_CLIENTES[p].texto}${tope}, del más reciente al más antiguo. Toca el que necesitas 👇 (o escribe parte del nombre).`,
-    tarjetas: lista.map((c, i) => ({
-      ...tarjetaDe(c),
-      compacta: true,
-      horaCorta: new Date(c.created_at).toLocaleString('es-CO', { timeZone: 'America/Bogota', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }),
-      elegir: `${i + 1}. ${c.nombre_cliente || 'Sin nombre'}`,
-    })),
-    opciones: [...chipsPeriodo(p), OP.CANCELAR],
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Mis rellamadas (pendientes de hoy y vencidas, y las próximas)
-// ---------------------------------------------------------------------------
-async function misRellamadas(sesion, asesor) {
-  let lista;
-  try {
-    lista = await db.rellamadasPendientes(asesor);
-  } catch (e) {
-    console.error('Error rellamadas:', e);
-    return { reply: `No pude traer las rellamadas (${e.message}).`, error: true };
-  }
-  if (!lista.length) {
-    sesion.modo = 'libre';
-    return { reply: 'No tienes rellamadas pendientes 🙌.', opciones: [OP.NUEVO, OP.HOY] };
-  }
-  const hoy = hoyCO();
-  const paraHoy = lista.filter((c) => c.rellamar_fecha <= hoy).length;
-  sesion.modo = 'seleccion';
-  sesion.resultados = lista;
-  return {
-    reply:
-      (paraHoy ? `📞 Tienes **${paraHoy}** rellamada(s) para hoy o atrasadas` : '📞 No tienes rellamadas para hoy') +
-      ` y ${lista.length - paraHoy} próxima(s). Toca la que vas a llamar 👇`,
-    tarjetas: lista.map((c, i) => ({
-      ...tarjetaDe(c),
-      compacta: true,
-      horaCorta: (c.rellamar_fecha < hoy ? '⚠ ' : '') + textoRellamada(c),
-      elegir: `${i + 1}. ${c.nombre_cliente || 'Sin nombre'}`,
-    })),
-    opciones: [OP.CANCELAR],
-  };
-}
-
-// Las ventas se muestran como "clientes" (con su venta adentro) para poder abrir la ficha.
-const ventaComoCliente = (v) => ({
-  id: v.interesado_id || v.id,
-  nombre_cliente: v.nombre_cliente,
-  telefono: v.telefono,
-  direccion: v.direccion,
-  ciudad: v.ciudad,
-  asesor: v.asesor,
-  created_at: v.created_at,
-  resultado: 'venta',
-  venta: v,
 });
 
-async function misVentas(sesion, asesor) {
-  let ventas;
-  try {
-    ventas = await db.ventasDeAsesor(asesor);
-  } catch (e) {
-    return { reply: `No pude traer tus ventas (${e.message}).`, error: true };
-  }
-  if (!ventas.length) {
-    sesion.modo = 'libre';
-    return { reply: 'Todavía no tienes ventas registradas en los últimos 45 días. ¡La primera está cerca! 💪', opciones: MENU };
-  }
-  const inst = ventas.filter((v) => v.estado_instalacion === 'instalada').length;
-  const pend = ventas.filter((v) => !v.estado_instalacion || v.estado_instalacion === 'pendiente').length;
-  const lista = ventas.map(ventaComoCliente);
-  sesion.modo = 'seleccion';
-  sesion.resultados = lista;
-  return {
-    reply: `🎉 Tus ventas (últimos 45 días): **${ventas.length}** · ✅ ${inst} instalada(s) · ⏳ ${pend} pendiente(s). Toca una para ver la ficha 👇`,
-    tarjetas: lista.map((c, i) => ({ ...tarjetaDe(c), compacta: true, horaCorta: textoInstalacion(c.venta), elegir: `${i + 1}. ${c.nombre_cliente || 'Sin nombre'}` })),
-    opciones: [OP.CANCELAR],
-  };
+async function textoEstadoContrato(casoId) {
+  const sb = clienteSupabaseAdmin();
+  const { data, error } = await sb
+    .from('solicitudes_contrato')
+    .select('*')
+    .eq('caso_id', casoId)
+    .order('creado_en', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  const r = data && data[0];
+  if (!r) return { reply: 'Todavía no hay una solicitud de contrato para este cliente. Toca "Crear contrato" cuando estén los documentos.', opciones: ['Crear contrato'] };
+  if (r.estado === 'pendiente') return { reply: '⏳ Tu solicitud está en cola. El sistema la toma en 1 a 2 minutos.', opciones: ['Ver estado del contrato'] };
+  if (r.estado === 'procesando') return { reply: '⚙️ Estoy leyendo los documentos y armando el contrato. Pregúntame de nuevo en un minuto.', opciones: ['Ver estado del contrato'] };
+  if (r.estado === 'listo') return { reply: textoContratoListo(r) };
+  if (r.estado === 'falta_documentos') return { reply: `📎 Faltan documentos para el contrato: ${r.mensaje || 'revisa cédula, RUT y factura'}.\n\nAdjúntalos con el clip y toca "Crear contrato" otra vez.`, opciones: ['Crear contrato'] };
+  return { reply: `⚠️ No se pudo crear el contrato: ${r.mensaje || 'error desconocido'}. Avisa a soporte o intenta de nuevo.`, opciones: ['Crear contrato'] };
 }
 
-async function misOtActivas(sesion, asesor) {
-  let lista;
+const MENSAJE_INICIAL =
+  'Soy Daniela, tu asistente experta en beneficios tributarios por compra de ' +
+  'vehículos eléctricos e híbridos 🙌. Solo cuéntame cómo vas y yo te voy guiando: ' +
+  'dime algo como "tengo un cliente nuevo" en cuanto identifiques un caso, y arrancamos. ' +
+  'Si no estás seguro de si ya atendimos antes a alguien, dime "ya fue atendido este cliente" ' +
+  'o "buscar cliente" y te confirmo con nombre, cédula o placa antes de duplicar el caso. ' +
+  'Mientras gestionas, escríbeme cualquier duda del proceso y te ayudo al toque.';
+
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true });
+});
+
+// --- Enseñarle algo nuevo a Daniela (texto pegado o contenido de un
+// documento .txt/.md leído por la extensión) ---
+app.post('/api/conocimiento', async (req, res) => {
   try {
-    lista = await db.otActivasDeAsesor(asesor);
-  } catch (e) {
-    return { reply: `No pude traer las OT activas (${e.message}).`, error: true };
-  }
-  if (!lista.length) {
-    sesion.modo = 'libre';
-    return { reply: 'No tienes clientes con OT activa. 🙌', opciones: MENU };
-  }
-  const lib = lista.filter((c) => c.ot_activa_estado === 'liberada').length;
-  sesion.modo = 'seleccion';
-  sesion.resultados = lista;
-  return {
-    reply: `🧾 Tienes **${lista.length - lib}** cliente(s) con OT activa${lib ? ` y **${lib}** ya liberada(s) ✅ (puedes retomar la venta)` : ''}. Toca uno para abrir la ficha 👇`,
-    tarjetas: lista.map((c, i) => ({ ...tarjetaDe(c), compacta: true, horaCorta: `OT ${c.ot_activa_numero} · ${c.ot_activa_estado === 'liberada' ? '✅ liberada' : '⏳ activa'}`, elegir: `${i + 1}. ${c.nombre_cliente || 'Sin nombre'}` })),
-    opciones: [OP.CANCELAR],
-  };
-}
-
-async function misAlertas(sesion, asesor) {
-  let lista;
-  try {
-    lista = await alertasDe(asesor);
-  } catch (e) {
-    return { reply: `No pude traer las alertas (${e.message}).`, error: true };
-  }
-  if (!lista.length) {
-    sesion.modo = 'libre';
-    return { reply: 'No tienes clientes recuperables por ahora. 🙌', opciones: MENU };
-  }
-  sesion.modo = 'seleccion';
-  sesion.resultados = lista;
-  return {
-    reply: `🔥 ¡Clientes recuperables! El back confirmó que **${lista.length}** cliente(s) que marcaste **sin cobertura** SÍ tienen. ¡Es una venta por recuperar! Vuelve a llamarlos. Toca uno para abrir la ficha 👇`,
-    tarjetas: lista.map((c, i) => ({ ...tarjetaDe(c), compacta: true, horaCorta: '🔥 Sí tiene cobertura', elegir: `${i + 1}. ${c.nombre_cliente || 'Sin nombre'}` })),
-    opciones: [OP.CANCELAR],
-  };
-}
-
-async function misEscalamientos(sesion, asesor) {
-  let lista;
-  try {
-    lista = await db.escalamientosDeAsesor(asesor);
-  } catch (e) {
-    return { reply: `No pude traer los escalamientos (${e.message}).`, error: true };
-  }
-  if (!lista.length) {
-    sesion.modo = 'libre';
-    return { reply: 'No tienes escalamientos. 🙌', opciones: MENU };
-  }
-  const pend = lista.filter((c) => c.escalamiento_estado !== 'resuelto').length;
-  sesion.modo = 'seleccion';
-  sesion.resultados = lista;
-  return {
-    reply: `🛠 Tienes **${pend}** escalamiento(s) pendiente(s) y ${lista.length - pend} resuelto(s) recientemente. Toca uno para abrir la ficha 👇`,
-    tarjetas: lista.map((c, i) => ({ ...tarjetaDe(c), compacta: true, horaCorta: c.escalamiento_estado === 'resuelto' ? '✅ resuelto' : '⏳ pendiente', elegir: `${i + 1}. ${c.nombre_cliente || 'Sin nombre'}` })),
-    opciones: [OP.CANCELAR],
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Resumen
-// ---------------------------------------------------------------------------
-async function resumen(asesor, equipo, periodo = 'hoy') {
-  try {
-    const r = await db.resumenDeHoy(equipo ? null : asesor, periodo);
-    const efect = r.interesados ? Math.round((r.ventas / r.interesados) * 100) : 0;
-    const quien = equipo ? 'del equipo' : asesor ? `de ${asesor.split(' ')[0]}` : '';
-    const esMes = periodo === 'mes';
-    let reply = esMes ? `📊 Así va el mes ${quien}:` : `📊 Así va el día ${quien}:`;
-    if (!r.interesados && !r.ventas) reply = esMes ? `📊 Este mes todavía no hay registros ${quien}.` : `📊 Hoy todavía no hay registros ${quien}. ¡A darle! 💪`;
-    else if (r.enGestion) reply += `\n\nTienes **${r.enGestion}** interesado(s) todavía en gestión — búscalos para cerrarlos.`;
-    return {
-      reply,
-      resumen: {
-        titulo: esMes
-          ? `Este mes · ${new Date().toLocaleDateString('es-CO', { timeZone: 'America/Bogota', month: 'long', year: 'numeric' })}`
-          : `Hoy · ${new Date().toLocaleDateString('es-CO', { timeZone: 'America/Bogota', weekday: 'long', day: 'numeric', month: 'long' })}`,
-        items: [
-          { label: 'Interesados', valor: r.interesados },
-          { label: 'Ventas', valor: r.ventas, destacado: true },
-          { label: 'Efectividad', valor: `${efect}%` },
-          { label: 'Con cobertura', valor: r.conCobertura },
-          { label: 'Sin cobertura', valor: r.sinCobertura },
-          { label: 'No se interesó', valor: r.noVenta },
-          { label: 'Por rellamar', valor: r.porRellamar ?? 0 },
-        ],
-      },
-      opciones: esMes ? [OP.RESUMEN, OP.RESUMEN_EQUIPO, OP.VENTAS] : equipo ? [OP.RESUMEN, OP.RESUMEN_MES, OP.NUEVO] : [OP.RESUMEN_MES, OP.RESUMEN_EQUIPO, OP.VENTAS],
-    };
-  } catch (e) {
-    console.error('Error en resumen:', e);
-    return { reply: `No pude traer el resumen (${e.message}).`, error: true };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Ayuda con IA (objeciones, ganchos, proceso)
-// ---------------------------------------------------------------------------
-async function ayuda(sesion, texto) {
-  if (!iaDisponible()) {
-    return {
-      reply:
-        'Puedo ayudarte a registrar interesados, buscar clientes, registrar ventas y darte el resumen del día. ' +
-        '(Para ayudarte con objeciones necesito que configuren la clave de IA en el servidor.)',
-      opciones: MENU,
-    };
-  }
-  try {
-    const campo = sesion.modo === 'captura' ? sesion.captura.campos[sesion.captura.paso] : null;
-    const respuesta = await responderAyuda(texto, {
-      sop: leer('sop.md'),
-      objeciones: leer('objeciones.md'),
-      cliente: sesion.cliente
-        ? { nombre: sesion.cliente.nombre_cliente, cobertura: sesion.cliente.cobertura_validada, estado: sesion.cliente.resultado }
-        : null,
-      pasoActual: campo?.prompt,
-    });
-    return { reply: respuesta };
-  } catch (e) {
-    console.error('Error IA:', e.message);
-    return {
-      reply: 'Esa no la pude responder ahora mismo 😅. Mientras tanto, puedo ayudarte con esto 👇',
-      opciones: sesion.cliente ? accionesPara(sesion.cliente) : MENU,
-    };
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Cerebro del chat
-// ---------------------------------------------------------------------------
-let asesorActual = '';
-async function manejar(sesion, asesor, texto) {
-  asesorActual = asesor;
-  await refrescarConfig();
-  const t = String(texto || '').trim();
-  const n = norm(t);
-  const nombre = asesor ? asesor.split(' ')[0] : '';
-
-  if (t === '__inicio__') {
-    let aviso = '';
-    try {
-      const pend = (await db.rellamadasPendientes(asesor)).filter((c) => c.rellamar_fecha <= hoyCO()).length;
-      if (pend) aviso = `\n\n📞 Ojo: tienes **${pend}** rellamada(s) para hoy. Mírala(s) en la pestaña "Volver a llamar".`;
-      const hace2 = Date.now() - 2 * 86400000;
-      const nuevas = (await db.ventasDeAsesor(asesor)).filter((v) => v.estado_instalacion === 'instalada' && new Date(v.instalacion_fecha).getTime() > hace2).length;
-      const otLib = (await db.otActivasDeAsesor(asesor)).filter((c) => c.ot_activa_estado === 'liberada' && Date.now() - new Date(c.ot_activa_liberada_fecha).getTime() < 2 * 86400000).length;
-      if (otLib) aviso += `\n\n🧾 **${otLib}** cliente(s) con OT activa ya quedaron **liberados**. Mira la pestaña "OT" y retoma la venta.`;
-      const alertas = (await alertasDe(asesor)).length;
-      if (alertas) aviso += `\n\n🔥 **${alertas}** cliente(s) que marcaste sin cobertura **SÍ tienen** según el back. Toca "${OP.ALERTAS}".`;
-      if (nuevas) aviso += `\n\n🎉 ¡Buenas noticias! **${nuevas}** de tus ventas quedó(aron) **instalada(s)**. Mira la pestaña "Ventas".`;
-    } catch (_) {}
-    return {
-      reply:
-        `¡Hola${nombre ? `, ${nombre}` : ''}! Soy **Marce**, tu asistente comercial 🙌. ` +
-        'Cuando tengas un interesado dime "tengo un cliente interesado" y lo registramos. ' +
-        'También puedo buscar un cliente (por nombre, celular o cédula), registrar la venta, ' +
-        'programar una rellamada, ayudarte con objeciones o darte el resumen del día.' + aviso,
-      opciones: /🔥/.test(aviso) ? [OP.ALERTAS, ...MENU] : MENU,
-    };
-  }
-  if (t === '__nuevo__') {
-    Object.assign(sesion, nuevaSesion());
-    return { ...iniciarCaptura(sesion, 'interesado'), reply: '¡Vamos! 🙌 ' + CAMPOS().interesado[0].prompt };
-  }
-
-  // Abrir un cliente directo (desde las pestañas "Volver a llamar" / "Escalamientos" de la ventana)
-  if (t.startsWith('__abrir__:')) {
-    try {
-      const cliente = await db.obtenerClienteOVenta(t.slice('__abrir__:'.length).trim());
-      sesion.captura = null;
-      return abrirCliente(sesion, cliente);
-    } catch (e) {
-      return { reply: `No pude abrir ese cliente (${e.message}).`, error: true, opciones: MENU };
+    const { texto, titulo, agregadoPor } = req.body || {};
+    if (!texto || !texto.trim()) {
+      return res.status(400).json({ error: 'Falta el texto a enseñar' });
     }
-  }
-
-  const intencion = detectarIntencion(t);
-
-  if (intencion === 'cancelar') {
-    const habia = sesion.modo !== 'libre';
-    sesion.modo = 'libre';
-    sesion.captura = null;
-    sesion.accionPendiente = null;
-    return { reply: habia ? 'Listo, lo dejamos ahí. ¿Qué sigue?' : '¿En qué te ayudo?', opciones: sesion.cliente ? accionesPara(sesion.cliente) : MENU };
-  }
-
-  // Formulario a medias que ya no existe (cambió la configuración): se descarta sin error.
-  if (sesion.modo === 'captura' && !sesion.captura?.campos?.[sesion.captura.paso]) {
-    sesion.modo = 'libre';
-    sesion.captura = null;
-  }
-
-  // --- Respondiendo un formulario ---
-  if (sesion.modo === 'captura') {
-    const cap = sesion.captura;
-    const campo = cap.campos[cap.paso];
-    const esOpcion = (campo.opciones || campo.opcionesSugeridas || []).some((o) => norm(o) === n);
-    // Saltos explícitos de flujo (solo frases claras, para no confundir datos con comandos)
-    if (!esOpcion && ['resumen', 'resumen_equipo', 'resumen_mes', 'buscar', 'nuevo', 'hoy', 'menu', 'rellamadas', 'escalamientos', 'misventas', 'misot', 'alertas'].includes(intencion) && n.split(' ').length <= 6) {
-      const titulo = TITULOS[cap.tipo];
-      return {
-        reply: `Estamos en medio de "${titulo}". ¿Lo dejamos y seguimos con lo otro?`,
-        opciones: [OP.CANCELAR, 'Seguir donde iba'],
-      };
+    // Subido de 20.000 a 200.000 caracteres para que quepa el texto de un
+    // Excel convertido a CSV (una hoja mediana puede pasar fácil de 20.000
+    // caracteres). Si suben este número, actualicen también MAX_TEXTO en
+    // sidepanel.js de la extensión para que el contador sea consistente.
+    const MAX_TEXTO_CONOCIMIENTO = 200000;
+    if (texto.length > MAX_TEXTO_CONOCIMIENTO) {
+      return res.status(400).json({
+        error: `El texto es muy largo (máx. ${MAX_TEXTO_CONOCIMIENTO.toLocaleString('es-CO')} caracteres). Divídelo en partes más cortas.`,
+      });
     }
-    if (n === 'seguir donde iba') return preguntar(campo, cap);
-    if (!esOpcion && /\?\s*$/.test(t)) {
-      const a = await ayuda(sesion, t);
-      const p = preguntar(campo, cap);
-      return { ...p, reply: `${a.reply}\n\n➡️ ${p.reply}` };
-    }
-    return responderCaptura(sesion, asesor, t);
-  }
-
-  // --- Eligiendo qué dato editar ---
-  if (sesion.modo === 'editar_elegir') {
-    const campo = editablesPara(sesion.cliente).find((f) => norm(f.label) === n || (norm(f.label).startsWith(n) && n.length >= 3));
-    if (campo && campo.id === 'observaciones') return pedirNota(sesion);
-    if (campo) {
-      sesion.modo = 'captura';
-      sesion.captura = { tipo: 'editar', campoId: campo.id, campos: [campo], paso: 0, datos: {} };
-      const actual = valorActual(sesion.cliente, campo.id);
-      const p = preguntar(campo, sesion.captura);
-      return { ...p, progreso: undefined, reply: (actual ? `Ahora dice: **${actual}**\n\n` : '') + p.reply };
-    }
-    if (!intencion) return { ...pedirQueEditar(sesion), reply: 'Elige uno de los datos 👇' };
-    sesion.modo = 'libre';
-  }
-
-  // --- Posible duplicado ---
-  if (sesion.modo === 'duplicado') {
-    if (/^si/.test(n)) {
-      sesion.captura = null;
-      return abrirCliente(sesion, sesion.resultados[0]);
-    }
-    if (/^no/.test(n)) {
-      sesion.modo = 'captura';
-      const cap = sesion.captura;
-      avanzar(cap);
-      if (cap.paso < cap.campos.length) return { ...preguntar(cap.campos[cap.paso], cap), reply: 'Ok, sigamos. ' + cap.campos[cap.paso].prompt };
-      return finalizarCaptura(sesion, asesor);
-    }
-    return { reply: '¿Es el mismo cliente?', opciones: ['Sí, es el mismo', 'No, es otro cliente'] };
-  }
-
-  // --- Eligiendo entre varios resultados ---
-  if (sesion.modo === 'seleccion') {
-    const num = parseInt(n, 10);
-    let elegido = Number.isInteger(num) ? sesion.resultados[num - 1] : null;
-    if (!elegido) elegido = sesion.resultados.find((c) => norm(c.nombre_cliente) === n || (c.telefono && t.replace(/\D/g, '').length >= 7 && String(c.telefono).replace(/\D/g, '').includes(t.replace(/\D/g, ''))));
-    if (!elegido && !intencion && n.length >= 3) {
-      const parecidos = sesion.resultados.filter((c) => norm(c.nombre_cliente).includes(n) || norm(c.direccion).includes(n));
-      if (parecidos.length === 1) elegido = parecidos[0];
-    }
-    if (elegido) return abrirCliente(sesion, elegido);
-    if (!intencion) return ejecutarBusqueda(sesion, t); // escribió otro término
-    sesion.modo = 'libre';
-  }
-
-  // --- Esperando el término de búsqueda ---
-  if (sesion.modo === 'buscar' && !intencion) {
-    return ejecutarBusqueda(sesion, t);
-  }
-
-  // --- Intenciones ---
-  if (intencion === 'menu') {
-    sesion.modo = 'libre';
-    sesion.accionPendiente = null;
-    const saludo = /^(hola|holi|oli|ola|hey|buen|que mas|que hubo|quiubo|saludos)/.test(n);
-    return { reply: saludo ? `¡Hola${nombre ? `, ${nombre}` : ''}! 👋 ¿Qué quieres hacer?` : '¿Qué quieres hacer? 👇', opciones: MENU };
-  }
-  if (intencion === 'hoy') {
-    const periodo = /\bhoy\b/.test(n) ? 'hoy' : /semana|7\s*dias/.test(n) ? 'semana' : /todo|historial/.test(n) ? 'todo' : 'mes';
-    return clientesDeHoy(sesion, asesor, periodo);
-  }
-  if (intencion === 'nuevo') {
-    sesion.cliente = null;
-    return { ...iniciarCaptura(sesion, 'interesado'), reply: '¡Bien! 🙌 Registremos al interesado. ' + CAMPOS().interesado[0].prompt };
-  }
-  if (intencion === 'resumen' || intencion === 'resumen_equipo' || intencion === 'resumen_mes') {
-    sesion.modo = 'libre';
-    return resumen(asesor, intencion === 'resumen_equipo', intencion === 'resumen_mes' ? 'mes' : 'hoy');
-  }
-  if (intencion === 'buscar') {
-    const termino = extraerTermino(t);
-    if (termino && !/^cliente$/i.test(termino)) return ejecutarBusqueda(sesion, termino);
-    sesion.modo = 'buscar';
-    return {
-      reply: 'Claro 🔎. Escríbeme el nombre, el celular o la cédula del cliente.\n\n¿No tienes el dato a la mano? Toca "Mis clientes de hoy" y lo eliges de la lista.',
-      opciones: [OP.HOY, OP.CANCELAR],
-    };
-  }
-  if (intencion === 'rellamadas') return misRellamadas(sesion, asesor);
-  if (intencion === 'escalamientos') return misEscalamientos(sesion, asesor);
-  if (intencion === 'misventas') return misVentas(sesion, asesor);
-  if (intencion === 'misot') return misOtActivas(sesion, asesor);
-  if (intencion === 'alertas') return misAlertas(sesion, asesor);
-  if (intencion === 'venta' || intencion === 'no_venta' || intencion === 'cobertura' || intencion === 'rellamar' || intencion === 'escalar' || intencion === 'ot_activa' || intencion === 'editar' || intencion === 'nota') {
-    if (!sesion.cliente) {
-      sesion.accionPendiente = intencion;
-      sesion.modo = 'buscar';
-      const que = { venta: 'registrar la venta', no_venta: 'registrar que no se interesó', cobertura: 'actualizar la cobertura', rellamar: 'programar la rellamada', escalar: 'hacer el escalamiento', ot_activa: 'registrar la OT activa', editar: 'editar los datos', nota: 'agregar la nota' }[intencion];
-      return { reply: `Listo, para ${que} primero dime de qué cliente: nombre, celular o cédula.`, opciones: [OP.CANCELAR] };
-    }
-    return arrancarAccion(sesion, intencion);
-  }
-
-  // --- Escribió directamente un celular o cédula: lo buscamos ---
-  if (esCelular(t) || esCedula(t)) return ejecutarBusqueda(sesion, t);
-
-  // --- Todo lo demás: objeciones, ganchos, dudas → IA ---
-  const a = await ayuda(sesion, t);
-  return a;
-}
-
-// ---------------------------------------------------------------------------
-// Rutas
-// ---------------------------------------------------------------------------
-// Diagnóstico: minutos encendido y memoria en MB (si 'encendido' vuelve a 0 sin deploy, Render reinició el servidor)
-app.get('/api/health', (req, res) => { const m = process.memoryUsage(); res.json({ ok: true, ia: iaDisponible(), encendidoMin: Math.round(process.uptime() / 60), memoriaMB: Math.round(m.rss / 1048576), heapMB: Math.round(m.heapUsed / 1048576) }); });
-
-// Pestañas de la ventana: "Volver a llamar" y "Escalamientos" del asesor.
-// La extensión valida la cédula del asesor y recibe su nombre oficial.
-app.get('/api/asesor', async (req, res) => {
-  try {
-    const fila = await resolverAsesor(req.query.cedula);
-    if (!fila) return res.status(404).json({ error: AVISO_CEDULA.no_existe });
-    if (!fila.activo) return res.status(403).json({ error: AVISO_CEDULA.inactivo });
-    res.json({ ok: true, cedula: fila.cedula, nombre: fila.nombre, campana: fila.campana });
+    const registro = await guardarConocimiento(titulo, texto.trim(), agregadoPor);
+    await obtenerConocimientoTexto('', true); // refresca el caché de una vez
+    res.json({ ok: true, id: registro.id });
   } catch (err) {
-    console.error('Error /api/asesor:', err.message);
-    res.status(500).json({ error: /asesores/.test(err.message) ? 'Falta crear la tabla de asesores en Supabase (supabase_asesores.sql).' : err.message });
+    console.error('Error guardando conocimiento:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
   }
 });
 
-app.get('/api/mis-pendientes', async (req, res) => {
+// --- Carga en lote (ej. la guía de respuestas partida en ~78 entradas) ---
+// Body: { entradas: [{titulo, texto}], agregadoPor: 'Guía V4', reemplazar: true }
+// Con reemplazar=true se desactivan las entradas anteriores del mismo
+// "agregadoPor", así se puede volver a cargar la guía sin duplicarla.
+app.use('/api/conocimiento/lote', express.json({ limit: '10mb' }));
+app.post('/api/conocimiento/lote', async (req, res) => {
   try {
-    let asesor = String(req.query.asesor || '').trim();
-    if (req.query.cedula) {
-      const fila = await resolverAsesor(req.query.cedula);
-      if (!fila || !fila.activo) return res.status(403).json({ error: AVISO_CEDULA[fila ? 'inactivo' : 'no_existe'] });
-      asesor = fila.nombre;
+    const { entradas, agregadoPor, reemplazar } = req.body || {};
+    if (!Array.isArray(entradas) || entradas.length === 0) {
+      return res.status(400).json({ error: 'Faltan las entradas a cargar' });
     }
-    if (!asesor) return res.status(400).json({ error: 'Falta el asesor' });
-    const [rell, escs, vts, ots, alertas] = await Promise.all([db.rellamadasPendientes(asesor), db.escalamientosDeAsesor(asesor), db.ventasDeAsesor(asesor), db.otActivasDeAsesor(asesor), alertasDe(asesor).catch(() => [])]);
-    const hoy = hoyCO();
-    const corto = (c) => ({
-      id: c.id,
-      nombre: c.nombre_cliente || 'Sin nombre',
-      telefono: c.telefono,
-      direccion: [c.direccion, c.ciudad].filter(Boolean).join(' · '),
-    });
+    if (entradas.length > 1000) return res.status(400).json({ error: 'Máximo 1.000 entradas por lote' });
+    const autor = (agregadoPor || '').toString().trim() || null;
+    const filas = entradas
+      .filter((e) => e && e.texto && String(e.texto).trim())
+      .map((e) => ({ titulo: e.titulo ? String(e.titulo).slice(0, 200) : null, texto: String(e.texto).trim(), agregado_por: autor, activo: true }));
+    if (filas.length === 0) return res.status(400).json({ error: 'Ninguna entrada tiene texto' });
+    const { createClient } = require('@supabase/supabase-js');
+    const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+    let desactivadas = 0;
+    if (reemplazar && autor) {
+      const { data: prev, error: e1 } = await sb.from('conocimiento').update({ activo: false }).eq('agregado_por', autor).eq('activo', true).select('id');
+      if (e1) throw e1;
+      desactivadas = (prev || []).length;
+    }
+    const { error: e2 } = await sb.from('conocimiento').insert(filas);
+    if (e2) throw e2;
+    await obtenerConocimientoTexto('', true);
+    res.json({ ok: true, cargadas: filas.length, desactivadas });
+  } catch (err) {
+    console.error('Error cargando conocimiento en lote:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+// --- Ver qué se le ha enseñado a Daniela hasta ahora ---
+app.get('/api/conocimiento', async (req, res) => {
+  try {
+    const entradas = await obtenerConocimientoReciente(50);
+    res.json({ entradas, buscables: conocimientoCache.trozos.length, siempre: conocimientoCache.siempre.length });
+  } catch (err) {
+    console.error('Error listando conocimiento:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+// Cuando un caso pasa a "Cliente", su carpeta de SharePoint se mueve de
+// "00. En proceso" a su lugar definitivo. Es de mejor esfuerzo: si falla, no
+// interrumpe a la asesora (se reintenta al sincronizar o al adjuntar algo).
+async function moverCarpetaSiCliente(casoId) {
+  try {
+    if (!sharepointConfigurado() || !casoId) return;
+    const { createClient } = require('@supabase/supabase-js');
+    const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+    const { data } = await sb.from('Perfilamiento_y_ventas_GLA').select('*').eq('id', casoId).maybeSingle();
+    if (data && esClienteDefinitivo(data) && data.numero_identificacion && data.nombre_cliente) {
+      await moverACliente(String(data.numero_identificacion).trim(), String(data.nombre_cliente).trim());
+    }
+  } catch (e) {
+    console.error('No se pudo mover la carpeta de SharePoint:', e.message);
+  }
+}
+
+// Mueve de una vez las carpetas de TODOS los clientes ya cerrados (lo usa el
+// botón "Sincronizar carpetas" del panel). Es seguro repetirlo.
+app.post('/api/sincronizar-carpetas', async (req, res) => {
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    const { createClient } = require('@supabase/supabase-js');
+    const sb = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+    const { data, error } = await sb.from('Perfilamiento_y_ventas_GLA').select('*').eq('estado_pipeline', 'Cliente').limit(500);
+    if (error) throw error;
+    const clientes = (data || []).filter((c) => esClienteDefinitivo(c) && c.numero_identificacion && c.nombre_cliente);
+    let movidas = 0, sinCarpeta = 0, errores = 0;
+    for (const c of clientes) {
+      try {
+        const r = await moverACliente(String(c.numero_identificacion).trim(), String(c.nombre_cliente).trim());
+        if (r.movida) movidas++; else sinCarpeta++;
+      } catch (e) { errores++; console.error('Sincronizar carpeta:', c.nombre_cliente, e.message); }
+    }
+    res.json({ ok: true, clientes: clientes.length, movidas, sinCarpeta, errores });
+  } catch (err) {
+    console.error('Error sincronizando carpetas:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+// --- Adjuntar documentos del cliente (cédula, factura de compra, RUT,
+// certificado UPME, soporte de pago) → carpeta "cédula - nombre" en SharePoint.
+app.post('/api/adjuntar', async (req, res) => {
+  try {
+    const { sessionId, tipo, nombreArchivo, base64 } = req.body || {};
+    if (!TIPOS_DOC[tipo]) return res.status(400).json({ error: 'Tipo de documento no válido.' });
+    if (!base64) return res.status(400).json({ error: 'No llegó el archivo.' });
+    if (!sharepointConfigurado()) {
+      return res.status(503).json({ error: 'SharePoint todavía no está configurado en el servidor (faltan las variables de Microsoft).' });
+    }
+    const sesion = sesiones.get(sessionId);
+    let datos = (sesion && sesion.data) || {};
+    if (sesion && sesion.casoId) {
+      try {
+        const lista = await buscarCasoPorTermino(String(datos.numero_identificacion || datos.nombre_cliente || ''));
+        const caso = Array.isArray(lista) ? lista.find((c) => String(c.id) === String(sesion.casoId)) : null;
+        if (caso) datos = { ...caso, ...datos, estado_pipeline: caso.estado_pipeline, siguiente_paso: caso.siguiente_paso };
+      } catch (e) { /* si falla, seguimos con lo de la sesión */ }
+    }
+    const cedula = String(datos.numero_identificacion || '').trim();
+    const nombre = String(datos.nombre_cliente || '').trim();
+    if (!cedula || !nombre) {
+      return res.status(400).json({ error: 'Primero necesito el nombre y la cédula del cliente para crear su carpeta. Termina de registrarlos y vuelve a adjuntar.' });
+    }
+    // (Se quitó el bloqueo por "no tiene certificado UPME": si el asesor adjunta el certificado, es porque ya lo tiene.)
+    const buffer = Buffer.from(base64, 'base64');
+    if (buffer.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'El archivo pesa más de 25 MB.' });
+    const r = await subirDocumento({ cedula, nombre, tipo, nombreArchivo, buffer, esCliente: esClienteDefinitivo(datos) });
+    if (tipo === 'soporte_pago') require('./pagos').registrarPago({ cedula, nombre, telefono: datos.telefono, canal: 'Asistente (panel)',
+      cargado_por: datos.asesor || (sesion && sesion.asesor) || 'Asistente', archivo: nombreArchivo, link: r.linkArchivo || r.linkCarpeta, caso_id: sesion && sesion.casoId });
     res.json({
-      hoy,
-      alertasCobertura: alertas.map((c) => ({ ...corto(c), fecha: c.auditoria_fecha, por: c.auditoria_por, nota: c.auditoria_nota })),
-      rellamadas: rell.map((c) => ({
-        ...corto(c),
-        fecha: c.rellamar_fecha,
-        cuando: textoRellamada(c),
-        nota: c.rellamar_nota && norm(c.rellamar_nota) !== 'ninguna' ? c.rellamar_nota : '',
-        grupo: c.rellamar_fecha < hoy ? 'atrasada' : c.rellamar_fecha === hoy ? 'hoy' : 'proxima',
-      })),
-      escalamientos: escs.map((c) => ({
-        ...corto(c),
-        tipo: c.escalamiento_tipo,
-        detalle: c.escalamiento_detalle,
-        estado: c.escalamiento_estado === 'resuelto' ? 'resuelto' : 'pendiente',
-        respuesta: c.escalamiento_respuesta,
-        por: c.escalamiento_por,
-        fecha: c.escalamiento_fecha,
-      })),
-      otActivas: ots.map((c) => ({
-        ...corto(c),
-        ot: c.ot_activa_numero,
-        estado: c.ot_activa_estado === 'liberada' ? 'liberada' : 'activa',
-        respuesta: c.ot_activa_respuesta,
-        por: c.ot_activa_por,
-        fecha: c.ot_activa_fecha,
-        liberadaReciente: c.ot_activa_estado === 'liberada' && Date.now() - new Date(c.ot_activa_liberada_fecha).getTime() < 2 * 86400000,
-      })),
-      ventas: vts.map((v) => ({
-        id: v.interesado_id || v.id,
-        nombre: v.nombre_cliente || 'Sin nombre',
-        telefono: v.telefono,
-        direccion: [v.direccion, v.ciudad].filter(Boolean).join(' · '),
-        plan: v.plan,
-        ot: v.numero_ot,
-        agenda: [v.fecha_agenda, v.hora_agenda].filter(Boolean).join(' · '),
-        // "cancelada" viaja como no_instalada para que la extensión ya instalada la muestre (el texto dice Cancelada).
-        estado: v.estado_instalacion === 'cancelada' ? 'no_instalada' : v.estado_instalacion || 'pendiente',
-        estadoReal: v.estado_instalacion || 'pendiente',
-        estadoTexto: textoInstalacion(v),
-        // Motivo + aprobación del BO en un solo texto (lo muestra cualquier versión de la extensión).
-        nota: [v.instalacion_nota, v.aprobacion_bo ? `Aprobación BO: ${TEXTO_APROBACION[v.aprobacion_bo]}${v.aprobacion_motivo ? ` (${v.aprobacion_motivo})` : ''}` : '', v.llamada_ocm ? `OCM: ${v.llamada_ocm === 'si' ? 'Sí' : 'No'}` : '', textoTorre(v)].filter(Boolean).join(' · '),
-        instaladaReciente: v.estado_instalacion === 'instalada' && Date.now() - new Date(v.instalacion_fecha).getTime() < 2 * 86400000,
-        fecha: v.created_at,
-      })),
+      ok: true,
+      reply: `📎 Listo, guardé "${TIPOS_DOC[tipo]}" de ${nombre} en SharePoint, carpeta "${r.carpeta}".`,
+      link: r.linkCarpeta || r.linkArchivo || null,
     });
   } catch (err) {
-    console.error('Error mis-pendientes:', err);
-    res.status(500).json({ error: err.message });
+    console.error('Error adjuntando a SharePoint:', err);
+    res.status(500).json({ error: 'No pude guardar el archivo en SharePoint. ' + (err.message || '') });
   }
 });
-
-// ---------------------------------------------------------------------------
-// Panel web (back office). Protegido con la clave PANEL_CLAVE de Render.
-// ---------------------------------------------------------------------------
-// Fecha "AAAA-MM-DD" (hora Colombia) → ISO
-const isoColombia = (fecha, finDelDia) => {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(fecha || ''))) return null;
-  const d = new Date(`${fecha}T00:00:00-05:00`);
-  if (finDelDia) d.setUTCDate(d.getUTCDate() + 1);
-  return d.toISOString();
-};
-
-// ---------------------------------------------------------------------------
-// Acceso al panel: usuario + contraseña con PERFIL. Cada cambio queda en el historial.
-// La clave PANEL_CLAVE de Render sirve como usuario "admin" de respaldo.
-// ---------------------------------------------------------------------------
-const crypto = require('crypto');
-const PERFILES = {
-  admin: { nombre: 'Administrador', permisos: ['ver', 'gestion', 'torre', 'editar', 'eliminar', 'administrar', 'usuarios', 'historial'] },
-  supervisor: { nombre: 'Supervisor', permisos: ['ver', 'gestion', 'torre', 'editar', 'eliminar', 'administrar', 'historial'] },
-  backoffice: { nombre: 'Back office', permisos: ['ver', 'gestion', 'torre', 'editar'] },
-  gtr: { nombre: 'GTR', permisos: ['ver', 'administrar', 'historial'] },
-  torre: { nombre: 'Torre de control', permisos: ['ver', 'gestion', 'torre', 'editar', 'historial'] },
-  consulta: { nombre: 'Solo consulta', permisos: ['ver'] },
-};
-const SECRETO = () => process.env.PANEL_SECRETO || process.env.PANEL_CLAVE || 'marce';
-const b64 = (s) => Buffer.from(s).toString('base64url');
-function firmarToken(u) {
-  const cuerpo = b64(JSON.stringify({ u: u.usuario, n: u.nombre, p: u.perfil, exp: Date.now() + 7 * 24 * 3600 * 1000 })); // la sesión dura 7 días
-  return cuerpo + '.' + crypto.createHmac('sha256', SECRETO()).update(cuerpo).digest('base64url');
-}
-function leerToken(t) {
-  const [cuerpo, firma] = String(t || '').split('.');
-  if (!cuerpo || !firma) return null;
-  const esperada = crypto.createHmac('sha256', SECRETO()).update(cuerpo).digest('base64url');
-  if (firma.length !== esperada.length || !crypto.timingSafeEqual(Buffer.from(firma), Buffer.from(esperada))) return null;
-  const d = JSON.parse(Buffer.from(cuerpo, 'base64url').toString());
-  return d.exp > Date.now() ? { usuario: d.u, nombre: d.n, perfil: d.p } : null;
-}
-const hashClave = (clave, sal = crypto.randomBytes(16).toString('hex')) => `${sal}:${crypto.scryptSync(String(clave), sal, 32).toString('hex')}`;
-function claveOk(clave, hash) {
-  const [sal, h] = String(hash || '').split(':');
-  if (!sal || !h) return false;
-  const calc = crypto.scryptSync(String(clave), sal, 32).toString('hex');
-  return crypto.timingSafeEqual(Buffer.from(calc), Buffer.from(h));
-}
-// Usuarios desactivados: se revisa cada minuto
-const USUARIOS_ACTIVOS = new Map();
-async function sigueActivo(usuario) {
-  if (usuario === 'admin') return true;
-  const c = USUARIOS_ACTIVOS.get(usuario);
-  if (c && Date.now() - c.ts < 60000) return c.activo;
-  let activo = true;
-  try { const u = await db.buscarUsuario(usuario); activo = Boolean(u?.activo); } catch (_) {}
-  USUARIOS_ACTIVOS.set(usuario, { activo, ts: Date.now() });
-  return activo;
-}
-async function exigirClave(req, res, next) {
-  const clave = process.env.PANEL_CLAVE;
-  const tok = leerToken(req.get('x-panel-token'));
-  if (tok) {
-    if (!(await sigueActivo(tok.usuario))) return res.status(401).json({ error: 'Tu usuario está desactivado.' });
-    req.usuario = tok;
-  } else if (clave && req.get('x-panel-clave') === clave) {
-    req.usuario = { usuario: 'admin', nombre: 'Administrador', perfil: 'admin' };
-  } else {
-    return res.status(401).json({ error: 'Tu sesión terminó. Vuelve a entrar.' });
-  }
-  // Quien hace el cambio es SIEMPRE el usuario que entró (no lo que diga el navegador).
-  if (req.body && typeof req.body === 'object') req.body.auditor = req.usuario.nombre;
-  next();
-}
-// Permiso por acción según el perfil
-const puede = (req, permiso) => (PERFILES[req.usuario?.perfil]?.permisos || []).includes(permiso);
-const PERMISO_RUTA = {
-  '/api/panel/gestion-bo': ['gestion', 'torre'], '/api/panel/instalacion': ['gestion'], '/api/panel/ot': ['gestion'], '/api/panel/escalamiento': ['gestion'],
-  '/api/panel/auditar': ['gestion'], '/api/panel/registro': ['editar'], '/api/panel/editar': ['editar'], '/api/panel/eliminar': ['eliminar'],
-  '/api/panel/config': ['administrar'], '/api/panel/asesores': ['administrar'], '/api/panel/asesores/lote': ['administrar'], '/api/panel/asesores/unir': ['administrar'],
-  '/api/panel/homologar-direcciones': ['administrar'], '/api/panel/usuarios': ['usuarios'],
-  '/api/panel/importar': ['usuarios'], '/api/panel/importar/enlazar': ['usuarios'], '/api/panel/campana-dia': ['administrar'], '/api/panel/ocm': ['administrar'], '/api/panel/ocm/borrar': ['administrar'], '/api/panel/base-asesor/cargar': ['administrar'], '/api/panel/base-asesor/accion': ['administrar'], '/api/panel/bases': ['administrar'], '/api/panel/bases/borrar': ['administrar'], '/api/panel/importar/deshacer': ['usuarios'],
-};
-app.use('/api/panel', (req, res, next) => {
-  if (req.method !== 'POST' || req.path === '/login' || req.path === '/mi-clave') return next();
-  const ruta = req.path; // se guarda aquí: más adelante Express le devuelve el prefijo /api/panel
-  return exigirClave(req, res, () => {
-    const necesita = PERMISO_RUTA['/api/panel' + ruta];
-    if (necesita && !necesita.some((p) => puede(req, p))) return res.status(403).json({ error: `Tu perfil (${PERFILES[req.usuario.perfil]?.nombre || req.usuario.perfil}) no puede hacer esto.` });
-    // El perfil "torre" solo cambia la torre de control: lo demás de la venta queda como estaba.
-    if (ruta === '/gestion-bo' && !puede(req, 'gestion')) req.body._soloTorre = true;
-    // Historial: se guarda cada cambio que salga bien
-    const json = res.json.bind(res);
-    res.json = (cuerpo) => {
-      if (res.statusCode < 400) {
-        const b = { ...(req.body || {}) }; delete b.clave; delete b.clave_nueva; delete b.auditor; delete b._soloTorre;
-        if (Array.isArray(b.asesores)) b.asesores = `${b.asesores.length} asesores`;
-        if (Array.isArray(b.filas)) b.filas = `${b.filas.length} filas`;
-        if (Array.isArray(b.cubo)) b.cubo = `${b.cubo.length} grupos`;
-        if (Array.isArray(b.asignaciones)) b.asignaciones = b.asignaciones.map((x) => `${x.cedula}: ${(x.filas || []).length}`).join(' · ');
-        for (const k of ['tels', 'marcados', 'resumen']) if (b[k]) b[k] = '(omitido)';
-        db.registrarHistorial({ usuario: req.usuario.usuario, nombre: req.usuario.nombre, perfil: req.usuario.perfil, accion: ruta.replace(/^\//, ''),
-          registro: String(b.id || b.venta_id || b.interesado_id || b.cedula || b.clave || b.usuario || b.de || ''), detalle: req._cambio ? { ...b, _cambio: req._cambio } : b }).catch((e) => console.error('Historial:', e.message));
-      }
-      return json(cuerpo);
-    };
-    next();
-  });
-});
-
-// Entrar con usuario y contraseña
-app.post('/api/panel/login', async (req, res) => {
-  try {
-    const usuario = String(req.body?.usuario || '').trim().toLowerCase();
-    const clave = String(req.body?.clave || '');
-    if (!usuario || !clave) return res.status(400).json({ error: 'Escribe tu usuario y contraseña.' });
-    // Respaldo: usuario "admin" con la clave PANEL_CLAVE de Render
-    if (usuario === 'admin' && process.env.PANEL_CLAVE && clave === process.env.PANEL_CLAVE) {
-      const u = { usuario: 'admin', nombre: 'Administrador', perfil: 'admin' };
-      return res.json({ ok: true, token: firmarToken(u), ...u, permisos: PERFILES.admin.permisos });
-    }
-    let u = null;
-    try { u = await db.buscarUsuario(usuario); } catch (e) {
-      return res.status(500).json({ error: /panel_usuarios/.test(e.message) ? 'Falta correr supabase_usuarios.sql en Supabase. Mientras tanto entra con usuario "admin" y la clave del panel.' : e.message });
-    }
-    if (!u || !claveOk(clave, u.hash)) return res.status(401).json({ error: 'Usuario o contraseña incorrectos.' });
-    if (!u.activo) return res.status(401).json({ error: 'Tu usuario está desactivado. Habla con el administrador.' });
-    db.marcarIngreso(u.usuario).catch(() => {});
-    db.registrarHistorial({ usuario: u.usuario, nombre: u.nombre, perfil: u.perfil, accion: 'ingreso', registro: '', detalle: {} }).catch(() => {});
-    res.json({ ok: true, token: firmarToken(u), usuario: u.usuario, nombre: u.nombre, perfil: u.perfil, permisos: PERFILES[u.perfil]?.permisos || ['ver'] });
-  } catch (err) {
-    console.error('Error panel/login:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-// ¿Sigue válida la sesión? (al recargar la página)
-app.get('/api/panel/login', exigirClave, (req, res) => res.json({ ok: true, ...req.usuario, permisos: PERFILES[req.usuario.perfil]?.permisos || ['ver'] }));
-
-// Cambiar mi propia contraseña
-app.post('/api/panel/mi-clave', exigirClave, async (req, res) => {
-  try {
-    const { clave, clave_nueva } = req.body || {};
-    if (req.usuario.usuario === 'admin') return res.status(400).json({ error: 'El usuario admin de respaldo usa la clave de Render.' });
-    if (String(clave_nueva || '').length < 6) return res.status(400).json({ error: 'La nueva contraseña debe tener mínimo 6 caracteres.' });
-    const u = await db.buscarUsuario(req.usuario.usuario);
-    if (!u || !claveOk(clave, u.hash)) return res.status(400).json({ error: 'La contraseña actual no es correcta.' });
-    await db.guardarUsuario({ usuario: u.usuario, nombre: u.nombre, perfil: u.perfil, activo: u.activo, hash: hashClave(clave_nueva) });
-    db.registrarHistorial({ usuario: u.usuario, nombre: u.nombre, perfil: u.perfil, accion: 'cambio de contraseña', registro: u.usuario, detalle: {} }).catch(() => {});
-    res.json({ ok: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 🔐 Usuarios (solo admin)
-app.get('/api/panel/usuarios', exigirClave, async (req, res) => {
-  if (!puede(req, 'usuarios')) return res.status(403).json({ error: 'Solo el administrador ve los usuarios.' });
-  try { res.json({ usuarios: await db.listarUsuarios(), perfiles: PERFILES }); }
-  catch (err) { res.status(500).json({ error: /panel_usuarios/.test(err.message) ? 'Falta correr supabase_usuarios.sql en Supabase.' : err.message }); }
-});
-app.post('/api/panel/usuarios', async (req, res) => {
-  try {
-    const usuario = String(req.body?.usuario || '').trim().toLowerCase().replace(/\s+/g, '.');
-    const nombre = String(req.body?.nombreUsuario || '').trim();
-    const perfil = String(req.body?.perfil || '');
-    const { activo, claveNueva } = req.body || {};
-    if (!/^[a-z0-9._-]{3,}$/.test(usuario)) return res.status(400).json({ error: 'El usuario debe tener mínimo 3 letras o números (sin espacios).' });
-    if (usuario === 'admin') return res.status(400).json({ error: '"admin" está reservado.' });
-    if (!PERFILES[perfil]) return res.status(400).json({ error: 'Perfil no válido.' });
-    const antes = await db.buscarUsuario(usuario);
-    if (!antes && String(claveNueva || '').length < 6) return res.status(400).json({ error: 'Pon una contraseña de mínimo 6 caracteres.' });
-    if (!nombre && !antes) return res.status(400).json({ error: 'Escribe el nombre de la persona.' });
-    const fila = { usuario, nombre: nombre || antes.nombre, perfil, activo: activo ?? antes?.activo ?? true, hash: claveNueva ? hashClave(claveNueva) : antes.hash };
-    const u = await db.guardarUsuario(fila);
-    USUARIOS_ACTIVOS.delete(usuario);
-    res.json({ ok: true, usuario: u });
-  } catch (err) {
-    console.error('Error panel/usuarios:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 📜 Historial de cambios (admin y supervisor)
-app.get('/api/panel/historial', exigirClave, async (req, res) => {
-  if (!puede(req, 'historial')) return res.status(403).json({ error: 'Tu perfil no puede ver el historial.' });
-  try {
-    const desde = isoColombia(req.query.desde, false), hasta = isoColombia(req.query.hasta, true);
-    res.json({ historial: await db.leerHistorial({ desde, hasta, usuario: req.query.usuario || '' }) });
-  } catch (err) {
-    res.status(500).json({ error: /marce_historial/.test(err.message) ? 'Falta correr supabase_historial.sql en Supabase.' : err.message });
-  }
-});
-
-app.get('/api/panel/datos', exigirClave, cachear(30000), async (req, res) => {
-  try {
-    const hoy = new Date(Date.now() - 5 * 3600 * 1000).toISOString().slice(0, 10);
-    const desde = isoColombia(req.query.desde || hoy, false);
-    const hasta = isoColombia(req.query.hasta || hoy, true);
-    if (!desde || !hasta) return res.status(400).json({ error: 'Fechas inválidas (usa AAAA-MM-DD).' });
-    const d = await db.panelDatos(desde, hasta);
-    // Ventas que se instalan / tienen agenda en el rango (aunque se hayan vendido antes)
-    try { d.ventasAgenda = await db.ventasPorAgenda(req.query.desde || hoy, req.query.hasta || hoy); } catch (e) { console.error('ventasPorAgenda:', e.message); d.ventasAgenda = []; }
-    for (const k of Object.keys(d)) if (Array.isArray(d[k])) d[k] = d[k].map((f) => ({ ...conRegional(f), venta: f.venta ? conRegional(f.venta) : f.venta, tipo_venta: f.tipo_venta || f.datos?.tipo_venta || undefined, servicios_vendidos: f.servicios_vendidos || f.datos?.servicios_vendidos || undefined, multiasistencia: f.multiasistencia || f.datos?.multiasistencia || undefined, multiasistencia_cual: f.multiasistencia_cual || f.datos?.multiasistencia_cual || undefined }));
-    res.json(d);
-  } catch (err) {
-    console.error('Error panel/datos:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Agenda del día y "¿Cómo vamos hoy?": ventas agendadas para la fecha y ventas registradas ese día.
-app.get('/api/panel/hoy', exigirClave, cachear(30000), async (req, res) => {
-  try {
-    const fecha = /^\d{4}-\d{2}-\d{2}$/.test(req.query.fecha || '') ? req.query.fecha : hoyCO();
-    const [agenda, ventas, gestionadas] = await Promise.all([db.agendaDelDia(fecha), db.ventasDelDia(fecha), db.ventasGestionadasDia(fecha).catch(() => [])]);
-    const prep = (v) => ({ ...conRegional(v), tipo_venta: v.tipo_venta || v.datos?.tipo_venta || null, servicios_vendidos: v.servicios_vendidos || v.datos?.servicios_vendidos || null, multiasistencia: v.multiasistencia || v.datos?.multiasistencia || null, multiasistencia_cual: v.multiasistencia_cual || v.datos?.multiasistencia_cual || null });
-    res.json({ fecha, agenda: agenda.map(prep), ventas: ventas.map(prep), gestionadas: gestionadas.map(prep) });
-  } catch (err) {
-    console.error('Error panel/hoy:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/panel/ot', exigirClave, async (req, res) => {
-  try {
-    const { id, estado, respuesta, auditor } = req.body || {};
-    if (!id || !['liberada', 'activa'].includes(estado)) return res.status(400).json({ error: 'Falta id o el estado no es válido.' });
-    const interesado = await db.actualizarInteresado(id, {
-      ot_activa_estado: estado,
-      ot_activa_respuesta: respuesta || null,
-      ot_activa_por: estado === 'liberada' ? auditor || null : null,
-      ot_activa_liberada_fecha: estado === 'liberada' ? new Date().toISOString() : null,
-    });
-    res.json({ ok: true, interesado });
-  } catch (err) {
-    console.error('Error panel/ot:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/panel/instalacion', exigirClave, async (req, res) => {
-  try {
-    const { id, estado, nota, auditor } = req.body || {};
-    if (!id || !['instalada', 'no_instalada', 'cancelada', 'pendiente'].includes(estado)) return res.status(400).json({ error: 'Falta id o el estado no es válido.' });
-    if ((estado === 'no_instalada' || estado === 'cancelada') && !String(nota || '').trim()) return res.status(400).json({ error: 'Escribe el motivo.' });
-    const venta = await db.actualizarVenta(id, {
-      estado_instalacion: estado,
-      instalacion_nota: nota || null,
-      instalacion_por: estado === 'pendiente' ? null : auditor || null,
-      instalacion_fecha: estado === 'pendiente' ? null : new Date().toISOString(),
-    });
-    res.json({ ok: true, venta });
-  } catch (err) {
-    console.error('Error panel/instalacion:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Gestión completa del BO sobre una venta: instalación (+motivo), aprobación (+motivo) y llamada en OCM.
-app.post('/api/panel/gestion-bo', exigirClave, async (req, res) => {
-  try {
-    let { id, estado, motivo, aprobacion_bo, aprobacion_motivo, llamada_ocm, torre_salida, torre_motivo, torre_fecha_reagenda, tecnologia, aliado_tecnico, auditor } = req.body || {};
-    if (!id) return res.status(400).json({ error: 'Falta la venta.' });
-    if (!['pendiente', 'instalada', 'no_instalada', 'cancelada'].includes(estado)) return res.status(400).json({ error: 'Estado de instalación no válido.' });
-    if ((estado === 'no_instalada' || estado === 'cancelada') && !String(motivo || '').trim()) {
-      return res.status(400).json({ error: `Escribe el motivo de ${estado === 'cancelada' ? 'cancelación' : 'no instalación'}.` });
-    }
-    if (aprobacion_bo && !TEXTO_APROBACION[aprobacion_bo]) return res.status(400).json({ error: 'Aprobación BO no válida.' });
-    if (llamada_ocm && !['si', 'no'].includes(llamada_ocm)) return res.status(400).json({ error: 'Llamada en OCM no válida.' });
-    if (torre_salida && !TEXTO_TORRE[torre_salida]) return res.status(400).json({ error: 'Salida de torre de control no válida.' });
-    const tMotivo = String(torre_motivo || '').trim();
-    if (['reagendado', 'cancelado', 'pendiente'].includes(torre_salida) && !tMotivo) {
-      return res.status(400).json({ error: 'Torre de control: escribe el motivo.' });
-    }
-    if (torre_salida === 'reagendado' && !/^\d{4}-\d{2}-\d{2}$/.test(torre_fecha_reagenda || '')) {
-      return res.status(400).json({ error: 'Torre de control: elige la fecha del nuevo reagendamiento.' });
-    }
-    const antes = await db.obtenerVenta(id);
-    if (req.body._soloTorre && antes) {
-      // Perfil torre: la aprobación BO y la OCM quedan como estaban
-      aprobacion_bo = antes.aprobacion_bo || ''; aprobacion_motivo = antes.aprobacion_motivo || ''; llamada_ocm = antes.llamada_ocm || '';
-      if (!((antes.torre_salida || '') !== (torre_salida || ''))) { estado = antes.estado_instalacion || 'pendiente'; motivo = antes.instalacion_nota || ''; }
-    }
-    // La torre y el estado de instalación son lo mismo: si cambia uno, se actualiza el otro.
-    const TORRE_A_ESTADO = { instalado: 'instalada', cancelado: 'cancelada', pendiente: 'pendiente', reagendado: 'pendiente', iniciado: 'pendiente', sin_iniciar_am: 'pendiente', sin_iniciar_pm: 'pendiente' };
-    const ESTADO_A_TORRE = { instalada: 'instalado', cancelada: 'cancelado' };
-    const torreCambio = (antes?.torre_salida || '') !== (torre_salida || '');
-    const estadoCambio = (antes?.estado_instalacion || 'pendiente') !== estado;
-    if (torreCambio && torre_salida && TORRE_A_ESTADO[torre_salida] && !estadoCambio) {
-      estado = TORRE_A_ESTADO[torre_salida];
-      if (estado === 'cancelada' && !String(motivo || '').trim()) motivo = tMotivo;
-    } else if (estadoCambio && !torreCambio && ESTADO_A_TORRE[estado]) {
-      torre_salida = ESTADO_A_TORRE[estado];
-      if (estado === 'cancelada' && !tMotivo) torre_motivo = String(motivo || '').trim();
-    }
-    const cambios = {
-      torre_salida: torre_salida || null,
-      torre_motivo: String(torre_motivo || '').trim() || null,
-      // La nueva fecha solo aplica si la salida es reagendado/pendiente (así no queda una fecha vieja colgada)
-      torre_fecha_reagenda: ['reagendado', 'pendiente'].includes(torre_salida) ? torre_fecha_reagenda || null : null,
-      estado_instalacion: estado,
-      instalacion_nota: String(motivo || '').trim() || null,
-      aprobacion_bo: aprobacion_bo || null,
-      aprobacion_motivo: String(aprobacion_motivo || '').trim() || null,
-      llamada_ocm: llamada_ocm || null,
-    };
-    // Tecnología y aliado técnico (los llena la torre); solo si vienen
-    if (tecnologia !== undefined) cambios.tecnologia = String(tecnologia || '').trim().toUpperCase() || null;
-    if (aliado_tecnico !== undefined) cambios.aliado_tecnico = String(aliado_tecnico || '').trim().toUpperCase() || null;
-    req._cambio = { ...fichaOrden(antes), cambios: diferencias(antes, cambios, ['estado_instalacion', 'instalacion_nota', 'aprobacion_bo', 'aprobacion_motivo', 'llamada_ocm', 'torre_salida', 'torre_motivo', 'torre_fecha_reagenda', 'tecnologia', 'aliado_tecnico']) };
-    // Quién y cuándo, solo si cambió esa parte
-    if (!antes || antes.estado_instalacion !== estado || antes.instalacion_nota !== cambios.instalacion_nota) {
-      cambios.instalacion_por = estado === 'pendiente' ? null : auditor || null;
-      cambios.instalacion_fecha = estado === 'pendiente' ? null : new Date().toISOString();
-    }
-    if (!antes || antes.aprobacion_bo !== cambios.aprobacion_bo || antes.aprobacion_motivo !== cambios.aprobacion_motivo || antes.llamada_ocm !== cambios.llamada_ocm) {
-      cambios.aprobacion_por = auditor || null;
-      cambios.aprobacion_fecha = new Date().toISOString();
-    }
-    if (!antes || antes.torre_salida !== cambios.torre_salida || antes.torre_motivo !== cambios.torre_motivo || (antes.torre_fecha_reagenda || null) !== cambios.torre_fecha_reagenda) {
-      cambios.torre_por = cambios.torre_salida ? auditor || null : null;
-      cambios.torre_fecha = cambios.torre_salida ? new Date().toISOString() : null;
-    }
-    res.json({ ok: true, venta: await db.actualizarVenta(id, cambios) });
-  } catch (err) {
-    console.error('Error panel/gestion-bo:', err.message);
-    res.status(500).json({ error: /tecnologia|aliado_tecnico/.test(err.message) ? 'Falta correr supabase_tecnologia.sql en Supabase.' : /torre_/.test(err.message) ? 'Falta correr supabase_torre_control.sql en Supabase.' : /aprobacion|llamada_ocm/.test(err.message) ? 'Falta correr supabase_gestion_bo.sql en Supabase.' : err.message });
-  }
-});
-
-app.post('/api/panel/escalamiento', exigirClave, async (req, res) => {
-  try {
-    const { id, estado, respuesta, auditor } = req.body || {};
-    if (!id || !['resuelto', 'pendiente'].includes(estado)) return res.status(400).json({ error: 'Falta id o el estado no es válido.' });
-    const interesado = await db.actualizarInteresado(id, {
-      escalamiento_estado: estado,
-      escalamiento_respuesta: respuesta || null,
-      escalamiento_por: estado === 'resuelto' ? auditor || null : null,
-      escalamiento_resuelto_fecha: estado === 'resuelto' ? new Date().toISOString() : null,
-    });
-    res.json({ ok: true, interesado });
-  } catch (err) {
-    console.error('Error panel/escalamiento:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Interruptores del panel (ej. permitir ventas con fecha anterior).
-const CLAVES_CONFIG = ['ventas_fecha_anterior', 'metas_cierre', 'base_asesor_off'];
-app.get('/api/panel/config', exigirClave, async (req, res) => {
-  try {
-    res.json(await db.leerConfig());
-  } catch (err) {
-    res.status(500).json({ error: /marce_config/.test(err.message) ? 'Falta crear la tabla marce_config en Supabase (supabase_config.sql).' : err.message });
-  }
-});
-app.post('/api/panel/config', exigirClave, async (req, res) => {
-  try {
-    const { clave, valor, auditor } = req.body || {};
-    if (!CLAVES_CONFIG.includes(clave)) return res.status(400).json({ error: 'Interruptor no válido.' });
-    // metas_cierre = { "OUT Hogar": 20, "Recuperación": 40 } · los demás son interruptores Sí/No
-    const v = clave === 'base_asesor_off' ? Object.fromEntries(Object.entries(valor || {}).filter(([k, x]) => /^\d+$/.test(k) && x).map(([k]) => [k, true])) : clave === 'metas_cierre' ? Object.fromEntries(Object.entries(valor || {}).filter(([k, n]) => String(k).trim() && Number(n) >= 0).map(([k, n]) => [String(k).trim().slice(0, 60), Math.round(Number(n))])) : Boolean(valor);
-    await db.guardarConfig(clave, v, auditor);
-    await refrescarConfig(true);
-    res.json({ ok: true, config: CONFIG.datos });
-  } catch (err) {
-    console.error('Error panel/config:', err);
-    res.status(500).json({ error: /marce_config/.test(err.message) ? 'Falta crear la tabla marce_config en Supabase (supabase_config.sql).' : err.message });
-  }
-});
-
-// Ventas con fecha de instalación (agenda o reagenda) en un rango: para mirar la torre hacia atrás
-app.get('/api/panel/agenda-rango', exigirClave, async (req, res) => {
-  try {
-    const { desde, hasta } = req.query;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(desde || '') || !/^\d{4}-\d{2}-\d{2}$/.test(hasta || '')) return res.status(400).json({ error: 'Fechas inválidas.' });
-    res.json({ ventas: (await db.ventasPorAgenda(desde, hasta)).map(conRegional) });
-  } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ---------- 📅 Campaña por día ----------
-app.get('/api/panel/campana-dia', exigirClave, async (req, res) => {
-  try { res.json({ dias: await db.leerCampanasDia(req.query.desde, req.query.hasta) }); }
-  catch (err) { res.status(500).json({ error: /marce_campana_dia/.test(err.message) ? 'Falta correr supabase_campana_dia.sql en Supabase.' : err.message }); }
-});
-app.post('/api/panel/campana-dia', exigirClave, async (req, res) => {
-  try {
-    const { fecha, asesor, campana } = req.body || {};
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(fecha || '') || !String(asesor || '').trim()) return res.status(400).json({ error: 'Falta la fecha o el asesor.' });
-    res.json({ ok: true, dia: await db.guardarCampanaDia(fecha, String(asesor).trim(), String(campana || '').trim(), req.usuario?.nombre) });
-  } catch (err) { res.status(500).json({ error: /marce_campana_dia/.test(err.message) ? 'Falta correr supabase_campana_dia.sql en Supabase.' : err.message }); }
-});
-
-// ---------- 📉 Embudo de gestión (base del marcador OCM) ----------
-// El panel lee el Excel de OCM y manda por día: un "cubo" (conteos por canal, skill, asesor, tipificación y nivel)
-// y las filas que llegaron a contacto (para ver el detalle). Si se sube otra vez el mismo día, se reemplaza.
-const ERR_OCM = (err) => /marce_ocm_dia/.test(err.message) ? 'Falta correr supabase_ocm.sql en Supabase.' : err.message;
-app.post('/api/panel/ocm', exigirClave, async (req, res) => {
-  try {
-    const { dia, campana, cubo, filas, archivo, total } = req.body || {};
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dia || '') || !Array.isArray(cubo)) return res.status(400).json({ error: 'Falta el día o los datos de la base.' });
-    if (cubo.length > 20000 || (filas || []).length > 20000) return res.status(400).json({ error: 'La base es demasiado grande para un solo día.' });
-    const fila = { dia, campana: String(campana || '').trim(), cubo, filas: Array.isArray(filas) ? filas : [], archivo: archivo || null, total: +total || null, cargado_por: req.usuario?.nombre || null };
-    const marcados = typeof req.body.marcados === 'string' ? req.body.marcados.slice(0, 3000000) : null;
-    try { res.json({ ok: true, dia: await db.guardarOcmDia(marcados ? { ...fila, marcados } : fila) }); }
-    catch (e) {
-      if (!/marcados/.test(e.message)) throw e;
-      res.json({ ok: true, dia: await db.guardarOcmDia(fila), aviso: 'Falta correr supabase_bases.sql: sin eso no se cruzan los marcados con las bases.' });
-    }
-  } catch (err) { res.status(500).json({ error: ERR_OCM(err) }); }
-});
-
-// ---------- 👤 Base por asesor: el admin asigna clientes por cédula; el asesor los gestiona de a 2 ----------
-const ERR_BA = (err) => (/marce_base_asesor/.test(err.message) ? 'Falta correr supabase_base_asesor.sql en Supabase.' : err.message);
-const MAX_A_LA_VEZ = 2;
-const corteBA = (f) => ({
-  id: f.id, lote: f.lote, estado: f.estado, datos: f.datos || {}, telefono: f.telefono, cargado: f.cargado,
-  contesto: f.contesto, efectivo: f.efectivo, util: f.util, interesado: f.interesado, venta: f.venta,
-  resultado: f.resultado, seguimiento_fecha: f.seguimiento_fecha, nota: f.nota, intentos: f.intentos, gestionado_at: f.gestionado_at,
-});
-async function datosMiBase(fila) {
-  const ced = String(fila.cedula);
-  // Base apagada desde el panel para este asesor: no ve clientes nuevos ni los que tenía abiertos
-  const pausada = Boolean((await refrescarConfig())?.base_asesor_off?.valor?.[ced]);
-  const [actuales, conteo, seg, hoyL] = await Promise.all([
-    pausada ? Promise.resolve([]) : db.tomarBaseAsesor(ced, MAX_A_LA_VEZ),
-    db.leerBaseAsesorCampos(ced, 'estado, contesto, interesado, venta, gestionado_at'),
-    db.seguimientosBaseAsesor(ced),
-    db.gestionadosBaseAsesor(ced, isoColombia(hoyCO(), false)),
-  ]);
-  const hoyIni = isoColombia(hoyCO(), false);
-  const r = { total: conteo.length, pendientes: 0, enGestion: 0, gestionados: 0, seguimiento: 0, hoy: 0, hoyContesto: 0, hoyInteresados: 0, hoyVentas: 0 };
-  for (const x of conteo) {
-    if (x.estado === 'pendiente') r.pendientes += 1; else if (x.estado === 'en_gestion') r.enGestion += 1; else if (x.estado === 'seguimiento') r.seguimiento += 1; else r.gestionados += 1;
-    if (x.gestionado_at && x.gestionado_at >= hoyIni) { r.hoy += 1; if (x.contesto) r.hoyContesto += 1; if (x.interesado) r.hoyInteresados += 1; if (x.venta) r.hoyVentas += 1; }
-  }
-  if (pausada) { r.pendientes = 0; r.enGestion = 0; }
-  return { ok: true, cedula: ced, asesor: fila.nombre, campana: fila.campana, hoy: hoyCO(), pausada, resumen: r, actuales: actuales.map(corteBA), seguimientos: pausada ? [] : seg.map(corteBA), gestionadosHoy: hoyL.map(corteBA) };
-}
-app.get('/api/mi-base', async (req, res) => {
-  try {
-    const fila = await resolverAsesor(req.query.cedula);
-    if (!fila) return res.status(404).json({ error: AVISO_CEDULA.no_existe });
-    if (!fila.activo) return res.status(403).json({ error: AVISO_CEDULA.inactivo });
-    res.json(await datosMiBase(fila));
-  } catch (err) { console.error('mi-base:', err.message); res.status(500).json({ error: ERR_BA(err) }); }
-});
-// Resultado en cadena: contestó → efectivo (gestionable) → útil para recuperar → interesado → venta / seguimiento
-app.post('/api/mi-base/resultado', async (req, res) => {
-  try {
-    const b = req.body || {};
-    const fila = await resolverAsesor(b.cedula);
-    if (!fila || !fila.activo) return res.status(403).json({ error: AVISO_CEDULA[fila ? 'inactivo' : 'no_existe'] });
-    if ((await refrescarConfig())?.base_asesor_off?.valor?.[String(fila.cedula)]) return res.status(403).json({ error: 'Tu base está pausada por el supervisor.' });
-    const reg = await db.leerFilaBase(+b.id);
-    if (!reg || String(reg.cedula) !== String(fila.cedula)) return res.status(404).json({ error: 'Ese cliente no está asignado a tu cédula.' });
-    if (!['en_gestion', 'seguimiento', 'pendiente'].includes(reg.estado)) return res.status(400).json({ error: 'Ese cliente ya fue gestionado.' });
-    const si = (v) => v === true || v === 'si' || v === 1;
-    const c = { contesto: si(b.contesto), efectivo: null, util: null, interesado: null, venta: null, seguimiento_fecha: null };
-    let estado = 'gestionado', resultado;
-    if (!c.contesto) { estado = 'no_contesto'; resultado = 'No contestó'; }
-    else {
-      c.efectivo = si(b.efectivo);
-      if (!c.efectivo) resultado = 'Contestó · no es cliente efectivo';
-      else {
-        c.util = si(b.util);
-        if (!c.util) resultado = 'Efectivo · no útil para recuperar';
-        else {
-          c.interesado = si(b.interesado);
-          if (!c.interesado) resultado = 'Útil · no interesado';
-          else if (b.seguimiento) { estado = 'seguimiento'; resultado = 'Interesado · en seguimiento'; c.seguimiento_fecha = /^\d{4}-\d{2}-\d{2}$/.test(b.seguimiento_fecha || '') ? b.seguimiento_fecha : null; }
-          else { c.venta = si(b.venta); resultado = c.venta ? 'Venta lograda' : 'Interesado · no se logró la venta'; }
-        }
-      }
-    }
-    await db.guardarResultadoBase(reg.id, String(fila.cedula), { ...c, estado, resultado, nota: String(b.nota || '').slice(0, 1000) || reg.nota || null, intentos: (reg.intentos || 0) + 1, gestionado_at: new Date().toISOString() });
-    res.json(await datosMiBase(fila));
-  } catch (err) { console.error('mi-base/resultado:', err.message); res.status(500).json({ error: ERR_BA(err) }); }
-});
-// Admin: cargar base (ya repartida por cédula en el panel)
-app.post('/api/panel/base-asesor/cargar', exigirClave, async (req, res) => {
-  try {
-    const { asignaciones, lote } = req.body || {};
-    if (!Array.isArray(asignaciones) || !asignaciones.length) return res.status(400).json({ error: 'No hay filas para cargar.' });
-    const filas = []; const resumen = [];
-    for (const a of asignaciones) {
-      // "BOLSA" = base disponible sin asignar: queda guardada para repartirla después
-      const fila = a.cedula === 'BOLSA' ? { cedula: 'BOLSA', nombre: '📦 Bolsa sin asignar' } : await resolverAsesor(a.cedula);
-      if (!fila) return res.status(400).json({ error: `La cédula ${a.cedula} no está registrada en Asesores.` });
-      (a.filas || []).forEach((d, i) => {
-        const tels = (Array.isArray(d.telefonos) ? d.telefonos : []).map((t) => soloDigitos(t)).filter((t) => t.length >= 7);
-        filas.push({ cedula: String(fila.cedula), asesor: fila.nombre, lote: String(lote || '').slice(0, 200) || null, cargado_por: req.usuario?.nombre || null, orden: i, telefono: tels[0] || null, datos: { ...d, telefonos: tels } });
-      });
-      resumen.push({ cedula: fila.cedula, asesor: fila.nombre, n: (a.filas || []).length });
-    }
-    if (filas.length > 20000) return res.status(400).json({ error: 'Máximo 20.000 clientes por carga.' });
-    // No se vuelve a cargar un cliente (mismo celular y OT) que ya está pendiente en alguna base
-    const ya = new Set((await db.leerBaseAsesorCampos(null, 'telefono, datos, estado')).filter((f) => ['pendiente', 'en_gestion'].includes(f.estado)).map((f) => (f.telefono || '') + '|' + (f.datos?.ot || f.datos?.cuenta || '')));
-    const nuevas = filas.filter((f) => { const k = (f.telefono || '') + '|' + (f.datos?.ot || f.datos?.cuenta || ''); if (!f.telefono || ya.has(k)) return !f.telefono; ya.add(k); return true; });
-    const n = nuevas.length ? await db.insertarBaseAsesor(nuevas) : 0;
-    res.json({ ok: true, cargados: n, repetidos: filas.length - nuevas.length, resumen });
-  } catch (err) { res.status(500).json({ error: ERR_BA(err) }); }
-});
-// Admin: consumo y resultados por cédula y por lote
-// Resultado final en Marce: lo que el asesor registró en el asistente (interesado / venta) después de cargar la base.
-// Así, si en la base marcó "no venta" pero después vendió y la registró en Marce, cuenta como venta.
-async function marceDeBase(filas) {
-  const gest = filas.filter((f) => f.cedula !== 'BOLSA' && !['pendiente', 'en_gestion'].includes(f.estado));
-  const telsDe = (f) => [...new Set([f.telefono, ...(Array.isArray(f.tels) ? f.tels : f.datos?.telefonos || [])].map((t) => soloDigitos(t).slice(-10)).filter((t) => t.length >= 7))];
-  const todos = [...new Set(gest.flatMap(telsDe))];
-  const idx = {};
-  if (todos.length) {
-    const m = await db.marcePorTelefonos(todos);
-    const partes = (t) => String(t || '').split(/[\/,;|]|\sy\s/i).map((x) => x.replace(/\D/g, '').slice(-10)).filter((x) => x.length >= 7);
-    for (const r of m.interesados) for (const t of partes(r.telefono)) (idx[t] ??= []).push({ tipo: 'interesado', fecha: r.created_at, resultado: r.resultado || '', asesor: r.asesor });
-    for (const r of m.ventas) for (const t of partes(r.telefono)) (idx[t] ??= []).push({ tipo: 'venta', fecha: r.created_at, asesor: r.asesor, ot: r.numero_ot });
-  }
-  const res = new Map();
-  for (const f of gest) {
-    // Cuenta lo registrado en Marce desde el día anterior a la carga de la base
-    const desde = new Date(Date.parse(f.cargado || 0) - 864e5).toISOString();
-    const regs = telsDe(f).flatMap((t) => idx[t] || []).filter((r) => r.fecha >= desde);
-    if (!regs.length) continue;
-    const vta = regs.find((r) => r.tipo === 'venta');
-    const intr = regs.filter((r) => r.tipo === 'interesado').sort((a, b) => (a.fecha < b.fecha ? 1 : -1))[0];
-    res.set(f.id, { enMarce: true, venta: Boolean(vta), ot: vta?.ot || null, resultado: vta ? 'venta' : intr?.resultado || '', fecha: (vta || intr).fecha, asesor: (vta || intr).asesor });
-  }
-  return res;
-}
-// Admin: consumo y resultados por cédula y por lote
-app.get('/api/panel/base-asesor', exigirClave, cachear(60000), async (req, res) => {
-  try {
-    const filas = await db.leerBaseAsesorCampos(null, 'id, cedula, asesor, lote, estado, contesto, efectivo, util, interesado, venta, gestionado_at, cargado, telefono, tels:datos->telefonos');
-    let mar = new Map();
-    try { mar = await marceDeBase(filas); } catch (e) { console.error('base-asesor marce:', e.message); }
-    const hoyIni = isoColombia(hoyCO(), false);
-    const nuevo = () => ({ total: 0, pendientes: 0, enGestion: 0, gestionados: 0, noContesto: 0, contesto: 0, efectivos: 0, utiles: 0, interesados: 0, ventas: 0, seguimiento: 0, hoy: 0, ultima: null, cargado: null,
-      enMarce: 0, intEnMarce: 0, ventasMarce: 0, ventasFinal: 0, ventasRecuperadas: 0 });
-    const porCed = {}, porLote = {};
-    for (const f of filas) {
-      const m = mar.get(f.id);
-      for (const [mp, k] of [[porCed, f.cedula], [porLote, (f.lote || 'Sin nombre') + '\u0001' + f.cedula]]) {
-        const x = (mp[k] ??= { ...nuevo(), cedula: f.cedula, asesor: f.asesor, lote: f.lote });
-        x.total += 1;
-        if (f.estado === 'pendiente') x.pendientes += 1; else if (f.estado === 'en_gestion') x.enGestion += 1; else x.gestionados += 1;
-        if (f.estado === 'no_contesto') x.noContesto += 1;
-        if (f.estado === 'seguimiento') x.seguimiento += 1;
-        if (f.contesto) x.contesto += 1; if (f.efectivo) x.efectivos += 1; if (f.util) x.utiles += 1; if (f.interesado) x.interesados += 1; if (f.venta) x.ventas += 1;
-        if (m) { x.enMarce += 1; if (f.interesado) x.intEnMarce += 1; if (m.venta) x.ventasMarce += 1; }
-        if (f.venta || m?.venta) x.ventasFinal += 1;
-        if (!f.venta && m?.venta) x.ventasRecuperadas += 1; // en la base quedó como no venta / seguimiento, pero la venta está en Marce
-        if (f.gestionado_at && f.gestionado_at >= hoyIni) x.hoy += 1;
-        if (f.gestionado_at && (!x.ultima || f.gestionado_at > x.ultima)) x.ultima = f.gestionado_at;
-        if (f.cargado && (!x.cargado || f.cargado > x.cargado)) x.cargado = f.cargado;
-      }
-    }
-    res.json({ asesores: Object.values(porCed), lotes: Object.values(porLote) });
-  } catch (err) { res.status(500).json({ error: ERR_BA(err) }); }
-});
-app.get('/api/panel/base-asesor/detalle', exigirClave, async (req, res) => {
-  try {
-    const filas = await db.detalleBaseAsesor(req.query.cedula || null, req.query.lote || null);
-    let mar = new Map();
-    try { mar = await marceDeBase(filas); } catch (e) { console.error('detalle marce:', e.message); }
-    res.json({ filas: filas.map((f) => ({ ...corteBA(f), cedula: f.cedula, asesor: f.asesor, cargado_por: f.cargado_por, marce: mar.get(f.id) || null })) });
-  } catch (err) { res.status(500).json({ error: ERR_BA(err) }); }
-});
-app.post('/api/panel/base-asesor/accion', exigirClave, async (req, res) => {
-  try {
-    const { accion, cedula, lote, aCedula, cantidad } = req.body || {};
-    if (!cedula) return res.status(400).json({ error: 'Falta la cédula.' });
-    let aNombre = null;
-    if (accion === 'reasignar' || accion === 'asignar') { if (aCedula === 'BOLSA') aNombre = '📦 Bolsa sin asignar'; else { const f = await resolverAsesor(aCedula); if (!f) return res.status(400).json({ error: 'La cédula destino no está en Asesores.' }); aNombre = f.nombre; } }
-    if (accion === 'asignar') return res.json({ ok: true, n: await db.asignarDeBolsa(cantidad, String(aCedula), aNombre, lote || null) });
-    // Quita los clientes repetidos (mismo celular y misma OT) que aún no se han gestionado; deja el primero que se cargó
-    if (accion === 'duplicados') {
-      const filas = await db.leerBaseAsesorCampos(null, 'id, telefono, datos, estado');
-      const vistos = new Set(), borrar = [];
-      for (const f of filas.sort((x, y) => x.id - y.id)) {
-        const k = (f.telefono || '') + '|' + (f.datos?.ot || f.datos?.cuenta || '');
-        if (!f.telefono) continue;
-        if (vistos.has(k) && ['pendiente', 'en_gestion'].includes(f.estado)) borrar.push(f.id); else vistos.add(k);
-      }
-      return res.json({ ok: true, n: borrar.length ? await db.borrarIdsBase(borrar) : 0 });
-    }
-    res.json({ ok: true, n: await db.accionBaseAsesor(accion, { cedula: String(cedula), lote: lote || null, aCedula: String(aCedula || ''), aNombre }) });
-  } catch (err) { res.status(500).json({ error: ERR_BA(err) }); }
-});
-
-// ---------- 📈 Histórico del embudo ----------
-// Resumen pequeño por día y campaña (se calcula una vez y queda guardado): así el histórico completo carga en segundos.
-// L = teléfonos únicos que llegaron a cada etapa (0 marcado … 6 venta OCM) · cubo = llamadas por canal, asesor y etapa
-// vm = ventas de Marce registradas ese día de teléfonos del marcador [canal, asesor] · ints = interesados [canal, asesor, en Marce 1/0]
-async function calcularResumenOcm(f) {
-  const nv = new Map();
-  for (const p of String(f.marcados || '').split(',')) { const [t, n0] = p.split(':'); if (!t) continue; const n = Math.min(+n0 || 0, 6); if (!(nv.get(t) >= n)) nv.set(t, n); }
-  const info = new Map();
-  for (const x of f.filas || []) { const n = Math.min(x[6], 6); if (!(nv.get(x[0]) >= n)) nv.set(x[0], n); const pr = info.get(x[0]); if (!pr || x[6] > pr.n) info.set(x[0], { c: x[2] || '', a: x[5] || '', n: x[6] }); }
-  const L = [0, 0, 0, 0, 0, 0, 0];
-  for (const n of nv.values()) for (let k = 0; k <= n; k++) L[k] += 1;
-  const cub = new Map();
-  for (const c of f.cubo || []) { const k = [c[0] || '', c[2] || '', Math.min(c[4], 6)].join('\u0001'); cub.set(k, (cub.get(k) || 0) + (c[5] || 0)); }
-  const cubo = [...cub.entries()].map(([k, n]) => { const p = k.split('\u0001'); return [p[0], p[1], +p[2], n]; });
-  const partes = (t) => String(t || '').split(/[\/,;|]|\sy\s/i).map((x) => x.replace(/\D/g, '').slice(-10)).filter((x) => x.length >= 7);
-  const vm = [];
-  for (const v of await db.ventasCreadasEntre(isoColombia(f.dia, false), isoColombia(f.dia, true))) {
-    const t = partes(v.telefono).find((x) => nv.has(x)); if (!t) continue;
-    const x = info.get(t) || {}; vm.push([x.c || '', x.a || '']);
-  }
-  const intsTel = [...nv.entries()].filter(([, n]) => n >= 5).map(([t]) => t);
-  const ini = sumarDias(f.dia, -30), fin = sumarDias(f.dia, 1);
-  const marce = intsTel.length ? await db.marcePorTelefonos(intsTel) : { interesados: [], ventas: [] };
-  const conReg = new Set();
-  for (const r of [...marce.interesados, ...marce.ventas]) { const d = new Date(Date.parse(r.created_at) - 5 * 3600e3).toISOString().slice(0, 10); if (d >= ini && d <= fin) for (const t of partes(r.telefono)) conReg.add(t); }
-  const ints = intsTel.map((t) => { const x = info.get(t) || {}; return [x.c || '', x.a || '', conReg.has(t) ? 1 : 0]; });
-  return { v: 1, L, cubo, vm, ints, calc: new Date().toISOString() };
-}
-app.get('/api/panel/ocm/historico', exigirClave, cachear(300000), async (req, res) => {
-  try {
-    const hasta = /^\d{4}-\d{2}-\d{2}$/.test(req.query.hasta || '') ? req.query.hasta : hoyCO();
-    const filas = await db.leerOcmResumenes(hasta);
-    // Se recalcula si no tiene resumen o si se calculó antes de cerrar el día siguiente (los asesores aún pueden registrar en Marce)
-    const pend = filas.filter((f) => !f.resumen || String(f.resumen.calc || '') < sumarDias(f.dia, 2));
-    const t0 = Date.now(); let hechos = 0;
-    for (const f of pend) {
-      if (Date.now() - t0 > 20000) break;
-      try { f.resumen = await calcularResumenOcm(await db.leerOcmFila(f.dia, f.campana)); await db.guardarOcmResumen(f.dia, f.campana, f.resumen); hechos += 1; }
-      catch (e) { console.error('resumen OCM', f.dia, f.campana, e.message); hechos += 1; }
-    }
-    const pendientes = pend.length - hechos;
-    if (pendientes > 0) res.locals.guardarCache = null; // no guardar en caché una respuesta incompleta
-    res.json({ dias: filas.filter((f) => f.resumen).map((f) => ({ dia: f.dia, campana: f.campana, total: f.total, r: f.resumen })), pendientes });
-  } catch (err) {
-    res.status(500).json({ error: /resumen/.test(err.message) ? 'Falta correr supabase_ocm_resumen.sql en Supabase.' : ERR_OCM(err) });
-  }
-});
-app.post('/api/panel/ocm/borrar', exigirClave, async (req, res) => {
-  try {
-    const { dia, campana } = req.body || {};
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dia || '')) return res.status(400).json({ error: 'Falta el día.' });
-    await db.borrarOcmDia(dia, String(campana || '').trim());
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: ERR_OCM(err) }); }
-});
-// Lee los días cargados y cruza cada interesado de OCM con Marce por celular
-app.get('/api/panel/ocm', exigirClave, cachear(180000), async (req, res) => {
-  try {
-    const { desde, hasta } = req.query;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(desde || '') || !/^\d{4}-\d{2}-\d{2}$/.test(hasta || '')) return res.status(400).json({ error: 'Fechas inválidas.' });
-    const dias = await db.leerOcmDias(desde, hasta);
-    // Nivel 5 = interesado (o más). Columnas de cada fila: [tel, hora, canal, skill, tipificación, asesor, nivel, procedencia, intentos]
-    const tels = []; for (const d of dias) for (const f of d.filas || []) if (f[6] >= 5) tels.push(f[0]);
-    const marce = tels.length ? await db.marcePorTelefonos(tels) : { interesados: [], ventas: [] };
-    const cruce = {};
-    const partes = (t) => String(t || '').split(/[\/,;|]|\sy\s/i).map((x) => x.replace(/\D/g, '').slice(-10)).filter((x) => x.length >= 7);
-    const meter = (t, x) => { for (const n of partes(t)) (cruce[n] = cruce[n] || []).push(x); };
-    for (const i of marce.interesados) meter(i.telefono, { tipo: 'interesado', id: i.id, asesor: i.asesor, resultado: i.resultado || '', fecha: i.created_at, cliente: i.nombre_cliente });
-    for (const v of marce.ventas) meter(v.telefono, { tipo: 'venta', id: v.id, asesor: v.asesor, resultado: 'venta', fecha: v.created_at, cliente: v.nombre_cliente, ot: v.numero_ot, interesado_id: v.interesado_id, agenda: Boolean(v.fecha_agenda), instalada: v.estado_instalacion === 'instalada' || v.torre_salida === 'instalado' });
-    // Nombre de cada asesor (OCM trae la cédula)
-    const asesores = {};
-    try { for (const a of await db.listarAsesores()) asesores[String(a.cedula)] = a.nombre; } catch (e) { console.error('ocm asesores:', e.message); }
-    res.json({ dias, cruce, asesores });
-  } catch (err) { res.status(500).json({ error: ERR_OCM(err) }); }
-});
-
-// ---------- 🗂 Gestión base de datos (bases preparadas por fuente × marcador OCM × Marce) ----------
-// El panel lee la base preparada (una o varias sub-bases por archivo) y manda por archivo un resumen y sus teléfonos.
-const ERR_BASES = (err) => /marce_base_dia|marcados/.test(err.message) ? 'Falta correr supabase_bases.sql en Supabase.' : err.message;
-app.post('/api/panel/bases', exigirClave, async (req, res) => {
-  try {
-    const { dia, archivo, fuente, canal, campana, resumen, tels, total, archivo_origen } = req.body || {};
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dia || '') || !String(archivo || '').trim() || typeof tels !== 'string') return res.status(400).json({ error: 'Falta el día, el archivo o los teléfonos.' });
-    res.json({ ok: true, base: await db.guardarBaseDia({ dia, archivo: String(archivo).trim().slice(0, 300), fuente: fuente || null, canal: canal || null, campana: campana || null,
-      resumen: resumen || {}, tels: tels.slice(0, 4000000), total: +total || null, archivo_origen: archivo_origen || null, cargado_por: req.usuario?.nombre || null }) });
-  } catch (err) { res.status(500).json({ error: ERR_BASES(err) }); }
-});
-app.post('/api/panel/bases/borrar', exigirClave, async (req, res) => {
-  try {
-    const { dia, archivo } = req.body || {};
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dia || '')) return res.status(400).json({ error: 'Falta el día.' });
-    await db.borrarBaseDia(dia, archivo || null);
-    res.json({ ok: true });
-  } catch (err) { res.status(500).json({ error: ERR_BASES(err) }); }
-});
-app.get('/api/panel/bases', exigirClave, cachear(120000), async (req, res) => {
-  try {
-    const todos = await db.diasBases();
-    const resumenDias = {};
-    for (const b of todos) { const d = (resumenDias[b.dia] = resumenDias[b.dia] || { dia: b.dia, archivos: 0, total: 0, fuentes: [] }); d.archivos += 1; d.total += b.total || 0; if (b.fuente && !d.fuentes.includes(b.fuente)) d.fuentes.push(b.fuente); }
-    const dias = Object.values(resumenDias).sort((a, b) => (a.dia < b.dia ? 1 : -1));
-    const ocmDias = await db.diasOcm().catch(() => []);
-    const dia = /^\d{4}-\d{2}-\d{2}$/.test(req.query.dia || '') ? req.query.dia : dias[0]?.dia;
-    if (!dia) return res.json({ dias, ocmDias, dia: null, bases: [], ocm: [], cruce: {} });
-    const [bases, ocm] = await Promise.all([db.leerBasesDia(dia), db.leerOcmDia(dia).catch(() => [])]);
-    // Interesados (nivel ≥ 5) del marcador: se buscan en Marce para saber si hubo venta e instalación
-    const tels = new Set();
-    for (const o of ocm) {
-      for (const f of o.filas || []) if (f[6] >= 5) tels.add(f[0]);
-      for (const p of String(o.marcados || '').split(',')) { const [t, n] = p.split(':'); if (+n >= 5) tels.add(t); }
-    }
-    const marce = tels.size ? await db.marcePorTelefonos([...tels]) : { interesados: [], ventas: [] };
-    const cruce = {};
-    const partes = (t) => String(t || '').split(/[\/,;|]|\sy\s/i).map((x) => x.replace(/\D/g, '').slice(-10)).filter((x) => x.length >= 7);
-    // "En Marce" = el asesor dejó registrado (interesado o venta) ese celular entre 30 días antes y el día siguiente
-    const enVentana = (iso) => { if (!iso) return false; const d = new Date(Date.parse(iso) - 5 * 3600 * 1000).toISOString().slice(0, 10); const ini = new Date(Date.parse(dia + 'T12:00:00Z') - 30 * 864e5).toISOString().slice(0, 10); const fin = new Date(Date.parse(dia + 'T12:00:00Z') + 864e5).toISOString().slice(0, 10); return d >= ini && d <= fin; };
-    for (const i of marce.interesados) for (const n of partes(i.telefono)) { const c = (cruce[n] = cruce[n] || { int: 0, venta: 0, agenda: 0, inst: 0 }); c.int += 1; if (enVentana(i.created_at)) c.marce = 1; }
-    // Solo cuenta como venta del día la que se registró ESE día (hora Colombia). Las de otros días (por ejemplo,
-    // la venta original de un cliente de Recuperación) se reportan aparte para no inflar el cierre.
-    const diaCO = (iso) => new Date(Date.parse(iso) - 5 * 3600 * 1000).toISOString().slice(0, 10);
-    for (const v of marce.ventas) for (const n of partes(v.telefono)) {
-      const c = (cruce[n] = cruce[n] || { int: 0, venta: 0, agenda: 0, inst: 0, ventaAntes: 0, ventaDespues: 0 });
-      const vd = v.created_at ? diaCO(v.created_at) : '';
-      if (enVentana(v.created_at)) c.marce = 1;
-      if (vd === dia) { c.venta += 1; if (v.fecha_agenda) c.agenda += 1; if (v.estado_instalacion === 'instalada' || v.torre_salida === 'instalado') c.inst += 1; }
-      else if (vd && vd < dia) c.ventaAntes += 1;
-      else c.ventaDespues += 1;
-    }
-    const asesores = {};
-    try { for (const a of await db.listarAsesores()) asesores[String(a.cedula)] = a.nombre; } catch (e) { console.error('bases asesores:', e.message); }
-    // Ventas registradas en Marce ese día (para cuadrar contra las ventas tipificadas en OCM)
-    let ventasDia = [];
-    try { ventasDia = (await db.ventasDelDia(dia)).map((v) => ({ tels: partes(v.telefono), hora: v.created_at ? new Date(Date.parse(v.created_at) - 5 * 3600 * 1000).toISOString().slice(11, 13) : '', asesor: v.asesor, cliente: v.nombre_cliente, ot: v.numero_ot, tipo: v.tipo_venta || v.datos?.tipo_venta || '' })); } catch (e) { console.error('bases ventasDia:', e.message); }
-    let interesadosDia = [];
-    try { interesadosDia = (await db.interesadosDelDia(dia)).map((i) => ({ tels: partes(i.telefono), asesor: i.asesor, resultado: i.resultado || '' })); } catch (e) { console.error('bases interesadosDia:', e.message); }
-    res.json({ dias, ocmDias, dia, bases, asesores, ventasDia, interesadosDia, ocm: ocm.map((o) => ({ campana: o.campana, total: o.total, archivo: o.archivo, actualizado: o.actualizado, marcados: o.marcados || '', filas: o.filas || [], cubo: o.cubo || [] })), cruce });
-  } catch (err) { res.status(500).json({ error: ERR_BASES(err) }); }
-});
-
-// ---------- 📥 Importar historial de ventas (Excel) ----------
-// No modifica nada que ya exista: solo agrega las ventas cuya OT (o cuenta + cédula) no está en la base.
-const CAMPOS_IMPORT = ['asesor', 'nombre_cliente', 'cedula', 'telefono', 'direccion', 'barrio', 'ciudad', 'plan', 'numero_ot', 'numero_cuenta', 'fecha_agenda', 'hora_agenda', 'observaciones',
-  'tipo_venta', 'servicios_vendidos', 'multiasistencia', 'multiasistencia_cual', 'tecnologia', 'estado_instalacion', 'instalacion_nota', 'aprobacion_bo', 'aprobacion_motivo', 'llamada_ocm'];
-const dig = (x) => String(x || '').replace(/\D/g, '');
-app.get('/api/panel/importar', exigirClave, async (req, res) => {
-  try { res.json({ importadas: await db.contarImportadas() }); } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/panel/importar', exigirClave, async (req, res) => {
-  try {
-    const { filas = [], simular = false } = req.body || {};
-    if (!Array.isArray(filas) || filas.length > 1000) return res.status(400).json({ error: 'Envía máximo 1000 filas por lote.' });
-    const { ots, cuentas, cedDia } = await db.llavesVentas();
-    const diaCO = (iso) => (iso ? new Date(new Date(iso).getTime() - 5 * 3600e3).toISOString().slice(0, 10) : '');
-    const nuevas = [], existentes = [];
-    for (const f of filas) {
-      const ot = dig(f.numero_ot), cta = dig(f.numero_cuenta) + '|' + dig(f.cedula);
-      // Ya existe si: misma OT · o (sin OT) misma cuenta + cédula · o el mismo cliente (cédula) ya tiene una venta ese mismo día (ej. registrada en Marce sin OT)
-      const cd = dig(f.cedula) && f.created_at ? dig(f.cedula) + '|' + diaCO(f.created_at) : '';
-      if ((ot && ots.has(ot)) || (!ot && dig(f.numero_cuenta) && cuentas.has(cta)) || (cd && cedDia.has(cd))) { existentes.push(f.numero_ot || f.numero_cuenta); continue; }
-      if (ot) ots.add(ot); else cuentas.add(cta); // tampoco se repite dentro del mismo lote
-      const row = { session_id: 'import-' + (ot || dig(f.numero_cuenta) || crypto.randomUUID()), datos: { ...(f.datos || {}), origen: 'importado_excel', importado_el: new Date().toISOString() } };
-      for (const c of CAMPOS_IMPORT) if (f[c] !== undefined && f[c] !== null && f[c] !== '') row[c] = f[c];
-      if (row.direccion) { const h = homologarDireccion(row.direccion); if (h && h.valor) { row.direccion = h.valor; row.datos.direccion_original = h.original; } }
-      if (/^\d{4}-\d{2}-\d{2}T/.test(f.created_at || '')) row.created_at = f.created_at;
-      nuevas.push(row);
-    }
-    if (simular) return res.json({ ok: true, nuevas: nuevas.length, existentes: existentes.length });
-    // Cada venta nueva queda enlazada al interesado que ya existía con el mismo celular
-    const mapa = await db.mapaInteresadosPorCelular().catch(() => new Map());
-    const aMarcar = new Set();
-    for (const row of nuevas) { const i = db.interesadoDeVenta(row, mapa); if (i) { row.interesado_id = i.id; if (i.resultado !== 'venta') aMarcar.add(i.id); } }
-    let guardadas = 0;
-    for (let i = 0; i < nuevas.length; i += 200) guardadas += await db.insertarVentasLote(nuevas.slice(i, i + 200));
-    if (aMarcar.size) await db.marcarInteresadosVenta([...aMarcar]).catch((e) => console.error('marcar venta:', e.message));
-    res.json({ ok: true, nuevas: guardadas, existentes: existentes.length, enlazadas: nuevas.filter((r) => r.interesado_id).length });
-  } catch (err) {
-    console.error('Error panel/importar:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-app.post('/api/panel/importar/enlazar', exigirClave, async (req, res) => {
-  try { res.json({ ok: true, ...(await db.enlazarVentasImportadas()) }); } catch (err) { res.status(500).json({ error: err.message }); }
-});
-app.post('/api/panel/importar/deshacer', exigirClave, async (req, res) => {
-  try { res.json({ ok: true, borradas: await db.deshacerImportacion() }); } catch (err) { res.status(500).json({ error: err.message }); }
-});
-
-// ---------- 👥 Asesores (panel) ----------
-const normNombre = (s) => norm(s).replace(/\s+/g, ' ').trim();
-app.get('/api/panel/asesores', exigirClave, async (req, res) => {
-  try {
-    const [lista, conteo] = await Promise.all([db.listarAsesores(), db.conteoPorAsesor()]);
-    const registrados = new Set(lista.map((a) => a.nombre));
-    const asesores = lista.map((a) => ({ ...a, interesados: conteo.interesados[a.nombre] || 0, ventas: conteo.ventas[a.nombre] || 0 }));
-    const nombres = new Set([...Object.keys(conteo.interesados), ...Object.keys(conteo.ventas)]);
-    const sinRegistrar = [...nombres]
-      .filter((n) => !registrados.has(n))
-      .map((n) => ({ nombre: n, interesados: conteo.interesados[n] || 0, ventas: conteo.ventas[n] || 0 }))
-      .sort((x, y) => y.interesados + y.ventas - (x.interesados + x.ventas));
-    res.json({ asesores, sinRegistrar });
-  } catch (err) {
-    console.error('Error panel/asesores:', err.message);
-    res.status(500).json({ error: /asesores/.test(err.message) ? 'Falta crear la tabla de asesores en Supabase (supabase_asesores.sql).' : err.message });
-  }
-});
-app.post('/api/panel/asesores', exigirClave, async (req, res) => {
-  try {
-    const cedula = soloDigitos(req.body?.cedula);
-    const nombre = String(req.body?.nombre || '').replace(/\s+/g, ' ').trim();
-    const { campana, activo } = req.body || {};
-    if (cedula.length < 5 || nombre.length < 3) return res.status(400).json({ error: 'Escribe la cédula y el nombre completo.' });
-    const antes = await db.buscarAsesor(cedula);
-    // Mismo nombre que otro asesor (otra cédula): no se permite, se mezclarían los registros.
-    const choca = (await db.listarAsesores()).find((a) => a.cedula !== cedula && normNombre(a.nombre) === normNombre(nombre));
-    if (choca) return res.status(400).json({ error: `Ese nombre ya lo tiene la cédula ${choca.cedula}.` });
-    const fila = await db.guardarAsesor({ cedula, nombre, campana: campana ?? antes?.campana, activo: activo ?? antes?.activo ?? true });
-    let movidos = null;
-    if (antes && antes.nombre !== nombre) movidos = await db.renombrarAsesor(antes.nombre, nombre); // su historial se va con él
-    ASESORES.delete(cedula);
-    res.json({ ok: true, asesor: fila, movidos });
-  } catch (err) {
-    console.error('Error panel/asesores POST:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-// Carga varios asesores de una vez (desde un Excel en el panel).
-app.post('/api/panel/asesores/lote', exigirClave, async (req, res) => {
-  try {
-    const filas = Array.isArray(req.body?.asesores) ? req.body.asesores.slice(0, 2000) : [];
-    const existentes = await db.listarAsesores();
-    const porCedula = new Map(existentes.map((a) => [a.cedula, a]));
-    let nuevos = 0, actualizados = 0, omitidos = 0;
-    for (const f of filas) {
-      const cedula = soloDigitos(f.cedula);
-      const nombre = String(f.nombre || '').replace(/\s+/g, ' ').trim();
-      if (cedula.length < 5 || nombre.length < 3) { omitidos += 1; continue; }
-      const antes = porCedula.get(cedula);
-      if (antes && antes.nombre === nombre && (antes.campana || '') === (f.campana || '')) { omitidos += 1; continue; }
-      await db.guardarAsesor({ cedula, nombre, campana: f.campana || antes?.campana || null, activo: antes ? antes.activo : true });
-      if (antes && antes.nombre !== nombre) await db.renombrarAsesor(antes.nombre, nombre);
-      ASESORES.delete(cedula);
-      antes ? (actualizados += 1) : (nuevos += 1);
-    }
-    res.json({ ok: true, nuevos, actualizados, omitidos });
-  } catch (err) {
-    console.error('Error panel/asesores/lote:', err.message);
-    res.status(500).json({ error: /asesores/.test(err.message) ? 'Falta crear la tabla de asesores en Supabase (supabase_asesores.sql).' : err.message });
-  }
-});
-
-app.post('/api/panel/asesores/unir', exigirClave, async (req, res) => {
-  try {
-    const { de, a } = req.body || {};
-    if (!de || !a || de === a) return res.status(400).json({ error: 'Elige el nombre a unir y el asesor destino.' });
-    const destino = (await db.listarAsesores()).find((x) => x.nombre === a);
-    if (!destino) return res.status(400).json({ error: 'El asesor destino no está registrado.' });
-    res.json({ ok: true, movidos: await db.renombrarAsesor(de, a) });
-  } catch (err) {
-    console.error('Error panel/asesores/unir:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ---------- Registro manual y edición desde el panel ----------
-const CAMPOS_INT_PANEL = ['asesor', 'nombre_cliente', 'telefono', 'direccion', 'ciudad', 'cobertura_validada', 'resultado', 'motivo_no_interes', 'observaciones'];
-// Qué cambió en una orden (antes → después), para la hoja "Cambios en órdenes"
-function diferencias(antes, despues, campos) {
-  const v = (x) => (x === undefined || x === null ? '' : String(x).trim());
-  return campos.filter((c) => despues[c] !== undefined && (!antes || c in antes) && v(antes?.[c]) !== v(despues[c])).map((c) => ({ campo: c, antes: antes?.[c] ?? null, despues: despues[c] ?? null }));
-}
-const fichaOrden = (v) => ({ ot: v?.numero_ot || '', cliente: v?.nombre_cliente || '', asesor: v?.asesor || '', fecha_agenda: v?.fecha_agenda || '' });
-const CAMPOS_VEN_PANEL = ['tecnologia', 'aliado_tecnico', 'tipo_venta', 'servicios_vendidos', 'multiasistencia', 'multiasistencia_cual', 'cedula', 'barrio', 'plan', 'numero_ot', 'numero_cuenta', 'fecha_agenda', 'hora_agenda', 'observaciones'];
-const COMPARTIDOS = ['asesor', 'nombre_cliente', 'telefono', 'direccion', 'ciudad'];
-const RESULTADOS = ['en_gestion', 'venta', 'no_venta', 'volver_llamar', 'escalado', 'ot_activa'];
-const limpiarCampos = (obj, permitidos) => {
-  const out = {};
-  for (const k of permitidos) if (obj && k in obj) out[k] = obj[k] === '' ? null : String(obj[k]).trim();
-  return out;
-};
-function validarPanel(i) {
-  if (i.direccion) {
-    const h = homologarDireccion(i.direccion);
-    if (h.ok) i.direccion = h.valor;
-  }
-  if ('telefono' in i && i.telefono) {
-    const t = validarTelefonos(i.telefono);
-    if (!t.ok) return t.mensaje || 'El celular debe tener 10 dígitos y empezar en 3. Si son varios, sepáralos con coma.';
-    i.telefono = t.valor;
-  }
-  if ('resultado' in i && i.resultado && !RESULTADOS.includes(i.resultado)) return 'Estado no válido.';
-  if ('cobertura_validada' in i && i.cobertura_validada) i.cobertura_validada = norm(i.cobertura_validada) === 'si' ? 'sí' : 'no';
-  return null;
-}
-async function crearVentaPanel(asesor, cliente, venta, fecha) {
-  const datos = { ...limpiarCampos(venta, CAMPOS_VEN_PANEL), ciudad: cliente.ciudad, fecha_venta: fecha || hoyCO() };
-  return db.guardarVenta(asesor, cliente, datos);
-}
-
-// Homologa las direcciones que ya estaban guardadas. Primero muestra cuántas cambian; con aplicar=true las corrige.
-app.post('/api/panel/homologar-direcciones', exigirClave, async (req, res) => {
-  try {
-    const aplicar = Boolean(req.body?.aplicar);
-    const filas = await db.todasLasDirecciones();
-    const cambios = [];
-    let sinHomologar = 0;
-    for (const f of filas) {
-      if (!f.direccion) continue;
-      const h = homologarDireccion(f.direccion);
-      if (!h.ok) { sinHomologar += 1; continue; }
-      if (h.valor !== f.direccion) cambios.push({ ...f, nueva: h.valor });
-    }
-    if (aplicar) for (const c of cambios) await db.actualizarDireccion(c.tabla, c.id, c.nueva, c.direccion);
-    res.json({ ok: true, aplicado: aplicar, cambian: cambios.length, sinHomologar, ejemplos: cambios.slice(0, 8).map((c) => ({ antes: c.direccion, despues: c.nueva })) });
-  } catch (err) {
-    console.error('Error homologar-direcciones:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Crea a mano un cliente (y su venta) con la fecha que se elija. Sirve para no perder lo que no se registró en Marce.
-app.post('/api/panel/registro', exigirClave, async (req, res) => {
-  try {
-    const { interesado = {}, venta = null, fecha, auditor } = req.body || {};
-    const i = limpiarCampos(interesado, CAMPOS_INT_PANEL);
-    const err = validarPanel(i);
-    if (err) return res.status(400).json({ error: err });
-    if (!i.asesor || !i.nombre_cliente || !i.telefono || !i.direccion) return res.status(400).json({ error: 'Faltan datos: asesor, cliente, celular y dirección.' });
-    const hoy = hoyCO();
-    const dia = /^\d{4}-\d{2}-\d{2}$/.test(fecha || '') ? fecha : hoy;
-    if (dia > hoy) return res.status(400).json({ error: 'La fecha no puede ser futura.' });
-    const creado = await db.crearInteresado(i.asesor, {
-      direccion: i.direccion, nombre_cliente: i.nombre_cliente, telefono: i.telefono, ciudad: i.ciudad || null,
-      cobertura: i.cobertura_validada || 'sí', registro_manual: auditor || 'panel',
-    });
-    const extra = { resultado: i.resultado || 'en_gestion', motivo_no_interes: i.motivo_no_interes || null, observaciones: i.observaciones || null };
-    if (dia < hoy) extra.created_at = new Date(`${dia}T12:00:00-05:00`).toISOString();
-    let cliente = await db.actualizarInteresado(creado.id, extra);
-    if (extra.resultado === 'venta') await crearVentaPanel(i.asesor, cliente, venta || {}, dia);
-    res.json({ ok: true, interesado: cliente });
-  } catch (err) {
-    console.error('Error panel/registro:', err.message);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Edita un cliente y/o su venta desde el panel.
-app.post('/api/panel/editar', exigirClave, async (req, res) => {
-  try {
-    const { interesado_id, venta_id, interesado = {}, venta = null } = req.body || {};
-    if (!interesado_id && !venta_id) return res.status(400).json({ error: 'Falta el registro a editar.' });
-    const i = limpiarCampos(interesado, CAMPOS_INT_PANEL);
-    const err = validarPanel(i);
-    if (err) return res.status(400).json({ error: err });
-    let cliente = null;
-    if (interesado_id && Object.keys(i).length) {
-      cliente = await db.actualizarInteresado(interesado_id, i);
-      await db.actualizarVentasDeInteresado(interesado_id, limpiarCampos(i, COMPARTIDOS));
-    }
-    if (venta_id) {
-      const antesV = await db.obtenerVenta(venta_id).catch(() => null);
-      req._cambio = { ...fichaOrden(antesV), cambios: diferencias(antesV, { ...limpiarCampos(i, CAMPOS_INT_PANEL), ...limpiarCampos(venta || {}, CAMPOS_VEN_PANEL) }, [...new Set([...CAMPOS_INT_PANEL, ...CAMPOS_VEN_PANEL])]) };
-    }
-    if (venta && venta_id) {
-      const v = limpiarCampos(venta, CAMPOS_VEN_PANEL);
-      if (!interesado_id) Object.assign(v, limpiarCampos(i, COMPARTIDOS));
-      if (Object.keys(v).length) await db.actualizarVenta(venta_id, v);
-    } else if (venta && interesado_id && i.resultado === 'venta') {
-      cliente = cliente || (await db.obtenerCliente(interesado_id));
-      if (!cliente.venta) await crearVentaPanel(cliente.asesor, cliente, venta, null);
-    }
-    res.json({ ok: true });
-  } catch (err) {
-    console.error('Error panel/editar:', err.message);
-    res.status(500).json({ error: /tecnologia|aliado_tecnico/.test(err.message) ? 'Falta correr supabase_tecnologia.sql en Supabase.' : err.message });
-  }
-});
-
-// Eliminar registros mal subidos. Solo desde el panel (con la clave).
-app.post('/api/panel/eliminar', exigirClave, async (req, res) => {
-  try {
-    const { tipo, id, auditor } = req.body || {};
-    if (!id || !['venta', 'interesado'].includes(tipo)) return res.status(400).json({ error: 'Falta id o el tipo no es válido.' });
-    console.log(`Panel: ${auditor || 'alguien'} eliminó ${tipo} ${id}`);
-    if (tipo === 'venta') { const v = await db.obtenerVenta(id).catch(() => null); req._cambio = { ...fichaOrden(v), cambios: [{ campo: 'eliminada', antes: 'venta', despues: 'eliminada' }] }; }
-    res.json(tipo === 'venta' ? await db.eliminarVenta(id) : await db.eliminarInteresado(id));
-  } catch (err) {
-    console.error('Error panel/eliminar:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.post('/api/panel/auditar', exigirClave, async (req, res) => {
-  try {
-    const { id, resultado, nota, auditor } = req.body || {};
-    if (!id || !['confirmada', 'sin_cobertura', 'pendiente'].includes(resultado)) {
-      return res.status(400).json({ error: 'Falta id o el resultado no es válido.' });
-    }
-    res.json({ ok: true, interesado: await db.auditarCobertura(id, { resultado, nota, auditor }) });
-  } catch (err) {
-    console.error('Error panel/auditar:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// El estado de la conversación viaja con cada mensaje (lo guarda la extensión).
-// Así, aunque Render reinicie o "duerma" el servidor, no se pierde el paso
-// en el que iba el asesor.
-function serializar(sesion) {
-  const { captura, ...resto } = sesion;
-  return {
-    ...resto,
-    captura: captura ? { tipo: captura.tipo, paso: captura.paso, datos: captura.datos, campoId: captura.campoId } : null,
-  };
-}
-function hidratar(estado) {
-  if (!estado || typeof estado !== 'object') return null;
-  const sesion = { ...nuevaSesion(), ...estado };
-  if (sesion.captura) {
-    const campos = sesion.captura.tipo === 'editar'
-      ? [campoEditable(sesion.captura.campoId)].filter(Boolean)
-      : CAMPOS()[sesion.captura.tipo];
-    // Si el formulario cambió o quedó vacío (ej. "no_venta" ya no pide datos), se descarta.
-    if (!Array.isArray(campos) || !campos.length) sesion.captura = null;
-    else sesion.captura = { ...sesion.captura, campos, paso: Math.min(sesion.captura.paso || 0, campos.length - 1) };
-  }
-  if (sesion.modo === 'captura' && !sesion.captura) sesion.modo = 'libre';
-  return sesion;
-}
 
 app.post('/api/chat', async (req, res) => {
   try {
-    const { sessionId, message, estado, cedula } = req.body || {};
-    let { asesor } = req.body || {};
-    if (!sessionId || !message) return res.status(400).json({ error: 'Falta sessionId o message' });
-    // Con cédula, el nombre siempre sale de la tabla de asesores (así nunca queda escrito distinto).
-    if (cedula) {
-      const fila = await resolverAsesor(cedula);
-      if (!fila || !fila.activo) {
-        return res.json({ reply: AVISO_CEDULA[fila ? 'inactivo' : 'no_existe'], error: true, estado: estado || null, sinAcceso: true });
-      }
-      asesor = fila.nombre;
+    const { sessionId, asesor: asesorCrudo } = req.body || {};
+    const asesor = asesorCrudo ? capitalizarNombrePropio(asesorCrudo) : asesorCrudo;
+    let message = req.body && req.body.message;
+    if (!sessionId || !message) {
+      return res.status(400).json({ error: 'Falta sessionId o message' });
     }
-    const sesion = hidratar(estado) || sesiones.get(sessionId) || nuevaSesion();
-    const respuesta = await manejar(sesion, asesor, message);
-    sesiones.set(sessionId, sesion);
-    if (sesiones.size > 2000) sesiones.delete(sesiones.keys().next().value);
-    res.json({ ...respuesta, estado: serializar(sesion), asesor: asesor || undefined });
+
+    let sesion = sesiones.get(sessionId);
+    if (!sesion) {
+      sesion = nuevaSesion();
+      sesiones.set(sessionId, sesion);
+    }
+    sesion.sessionId = sessionId; // para avisarle al asesor cuando su contrato esté listo
+
+    // --- Elegir un cliente de la lista de coincidencias ---
+    const mElegir = message.trim().match(/^elegir\s+(\d+)\b/i);
+    if (mElegir) {
+      const elegido = (sesion.candidatosLista || [])[Number(mElegir[1]) - 1];
+      if (!elegido) {
+        return res.json({ reply: 'Ya no tengo esa lista a mano — dime "buscar cliente" y lo buscamos de nuevo.' });
+      }
+      if (sesion.modoContrato) {
+        const rc = seleccionarCasoParaContrato(sesion, elegido);
+        return res.json({ reply: rc.reply, opciones: rc.opciones });
+      }
+      sesion.candidatoRetomar = elegido;
+      sesion.candidatosLista = null;
+      return res.json({
+        reply: formatearResultadosBusqueda([elegido], elegido.nombre_cliente || ''),
+        opciones: ['Retomar este caso', 'Mismo cliente, otro vehículo'],
+      });
+    }
+
+    // --- Generación de contrato ---
+    {
+      const tn = normalizarTexto(message).trim();
+      if (tn === normalizarTexto('Generar contrato')) {
+        sesion.pendienteContrato = 'buscar';
+        sesion.pendienteBusqueda = false;
+        return res.json({ reply: 'Claro 📄 Dime el celular o la cédula del cliente y lo busco.' });
+      }
+      if (sesion.pendienteContrato === 'buscar') {
+        try {
+          const lista = await buscarParaContrato(message.trim());
+          if (!lista || lista.length === 0) {
+            return res.json({ reply: 'No encontré ese cliente. Revisa el número e inténtalo de nuevo (celular o cédula), o dime "tengo un cliente nuevo" para registrarlo.', opciones: OPC_INICIO });
+          }
+          const exactos = lista.filter((c) => String(c.numero_identificacion || '').trim() === message.trim());
+          const l = exactos.length ? exactos : lista;
+          if (l.length === 1) {
+            const rc = seleccionarCasoParaContrato(sesion, l[0]);
+            return res.json({ reply: rc.reply, opciones: rc.opciones });
+          }
+          sesion.modoContrato = true;
+          sesion.pendienteContrato = null;
+          sesion.candidatosLista = l.slice(0, 5);
+          return res.json({
+            reply: 'Encontré varios clientes. Toca el que necesitas:',
+            opciones: sesion.candidatosLista.map((c, i) => `Elegir ${i + 1}: ${c.nombre_cliente || 'Sin nombre'}${c.numero_identificacion ? ' · ' + c.numero_identificacion : ''}`),
+          });
+        } catch (e) {
+          console.error('Error buscando cliente para contrato:', e);
+          return res.json({ reply: `No pude consultar la base de datos (${e.message}). Intenta de nuevo.` });
+        }
+      }
+      if (/^crear contrato\b/.test(tn)) {
+        if (!sesion.casoId || !sesion.data || !sesion.data.numero_identificacion || !sesion.data.nombre_cliente) {
+          sesion.pendienteContrato = 'buscar';
+          return res.json({ reply: 'Primero dime el celular o la cédula del cliente para saber de quién es el contrato.' });
+        }
+        try {
+          const r = await crearSolicitudContrato(sesion, asesor);
+          let reply = r.yaExiste
+            ? '⏳ Ya hay una solicitud en proceso para este cliente. Toca "Ver estado del contrato" en un par de minutos.'
+            : '✅ Listo, mandé la solicitud. El sistema revisa los documentos y arma el contrato (2 a 4 minutos). Te aviso aquí mismo con el enlace cuando esté listo.';
+          const neg = sesion.negociacion;
+          if (neg && neg.sub === 'contrato_docs') {
+            neg.sub = 'escalar';
+            return res.json({ reply: `${reply}\n\nMientras tanto, sigamos: ¿cómo quedan los documentos para escalar este caso?`, opciones: OPCIONES_ESCALAR_DOCUMENTOS });
+          }
+          return res.json({ reply, opciones: ['Ver estado del contrato'] });
+        } catch (e) {
+          console.error('Error creando solicitud de contrato:', e);
+          return res.json({ reply: `⚠️ No pude enviar la solicitud (${e.message}). Avisa a soporte si se repite.` });
+        }
+      }
+      if (/^(ver )?estado (del )?contrato$/.test(tn)) {
+        if (!sesion.casoId) {
+          sesion.pendienteContrato = 'buscar';
+          return res.json({ reply: 'Dime el celular o la cédula del cliente y reviso su contrato.' });
+        }
+        try {
+          const r = await textoEstadoContrato(sesion.casoId);
+          return res.json(r.opciones ? { reply: r.reply, opciones: r.opciones } : { reply: r.reply });
+        } catch (e) {
+          return res.json({ reply: `No pude consultar el estado (${e.message}).` });
+        }
+      }
+    }
+
+    // --- Cédula/NIT o placa suelta (o "cédula del cliente 123") fuera de la
+    // captura de un caso: se busca directo, sin preguntar qué quiere hacer. ---
+    {
+      const enCaptura = /^capturando|^negociacion/.test(String(sesion.estado || ''));
+      const m = message.trim();
+      let terminoDirecto = null;
+      if (!enCaptura) {
+        if (/^\d{6,12}$/.test(m) || /^[a-z]{3}[-\s]?\d{2}[a-z0-9]$/i.test(m)) terminoDirecto = m;
+        else {
+          const mc = m.match(/(?:c[eé]dula|\bcc\b|\bnit\b|placa)\D{0,20}?([a-z0-9]{5,12})\s*$/i);
+          if (mc && /\d/.test(mc[1])) terminoDirecto = mc[1];
+        }
+      }
+      if (terminoDirecto) {
+        try {
+          const resultados = await buscarCasoPorTermino(terminoDirecto);
+          if (resultados.length === 0) {
+            return res.json({ reply: `No encontré ningún caso con "${terminoDirecto}". Si es un cliente nuevo, dime "tengo un cliente nuevo".`, opciones: ['Tengo un cliente nuevo', 'Buscar cliente'] });
+          }
+          const r = resolverBusqueda(sesion, terminoDirecto, resultados);
+          return res.json(r.opciones ? { reply: r.reply, opciones: r.opciones } : { reply: r.reply });
+        } catch (dbError) {
+          return res.json({ reply: `No pude consultar la base de datos (${dbError.message}). Intenta de nuevo.` });
+        }
+      }
+    }
+
+    // --- Retomar un caso ya existente (botón que aparece cuando una
+    // búsqueda encuentra exactamente un cliente): en vez de seguir pidiendo
+    // datos para un caso nuevo (que duplicaría al cliente), cargamos lo que
+    // el caso ya tiene y seguimos preguntando solo lo que falta.
+    if (/^retomar este caso$/i.test(message.trim())) {
+      const casoARetomar = sesion.candidatoRetomar;
+      if (!casoARetomar) {
+        return res.json({
+          reply: 'Ya no tengo a mano ese caso para retomarlo — dime "buscar cliente" y lo buscamos de nuevo.',
+        });
+      }
+      sesion.estado = 'capturando_caso';
+      sesion.tipo = null;
+      sesion.casoId = casoARetomar.id;
+      sesion.data = datosDeCasoExistente(casoARetomar);
+      sesion.stepIndex = siguienteIndicePendiente(CAMPOS.caso_nuevo, sesion.data);
+      sesion.avisoDuplicadoMostrado = true;
+      sesion.pendienteCierre = false;
+      sesion.pendienteBusqueda = false;
+      sesion.candidatoRetomar = null;
+      const nombreRetomado = casoARetomar.nombre_cliente || 'este cliente';
+      if (sesion.stepIndex < CAMPOS.caso_nuevo.length) {
+        const siguienteRetomado = CAMPOS.caso_nuevo[sesion.stepIndex];
+        return res.json(
+          conOpciones(
+            { reply: `✅ Retomamos el caso de ${nombreRetomado}. Sigamos completando lo que falta.\n\n${siguienteRetomado.prompt}` },
+            siguienteRetomado
+          )
+        );
+      }
+      sesion.estado = 'caso_abierto';
+      return res.json({
+        reply: `El caso de ${nombreRetomado} ya tiene todos los datos completos (estado del pipeline: ${casoARetomar.estado_pipeline || 'sin definir'}). Pregúntame cualquier duda, o cuéntame cuando se radique o no aplique.`,
+      });
+    }
+
+    // --- Mismo cliente, pero un vehículo (caso) distinto: se reutilizan sus
+    // datos de contacto/identidad, pero se crea un caso NUEVO y aparte (no se
+    // toca el caso ya existente), porque cada vehículo se gestiona con su
+    // propio pipeline/negociación.
+    if (/^mismo cliente,? otro veh[ií]culo$/i.test(message.trim())) {
+      const casoBase = sesion.candidatoRetomar;
+      if (!casoBase) {
+        return res.json({
+          reply: 'Ya no tengo a mano ese cliente — dime "buscar cliente" y lo buscamos de nuevo.',
+        });
+      }
+      sesion.estado = 'capturando_caso';
+      sesion.tipo = null;
+      sesion.casoId = null;
+      sesion.data = datosClienteExistente(casoBase);
+      sesion.otroVehiculo = true; // el único caso en que se permite repetir cédula/teléfono
+      sesion.avisoDuplicadoMostrado = true;
+      sesion.pendienteCierre = false;
+      sesion.pendienteBusqueda = false;
+      sesion.candidatoRetomar = null;
+      const nombreCliente = casoBase.nombre_cliente || 'este cliente';
+
+      let avisoGuardadoVehiculo = '';
+      try {
+        const registro = await crearCaso(sessionId, asesor, { ...sesion.data, estado_pipeline: 'Contacto' });
+        sesion.casoId = registro.id;
+        avisoGuardadoVehiculo = '✅ Ya quedó creado el caso nuevo para este vehículo (estado: Contacto), así que no se pierde aunque no completemos todo de una vez.\n\n';
+      } catch (dbError) {
+        console.error('Error creando el caso del segundo vehículo en Supabase:', dbError);
+        avisoGuardadoVehiculo = `⚠️ No pude guardar el caso en la base de datos en este momento (${dbError.message}). Sigamos igual, pero avisa a soporte si esto se repite.\n\n`;
+      }
+
+      sesion.stepIndex = siguienteIndicePendiente(CAMPOS.caso_nuevo, sesion.data);
+      if (sesion.stepIndex < CAMPOS.caso_nuevo.length) {
+        const siguienteCampo = CAMPOS.caso_nuevo[sesion.stepIndex];
+        return res.json(
+          conOpciones(
+            {
+              reply: `${avisoGuardadoVehiculo}✅ Perfecto, abrimos un caso aparte para el vehículo nuevo de ${nombreCliente}. Ya tengo sus datos de contacto, así que sigamos solo con la información de este vehículo.\n\n${siguienteCampo.prompt}`,
+            },
+            siguienteCampo
+          )
+        );
+      }
+      sesion.estado = 'caso_abierto';
+      return res.json({ reply: `${avisoGuardadoVehiculo}Listo, el caso del vehículo nuevo de ${nombreCliente} ya quedó completo.` });
+    }
+
+    // --- Detección dinámica: si el mensaje libre suena a un cambio de
+    // estado ("tengo un cliente nuevo", "ya se radicó", etc.), lo tratamos
+    // como si hubiera pulsado el botón correspondiente.
+    const mensajeOriginal = message;
+    const intencionDetectada = detectarIntencion(message, sesion);
+    if (intencionDetectada) {
+      message = intencionDetectada;
+      req.body.message = intencionDetectada;
+    }
+
+    // --- Escalamiento a jurídico: disponible casi en cualquier momento ---
+    if (message === '__escalar_juridico__') {
+      sesion.pendienteEscalamiento = {
+        stepIndex: 0,
+        data: {},
+        anterior: {
+          estado: sesion.estado,
+          tipo: sesion.tipo,
+          stepIndex: sesion.stepIndex,
+          data: sesion.data,
+        },
+      };
+      const primerCampo = CAMPOS.escalamiento_juridico[0];
+      return res.json(conOpciones({ reply: primerCampo.prompt }, primerCampo));
+    }
+
+    // --- Si hay un escalamiento en curso, todo mensaje libre va ahí ---
+    if (sesion.pendienteEscalamiento) {
+      const esc = sesion.pendienteEscalamiento;
+      const campos = CAMPOS.escalamiento_juridico;
+      const campo = campos[esc.stepIndex];
+
+      const esDuda = pareceDuda(message);
+      if (esDuda) {
+        const conocimiento = await obtenerConocimientoTexto(message);
+        const respuesta = await responderAyuda(
+          SOP_TEXT,
+          OBJECIONES_TEXT,
+          message,
+          {
+            estado: 'escalamiento_juridico',
+            campoActual: campo.prompt,
+            datosCapturados: esc.data,
+          },
+          conocimiento
+        );
+        return res.json(conOpciones({ reply: `${respuesta}\n\n➡️ ${campo.prompt}` }, campo));
+      }
+
+      const resultadoCampo = validarYNormalizarCampo(campo, message);
+      if (!resultadoCampo.ok) {
+        return res.json(conOpciones({ reply: `⚠️ ${campo.errorMessage}\n\n${campo.prompt}` }, campo));
+      }
+
+      esc.data[campo.id] = resultadoCampo.valor;
+      esc.stepIndex += 1;
+
+      if (esc.stepIndex < campos.length) {
+        const siguiente = campos[esc.stepIndex];
+        return res.json(conOpciones({ reply: `✅ Anotado.\n\n${siguiente.prompt}` }, siguiente));
+      }
+
+      // Escalamiento completo: guardar y volver a donde estaba el asesor.
+      try {
+        await guardarEscalamientoJuridico(sessionId, asesor, sesion.casoId, esc.data);
+      } catch (dbError) {
+        console.error('Error guardando escalamiento:', dbError);
+        return res.json({
+          reply: `Se registraron los datos, pero hubo un error guardando el escalamiento: ${dbError.message}. Avisa a soporte técnico.`,
+        });
+      }
+
+      const anterior = esc.anterior;
+      sesion.estado = anterior.estado;
+      sesion.tipo = anterior.tipo;
+      sesion.stepIndex = anterior.stepIndex;
+      sesion.data = anterior.data;
+      sesion.pendienteEscalamiento = null;
+
+      let mensajeRetomar = '✅ ¡Listo, quedó escalado a jurídico! Ya alguien del área correspondiente lo va a revisar. ';
+      const campoPendiente = campoActualDe(sesion);
+      if (campoPendiente) {
+        mensajeRetomar += `Sigamos donde íbamos:\n\n${campoPendiente}`;
+      } else if (sesion.estado === 'caso_abierto') {
+        mensajeRetomar += 'Seguimos con el caso — cuéntame si hay otra duda o dime el resultado cuando lo sepas.';
+      } else {
+        mensajeRetomar += MENSAJE_INICIAL;
+      }
+      return res.json({ reply: mensajeRetomar });
+    }
+
+    // --- Cambiar el estado del pipeline comercial de un caso (Interesado,
+    // Contacto, Cliente, Cierre perdido, En proceso UPME, En proceso DIAN,
+    // Pendiente desembolso, Desembolso realizado) ---
+    if (message === '__cambiar_estado__') {
+      const cambio = detectarCambioEstado(mensajeOriginal);
+      // No debería pasar (ya se validó en detectarIntencion), pero por si
+      // acaso el mensaje cambió de forma entre medio.
+      if (!cambio) {
+        return res.json({
+          reply: 'No logré identificar a qué estado quieres cambiarlo. Dime algo como "cambia el estado del cliente [nombre] a cliente".',
+        });
+      }
+
+      let casoObjetivo = null;
+
+      if (cambio.nombre) {
+        try {
+          const coincidencias = await buscarCasoPorTermino(cambio.nombre);
+          if (coincidencias.length === 0) {
+            return res.json({
+              reply: `No encontré ningún caso registrado que coincida con "${cambio.nombre}", así que no pude cambiarle el estado. Revisa que el nombre esté bien escrito, o dime "tengo un cliente nuevo" si todavía no está registrado.`,
+            });
+          }
+          if (coincidencias.length > 1) {
+            return res.json({
+              reply: `${formatearResultadosBusqueda(coincidencias, cambio.nombre)}\n\nHay más de un caso que coincide con "${cambio.nombre}" — dime la cédula/NIT o la placa exacta para saber cuál actualizar.`,
+            });
+          }
+          casoObjetivo = coincidencias[0];
+        } catch (dbError) {
+          console.error('Error buscando cliente para cambiar estado:', dbError);
+          return res.json({
+            reply: `No pude consultar la base de datos en este momento (${dbError.message}). Intenta de nuevo en un momento.`,
+          });
+        }
+      } else if (sesion.casoId) {
+        casoObjetivo = { id: sesion.casoId, nombre_cliente: sesion.data?.nombre_cliente };
+      } else {
+        return res.json({
+          reply: 'Dime de qué cliente quieres cambiar el estado (ej. "cambia el estado del cliente Juan Pérez a cliente").',
+        });
+      }
+
+      try {
+        await actualizarCaso(casoObjetivo.id, { estado_pipeline: cambio.estadoLabel });
+        if (cambio.estadoLabel === 'Cliente') moverCarpetaSiCliente(casoObjetivo.id);
+      } catch (dbError) {
+        console.error('Error actualizando el estado del pipeline:', dbError);
+        return res.json({
+          reply: `No pude guardar el cambio de estado en este momento (${dbError.message}). Intenta de nuevo en un momento.`,
+        });
+      }
+
+      let reply = `✅ Listo, actualicé el estado de ${casoObjetivo.nombre_cliente || 'ese caso'} a "${cambio.estadoLabel}".`;
+      const campoPendienteCambio = campoActualDe(sesion);
+      if (campoPendienteCambio) {
+        reply += `\n\n➡️ Sigamos donde íbamos: ${campoPendienteCambio}`;
+      }
+      return res.json({ reply });
+    }
+
+    // --- Buscar si un cliente ya fue atendido antes / consultar el estado
+    // de su caso (evitar duplicar, o simplemente responder "cómo va") ---
+    if (message === '__buscar_cliente__') {
+      // Si el asesor ya escribió el nombre en el mismo mensaje (ej.
+      // "estado del caso del cliente michael barco"), buscamos de una vez en
+      // vez de preguntarle otra vez un dato que ya dio.
+      const terminoInline = extraerTerminoBusqueda(mensajeOriginal);
+      if (terminoInline) {
+        let reply;
+        let opcionesBusqueda;
+        try {
+          const resultados = await buscarCasoPorTermino(terminoInline);
+          const r = resolverBusqueda(sesion, terminoInline, resultados);
+          reply = r.reply;
+          opcionesBusqueda = r.opciones;
+        } catch (dbError) {
+          console.error('Error buscando cliente en Supabase:', dbError);
+          reply = `No pude consultar la base de datos en este momento (${dbError.message}). Intenta de nuevo en un momento.`;
+        }
+        const campoPendienteInline = campoActualDe(sesion);
+        if (campoPendienteInline) {
+          reply += `\n\n➡️ Sigamos donde íbamos: ${campoPendienteInline}`;
+        }
+        return res.json(opcionesBusqueda ? { reply, opciones: opcionesBusqueda } : { reply });
+      }
+      sesion.pendienteBusqueda = true;
+      return res.json({
+        reply:
+          'Claro, dime el nombre completo, la cédula/NIT o la placa del cliente y reviso si ya tiene un caso registrado.',
+      });
+    }
+
+    if (sesion.pendienteBusqueda) {
+      sesion.pendienteBusqueda = false;
+      const termino = message.trim();
+      let reply;
+      let opcionesBusqueda;
+      try {
+        const resultados = await buscarCasoPorTermino(termino);
+        const r = resolverBusqueda(sesion, termino, resultados);
+        reply = r.reply;
+        opcionesBusqueda = r.opciones;
+      } catch (dbError) {
+        console.error('Error buscando cliente en Supabase:', dbError);
+        reply = `No pude consultar la base de datos en este momento (${dbError.message}). Intenta de nuevo en un momento.`;
+      }
+      const campoPendiente = campoActualDe(sesion);
+      if (campoPendiente) {
+        reply += `\n\n➡️ Sigamos donde íbamos: ${campoPendiente}`;
+      }
+      return res.json(opcionesBusqueda ? { reply, opciones: opcionesBusqueda } : { reply });
+    }
+
+    // --- Mensajes especiales ---
+
+    if (message === '__inicio__') {
+      const saludo = asesor ? `¡Hola, ${asesor}! ` : '¡Hola! ';
+      return res.json({
+        reply: `${saludo}${MENSAJE_INICIAL}`,
+        opciones: OPC_INICIO,
+      });
+    }
+
+    if (message === '__nuevo_caso__') {
+      sesion.estado = 'capturando_caso';
+      sesion.tipo = null;
+      sesion.stepIndex = 0;
+      sesion.data = {};
+      sesion.casoId = null;
+      sesion.otroVehiculo = false;
+      sesion.casoCreadoEnSesion = null;
+      sesion.avisoDuplicadoMostrado = false;
+      sesion.pendienteCierre = false;
+      const primerCampo = CAMPOS.caso_nuevo[0];
+      return res.json(conOpciones({ reply: primerCampo.prompt }, primerCampo));
+    }
+
+    if (message === '__radicado__' || message === '__no_aplica__') {
+      if (sesion.estado !== 'caso_abierto') {
+        return res.json({
+          reply:
+            'Antes de contarme el resultado, cuéntame que tienes un caso (dime algo como "tengo un cliente nuevo") para arrancar.',
+        });
+      }
+      sesion.estado = 'capturando_resultado';
+      sesion.tipo = message === '__radicado__' ? 'radicado' : 'no_aplica';
+      sesion.stepIndex = 0;
+      sesion.data = {};
+      const primerCampo = CAMPOS[sesion.tipo][0];
+      return res.json(conOpciones({ reply: primerCampo.prompt }, primerCampo));
+    }
+
+    // --- Captura de datos del caso nuevo ---
+    if (sesion.estado === 'capturando_caso') {
+      const campos = CAMPOS.caso_nuevo;
+      const campo = campos[sesion.stepIndex];
+
+      // El asesor está respondiendo a "¿quieres cerrar la interacción con
+      // este cliente?" (esto solo se pregunta cuando "¿lograste el
+      // contacto?" fue "No"). Se maneja aparte del flujo normal de campos
+      // porque no es una pregunta de CAMPOS.caso_nuevo.
+      // El asesor está respondiendo "¿Cuál es el nombre o razón social de la
+      // empresa?" (esto solo se pregunta cuando el tipo de documento fue
+      // NIT). Se maneja aparte del flujo normal de campos porque no es una
+      // pregunta de CAMPOS.caso_nuevo: es un dato obligatorio derivado de
+      // haber elegido NIT, no un campo saltable.
+      if (sesion.pendienteNombreEmpresa) {
+        const nombreEmpresaCrudo = message.trim();
+        if (
+          !nombreEmpresaCrudo ||
+          nombreEmpresaCrudo.length < 2 ||
+          normalizarTexto(nombreEmpresaCrudo).trim() === normalizarTexto(ETIQUETA_SALTAR).trim()
+        ) {
+          return res.json({
+            reply:
+              '⚠️ Escribe el nombre o razón social de la empresa (mínimo 2 caracteres) — este dato es obligatorio porque el cliente es persona jurídica (NIT).\n\n¿Cuál es el nombre o razón social de la empresa?',
+          });
+        }
+        const nombreEmpresa = capitalizarNombrePropio(nombreEmpresaCrudo);
+        sesion.data.nombre_empresa = nombreEmpresa;
+        sesion.data.cuenta = nombreEmpresa;
+        sesion.pendienteNombreEmpresa = false;
+
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { nombre_empresa: nombreEmpresa, cuenta: nombreEmpresa });
+          } catch (dbError) {
+            console.error('Error guardando el nombre de la empresa en Supabase:', dbError);
+          }
+        }
+
+        sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
+        if (sesion.stepIndex < campos.length) {
+          const siguienteTrasEmpresa = campos[sesion.stepIndex];
+          return res.json(
+            conOpciones({ reply: `✅ Anotado.\n\n${siguienteTrasEmpresa.prompt}` }, siguienteTrasEmpresa)
+          );
+        }
+        // Caso raro: la empresa era el último dato que faltaba. Guardamos el
+        // caso si aún no existía y arrancamos la confirmación de datos, igual
+        // que al terminar el flujo normal de captura.
+        if (!sesion.casoId) {
+          try {
+            const registro = await crearCaso(sessionId, asesor, sesion.data);
+            sesion.casoId = registro.id;
+          } catch (dbError) {
+            console.error('Error guardando el caso en Supabase:', dbError);
+            return res.json({
+              reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+                campos,
+                sesion.data
+              )}`,
+            });
+          }
+        }
+        // El caso ya tiene todos sus datos: el sistema lo categoriza solo
+        // como "Interesado" (antes se quedaba pegado en "Contacto").
+        try {
+          await actualizarCaso(sesion.casoId, { estado_pipeline: 'Interesado' });
+        } catch (dbError) {
+          console.error('Error actualizando estado_pipeline a Interesado:', dbError);
+        }
+        sesion.estado = 'negociacion';
+        sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
+        return res.json({
+          reply: `✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar alguno?`,
+          opciones: ['Están correctos', 'Modificar un dato'],
+        });
+      }
+
+      // El asesor está respondiendo cuál es la línea/referencia exacta del
+      // vehículo, porque lo que escribió antes coincidía igual contra varias
+      // líneas distintas de la base (ver arriba). Se maneja aparte del flujo
+      // normal porque no es una pregunta de CAMPOS.caso_nuevo.
+      if (sesion.pendienteDesambiguarVehiculo) {
+        const { candidatos } = sesion.pendienteDesambiguarVehiculo;
+        const preguntaDesambiguar = construirPreguntaDesambiguarVehiculo(candidatos, asesor);
+
+        // Si en vez de responder cuál línea es, el asesor aprovecha para
+        // preguntar cualquier otra duda del proceso, se la resolvemos igual
+        // que en cualquier otro punto del flujo y luego retomamos la
+        // pregunta pendiente — no lo dejamos "atascado" teniendo que elegir
+        // una línea antes de poder preguntar algo.
+        if (pareceDuda(message)) {
+          const conocimiento = await obtenerConocimientoTexto(message);
+          const respuestaDuda = await responderAyuda(
+            SOP_TEXT,
+            OBJECIONES_TEXT,
+            message,
+            {
+              estado: sesion.estado,
+              campoActual: preguntaDesambiguar,
+              datosCapturados: sesion.data,
+            },
+            conocimiento
+          );
+          return res.json({
+            reply: `${respuestaDuda}\n\n➡️ ${preguntaDesambiguar}`,
+            opciones: opcionesDesambiguarVehiculo(candidatos),
+          });
+        }
+
+        const respuesta = (message || '').trim();
+
+        // Ninguna de las líneas listadas es la correcta — el asesor prefiere
+        // escribir la referencia completa de una vez, en vez de saltar
+        // directo a preguntar la tecnología a mano. Con ese texto nuevo se
+        // vuelve a intentar la búsqueda (puede salir un match único, puede
+        // volver a quedar ambiguo con otras líneas, o puede no encontrarse).
+        if (normalizarTexto(respuesta).trim() === normalizarTexto(ETIQUETA_OTRO_VEHICULO).trim()) {
+          sesion.pendienteDesambiguarVehiculo = null;
+          sesion.pendienteReferenciaVehiculo = true;
+          return res.json({
+            reply: 'Sin problema — escríbeme la referencia completa del vehículo (marca, línea y versión), tal como aparece en la factura o en la tarjeta de propiedad.',
+          });
+        }
+
+        // El asesor no sabe cuál es la referencia/línea exacta — no lo
+        // dejamos bloqueado por eso. Seguimos igual que cuando el vehículo no
+        // se encuentra en la base: se pregunta la tecnología a mano y el
+        // vehículo queda registrado como "no listado" para revisión.
+        if (normalizarTexto(respuesta).trim() === normalizarTexto(ETIQUETA_SALTAR).trim()) {
+          sesion.vehiculoSinListar = sesion.pendienteDesambiguarVehiculo.textoOriginal;
+          sesion.pendienteDesambiguarVehiculo = null;
+          sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
+          if (sesion.stepIndex < campos.length) {
+            const siguienteTrasSaltar = campos[sesion.stepIndex];
+            return res.json(
+              conOpciones(
+                {
+                  reply: `De acuerdo, no hay problema — entonces cuéntame la tecnología a mano.\n\n${siguienteTrasSaltar.prompt}`,
+                },
+                siguienteTrasSaltar
+              )
+            );
+          }
+          // Caso raro: el vehículo era el último dato que faltaba.
+          if (!sesion.casoId) {
+            try {
+              const registro = await crearCaso(sessionId, asesor, sesion.data);
+              sesion.casoId = registro.id;
+            } catch (dbError) {
+              console.error('Error guardando el caso en Supabase:', dbError);
+              return res.json({
+                reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+                  campos,
+                  sesion.data
+                )}`,
+              });
+            }
+          }
+          try {
+            await actualizarCaso(sesion.casoId, { estado_pipeline: 'Interesado' });
+          } catch (dbError) {
+            console.error('Error actualizando estado_pipeline a Interesado:', dbError);
+          }
+          sesion.estado = 'negociacion';
+          sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
+          return res.json({
+            reply: `✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar alguno?`,
+            opciones: ['Están correctos', 'Modificar un dato'],
+          });
+        }
+
+        let elegido = null;
+
+        const numero = parseInt(respuesta, 10);
+        if (!isNaN(numero) && numero >= 1 && numero <= candidatos.length) {
+          elegido = candidatos[numero - 1];
+        } else {
+          const respuestaNorm = normalizarParaComparar(respuesta);
+          if (respuestaNorm) {
+            elegido =
+              candidatos.find((c) => normalizarParaComparar(c.modelo).includes(respuestaNorm)) ||
+              candidatos.find((c) => respuestaNorm.includes(normalizarParaComparar(c.modelo)));
+          }
+        }
+
+        if (!elegido) {
+          return res.json({
+            reply: `⚠️ No logré identificar cuál de estas líneas es.\n\n${preguntaDesambiguar}`,
+            opciones: opcionesDesambiguarVehiculo(candidatos),
+          });
+        }
+
+        sesion.data.tecnologia = elegido.tecnologia;
+        sesion.data.vehiculo = `${elegido.marca} ${elegido.modelo}`;
+        sesion.pendienteDesambiguarVehiculo = null;
+
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { vehiculo: sesion.data.vehiculo, tecnologia: sesion.data.tecnologia });
+          } catch (dbError) {
+            console.error('Error guardando la línea exacta del vehículo:', dbError);
+          }
+        }
+
+        sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
+        if (sesion.stepIndex < campos.length) {
+          const siguienteTrasVehiculo = campos[sesion.stepIndex];
+          return res.json(
+            conOpciones(
+              {
+                reply: `✅ Anotado como "${sesion.data.vehiculo}" (tecnología: ${elegido.tecnologia}).\n\n${siguienteTrasVehiculo.prompt}`,
+              },
+              siguienteTrasVehiculo
+            )
+          );
+        }
+        // Caso raro: el vehículo era el último dato que faltaba.
+        if (!sesion.casoId) {
+          try {
+            const registro = await crearCaso(sessionId, asesor, sesion.data);
+            sesion.casoId = registro.id;
+          } catch (dbError) {
+            console.error('Error guardando el caso en Supabase:', dbError);
+            return res.json({
+              reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+                campos,
+                sesion.data
+              )}`,
+            });
+          }
+        }
+        try {
+          await actualizarCaso(sesion.casoId, { estado_pipeline: 'Interesado' });
+        } catch (dbError) {
+          console.error('Error actualizando estado_pipeline a Interesado:', dbError);
+        }
+        sesion.estado = 'negociacion';
+        sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
+        return res.json({
+          reply: `✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar alguno?`,
+          opciones: ['Están correctos', 'Modificar un dato'],
+        });
+      }
+
+      // El asesor está escribiendo la referencia completa del vehículo,
+      // porque en la desambiguación anterior le dio clic a "Otro". Se maneja
+      // aparte del flujo normal porque no es una pregunta de CAMPOS.caso_nuevo:
+      // con este texto nuevo se vuelve a intentar la búsqueda en la base de
+      // referencia, igual que la primera vez que se captura el vehículo.
+      if (sesion.pendienteReferenciaVehiculo) {
+        if (pareceDuda(message)) {
+          const conocimiento = await obtenerConocimientoTexto(message);
+          const respuestaDuda = await responderAyuda(
+            SOP_TEXT,
+            OBJECIONES_TEXT,
+            message,
+            {
+              estado: sesion.estado,
+              campoActual: 'Escribe la referencia completa del vehículo',
+              datosCapturados: sesion.data,
+            },
+            conocimiento
+          );
+          return res.json({
+            reply: `${respuestaDuda}\n\n➡️ Escríbeme la referencia completa del vehículo (marca, línea y versión).`,
+          });
+        }
+
+        const textoReferencia = (message || '').trim();
+        if (textoReferencia.length < 3) {
+          return res.json({
+            reply: '⚠️ Escribe la referencia completa del vehículo (marca, línea y versión).',
+          });
+        }
+
+        sesion.pendienteReferenciaVehiculo = false;
+        let avisoReferencia = '';
+        try {
+          const referencia = await obtenerVehiculosReferenciaCacheada();
+          const candidatos = buscarVehiculosEnReferencia(textoReferencia, referencia);
+          if (candidatos.length === 1) {
+            const encontrado = candidatos[0];
+            sesion.data.tecnologia = encontrado.tecnologia;
+            sesion.data.vehiculo = `${encontrado.marca} ${encontrado.modelo}`;
+            avisoReferencia = `✅ Listo, encontré "${sesion.data.vehiculo}" en la base (tecnología: ${encontrado.tecnologia}), no hace falta preguntarla.\n\n`;
+          } else if (candidatos.length > 1) {
+            sesion.pendienteDesambiguarVehiculo = { candidatos, textoOriginal: textoReferencia };
+            const preguntaOtraVez = construirPreguntaDesambiguarVehiculo(candidatos, asesor);
+            return res.json({
+              reply: preguntaOtraVez,
+              opciones: opcionesDesambiguarVehiculo(candidatos),
+            });
+          } else {
+            sesion.vehiculoSinListar = textoReferencia;
+            sesion.data.vehiculo = textoReferencia;
+          }
+        } catch (err) {
+          console.error('Error consultando la base de referencia de vehículos:', err);
+          sesion.data.vehiculo = textoReferencia;
+        }
+
+        if (sesion.casoId) {
+          try {
+            const cambios = { vehiculo: sesion.data.vehiculo };
+            if (sesion.data.tecnologia) cambios.tecnologia = sesion.data.tecnologia;
+            await actualizarCaso(sesion.casoId, cambios);
+          } catch (dbError) {
+            console.error('Error guardando la referencia del vehículo:', dbError);
+          }
+        }
+
+        sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
+        if (sesion.stepIndex < campos.length) {
+          const siguienteTrasReferencia = campos[sesion.stepIndex];
+          return res.json(
+            conOpciones(
+              { reply: `${avisoReferencia}✅ Anotado.\n\n${siguienteTrasReferencia.prompt}` },
+              siguienteTrasReferencia
+            )
+          );
+        }
+        // Caso raro: el vehículo era el último dato que faltaba.
+        if (!sesion.casoId) {
+          try {
+            const registro = await crearCaso(sessionId, asesor, sesion.data);
+            sesion.casoId = registro.id;
+          } catch (dbError) {
+            console.error('Error guardando el caso en Supabase:', dbError);
+            return res.json({
+              reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+                campos,
+                sesion.data
+              )}`,
+            });
+          }
+        }
+        try {
+          await actualizarCaso(sesion.casoId, { estado_pipeline: 'Interesado' });
+        } catch (dbError) {
+          console.error('Error actualizando estado_pipeline a Interesado:', dbError);
+        }
+        sesion.estado = 'negociacion';
+        sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
+        return res.json({
+          reply: `${avisoReferencia}✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar alguno?`,
+          opciones: ['Están correctos', 'Modificar un dato'],
+        });
+      }
+
+      if (sesion.pendienteCierre) {
+        const respuestaCierre = interpretarSiNo(message);
+        if (!respuestaCierre) {
+          return res.json({
+            reply: '¿Quieres cerrar la interacción con este cliente?',
+            opciones: ['Sí', 'No'],
+          });
+        }
+        if (respuestaCierre === 'sí') {
+          const nombreCerrado = sesion.data.nombre_cliente || 'el cliente';
+          Object.assign(sesion, nuevaSesion());
+          return res.json({
+            reply: `✅ Listo, dejamos cerrada la interacción con ${nombreCerrado} — ya quedó guardado en la base de datos con estado "Contacto". Cuéntame cuando tengas otro cliente (dime "tengo un cliente nuevo") y arrancamos.`,
+          });
+        }
+        // Sigue con las preguntas normales, desde donde iba.
+        sesion.pendienteCierre = false;
+        const siguienteCampo = campos[sesion.stepIndex];
+        return res.json(conOpciones({ reply: `Listo, seguimos.\n\n${siguienteCampo.prompt}` }, siguienteCampo));
+      }
+
+      const esDuda = pareceDuda(message);
+      if (esDuda) {
+        const conocimiento = await obtenerConocimientoTexto(message);
+        const respuesta = await responderAyuda(
+          SOP_TEXT,
+          OBJECIONES_TEXT,
+          message,
+          {
+            estado: sesion.estado,
+            campoActual: campo.prompt,
+            datosCapturados: sesion.data,
+          },
+          conocimiento
+        );
+        return res.json(conOpciones({ reply: `${respuesta}\n\n➡️ ${campo.prompt}` }, campo));
+      }
+
+      const resultadoCampo = validarYNormalizarCampo(campo, message);
+      if (!resultadoCampo.ok) {
+        return res.json(conOpciones({ reply: `⚠️ ${campo.errorMessage}\n\n${campo.prompt}` }, campo));
+      }
+
+      // BLOQUEO DE DUPLICADOS: si el teléfono o la cédula/NIT ya existen en otro caso,
+      // no se sigue creando un cliente nuevo; se ofrece retomar el existente.
+      if (['telefono', 'numero_identificacion'].includes(campo.id) && resultadoCampo.valor && !sesion.otroVehiculo) {
+        let dup = { casos: [], campo: null };
+        try {
+          dup = await buscarDuplicados({ [campo.id]: resultadoCampo.valor, excluirId: sesion.casoId });
+        } catch (dupError) {
+          console.error('Error verificando duplicados (bloqueo):', dupError);
+        }
+        if (dup.casos.length) {
+          // Si esta sesión ya había creado un caso vacío (al responder "contacto logrado"), se descarta.
+          if (sesion.casoId && sesion.casoCreadoEnSesion === sesion.casoId) {
+            try { await eliminarCasoDeSesion(sesion.casoId, sessionId); } catch (e) { console.error('No se pudo descartar el caso repetido:', e.message); }
+            sesion.casoId = null;
+            sesion.casoCreadoEnSesion = null;
+          }
+          const etiqueta = campo.id === 'telefono' ? 'teléfono' : 'número de documento';
+          const r = resolverBusqueda(sesion, resultadoCampo.valor, dup.casos);
+          sesion.candidatoRetomar = dup.casos[0];
+          return res.json({
+            reply: `⛔ Ese ${etiqueta} ya está registrado, así que no puedo crear otro cliente.\n\n${r.reply}\n\nSi es el mismo trámite, retómalo. Si es otro vehículo del mismo cliente, elige "Mismo cliente, otro vehículo". Si te equivocaste al escribir el dato, envíalo de nuevo.`,
+            opciones: dup.casos.length === 1 ? ['Retomar este caso', 'Mismo cliente, otro vehículo'] : r.opciones,
+          });
+        }
+      }
+
+      // BLOQUEO "MISMO CARRO": aunque se haya elegido "Mismo cliente, otro vehículo", si ese celular ya tiene
+      // un caso con la MISMA placa, es el mismo carro: no se crea otro caso, se retoma el que ya existe.
+      if (campo.id === 'placa' && resultadoCampo.valor && sesion.data.telefono) {
+        try {
+          const placaN = (x) => String(x || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+          const mismos = await buscarDuplicados({ telefono: sesion.data.telefono, excluirId: sesion.casoId });
+          const igual = (mismos.casos || []).filter((c) => placaN(c.placa) && placaN(c.placa) === placaN(resultadoCampo.valor));
+          if (igual.length) {
+            if (sesion.casoId && sesion.casoCreadoEnSesion === sesion.casoId) {
+              try { await eliminarCasoDeSesion(sesion.casoId, sessionId); } catch (e) { console.error('No se pudo descartar el caso repetido:', e.message); }
+              sesion.casoId = null;
+              sesion.casoCreadoEnSesion = null;
+            }
+            sesion.candidatoRetomar = igual[0];
+            return res.json({
+              reply: `⛔ Ese cliente ya tiene un caso con la placa ${resultadoCampo.valor} (${igual[0].vehiculo || 'sin vehículo'}, estado: ${igual[0].estado_pipeline || 'sin definir'}). Una placa es de un solo carro: si es el mismo trámite, retómalo; si es otro carro, escribe de nuevo la placa correcta.`,
+              opciones: ['Retomar este caso'],
+            });
+          }
+        } catch (placaError) {
+          console.error('Error verificando placa repetida:', placaError);
+        }
+      }
+
+      sesion.data[campo.id] = resultadoCampo.valor;
+
+      // Al responder el tipo de documento, derivamos solos si la cuenta es
+      // "Persona natural" o "Empresa" (CC/CE/TI/Pasaporte -> Persona natural,
+      // NIT -> Empresa), y también el nombre de cuenta unificado: para
+      // persona natural es el nombre del cliente (ya lo tenemos); para
+      // empresa lo pedimos aparte (ver sesion.pendienteNombreEmpresa más
+      // abajo), porque el nombre de la empresa es un dato nuevo que el
+      // cliente-persona-natural no tiene.
+      if (campo.id === 'tipo_identificacion' && resultadoCampo.valor) {
+        const esEmpresa = resultadoCampo.valor === 'NIT';
+        sesion.data.tipo_cuenta = esEmpresa ? 'Empresa' : 'Persona natural';
+        if (!esEmpresa) {
+          sesion.data.cuenta = sesion.data.nombre_cliente || null;
+        }
+      }
+
+      // Al capturar el vehículo, lo cruzamos contra la base de referencia de
+      // vehículos que aplican. Si hay una sola línea que coincide, ya sabemos
+      // la tecnología (nos ahorramos preguntarla) y además dejamos el dato
+      // guardado con el nombre completo y correcto de la referencia (no el
+      // texto suelto que haya escrito el asesor). Si el texto es ambiguo
+      // (coincide igual contra varias líneas distintas, ej. "Toyota Corolla"
+      // sin más detalle) le pedimos al asesor que precise cuál es, en vez de
+      // adivinar. Si no coincide con nada, seguimos preguntando todo normal
+      // (la base puede no estar completa) pero lo dejamos marcado para
+      // avisar y registrar apenas se responda la tecnología.
+      let avisoVehiculo = '';
+      if (campo.id === 'vehiculo' && resultadoCampo.valor) {
+        try {
+          const referencia = await obtenerVehiculosReferenciaCacheada();
+          const candidatos = buscarVehiculosEnReferencia(resultadoCampo.valor, referencia);
+          if (candidatos.length === 1) {
+            const encontrado = candidatos[0];
+            sesion.data.tecnologia = encontrado.tecnologia;
+            sesion.data.vehiculo = `${encontrado.marca} ${encontrado.modelo}`;
+            avisoVehiculo = `✅ Ese modelo ya está en nuestra base de vehículos que aplican (tecnología: ${encontrado.tecnologia}). Lo dejamos anotado como "${sesion.data.vehiculo}" y no hace falta preguntar la tecnología.\n\n`;
+          } else if (candidatos.length > 1) {
+            sesion.pendienteDesambiguarVehiculo = { candidatos, textoOriginal: resultadoCampo.valor };
+          } else {
+            sesion.vehiculoSinListar = resultadoCampo.valor;
+          }
+        } catch (err) {
+          console.error('Error consultando la base de referencia de vehículos:', err);
+        }
+      }
+
+      // Cuando la tecnología queda capturada (a mano, porque el vehículo no
+      // estaba en la base) dejamos el aviso y registramos el vehículo como
+      // "no listado" para poder revisarlo después y, si aplica, agregarlo a
+      // la base de referencia.
+      if (campo.id === 'tecnologia' && sesion.vehiculoSinListar) {
+        avisoVehiculo =
+          `⚠️ Este vehículo todavía no está en nuestra base de referencia — confirma bien que SÍ aplica al beneficio antes de continuar. Queda registrado para revisión.\n\n`;
+        try {
+          await guardarVehiculoNoListado(sesion.casoId, sesion.vehiculoSinListar, resultadoCampo.valor, asesor);
+        } catch (err) {
+          console.error('Error guardando vehículo no listado:', err);
+        }
+        sesion.vehiculoSinListar = null;
+      }
+
+      sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
+
+      // Verificación automática de duplicados: apenas se captura el nombre,
+      // la cédula/NIT o la placa, revisamos si ya existe un caso con ese
+      // dato — así el asesor no tiene que acordarse de decir una frase
+      // especial para consultarlo, se hace solo dentro del flujo normal.
+      // Se avisa una sola vez por sesión para no repetir el aviso en cada
+      // campo si el mismo cliente coincide en varios (nombre, cédula, placa).
+      let avisoDuplicado = '';
+      if (
+        resultadoCampo.valor &&
+        !sesion.avisoDuplicadoMostrado &&
+        ['nombre_cliente', 'numero_identificacion', 'placa'].includes(campo.id)
+      ) {
+        try {
+          const coincidencias = await buscarCasoPorTermino(resultadoCampo.valor);
+          if (coincidencias.length > 0) {
+            sesion.avisoDuplicadoMostrado = true;
+            avisoDuplicado = `${formatearResultadosBusqueda(coincidencias, resultadoCampo.valor)}\n\nSi es el mismo cliente, mejor retoma ese caso en vez de crear uno nuevo (dime "buscar cliente" en cualquier momento si quieres revisarlo primero). Si de verdad es una gestión nueva, seguimos con los datos.\n\n`;
+          }
+        } catch (dbError) {
+          console.error('Error verificando duplicados:', dbError);
+          // No bloqueamos la captura si falla la verificación — seguimos igual.
+        }
+      }
+
+      // En cuanto se responde si se logró el contacto, ya creamos el caso en
+      // Supabase — así, aunque después se caiga la llamada o no se alcance a
+      // llenar todo lo demás, el cliente NO se pierde: ya quedó guardado en
+      // la base de datos. El sistema categoriza solo: si NO se logró el
+      // contacto, el caso queda como "Registro" (no como "Contacto", que es
+      // solo para cuando sí se habló con el cliente).
+      let avisoGuardado = '';
+      if (campo.id === 'contacto_logrado' && !sesion.casoId) {
+        try {
+          const estadoInicial = resultadoCampo.valor === 'No' ? 'Registro' : 'Contacto';
+          const registro = await crearCaso(sessionId, asesor, { ...sesion.data, estado_pipeline: estadoInicial });
+          sesion.casoId = registro.id;
+          avisoGuardado =
+            `✅ Ya quedó guardado en la base de datos (estado: ${estadoInicial}), así que aunque no alcancemos a completar todo, no se pierde.\n\n`;
+        } catch (dbError) {
+          console.error('Error creando el caso en Supabase (paso de contacto):', dbError);
+          avisoGuardado = `⚠️ No pude guardar el caso en la base de datos en este momento (${dbError.message}). Sigamos igual, pero avisa a soporte si esto se repite.\n\n`;
+        }
+      } else if (sesion.casoId) {
+        // El caso ya existe (se creó en el paso de "contacto_logrado"): cada
+        // dato nuevo se va guardando de una vez, en vez de esperar a que se
+        // complete todo el formulario.
+        try {
+          // Para vehículo guardamos sesion.data.vehiculo (no
+          // resultadoCampo.valor): si hubo un match único contra la base de
+          // referencia, ya quedó normalizado con el nombre completo y
+          // correcto de la línea (ver arriba); si no, es el mismo texto que
+          // escribió el asesor.
+          const cambiosIncrementales = {
+            [campo.id]: campo.id === 'vehiculo' ? sesion.data.vehiculo : resultadoCampo.valor,
+          };
+          if (campo.id === 'tipo_identificacion' && resultadoCampo.valor) {
+            cambiosIncrementales.tipo_cuenta = sesion.data.tipo_cuenta;
+            if (sesion.data.cuenta !== undefined) cambiosIncrementales.cuenta = sesion.data.cuenta;
+          }
+          // Si el vehículo se encontró en la base de referencia, la
+          // tecnología quedó autocompletada en el mismo paso (ver arriba) y
+          // ese campo se salta — así que la guardamos ya mismo, de una vez
+          // con el vehículo, para que no falte en Supabase.
+          if (campo.id === 'vehiculo' && sesion.data.tecnologia) {
+            cambiosIncrementales.tecnologia = sesion.data.tecnologia;
+          }
+          await actualizarCaso(sesion.casoId, cambiosIncrementales);
+        } catch (dbError) {
+          console.error(`Error actualizando el campo ${campo.id} en Supabase:`, dbError);
+          // No bloqueamos el flujo si falla un guardado incremental.
+        }
+      }
+
+      // Si el vehículo que escribió el asesor coincide igual contra varias
+      // líneas distintas de la base (ambiguo), no seguimos con las preguntas
+      // normales todavía: primero pedimos que confirme cuál es la
+      // referencia/línea exacta, para no adivinar y dejar un dato mal
+      // parametrizado.
+      if (sesion.pendienteDesambiguarVehiculo) {
+        const preguntaDesambiguarInicial = construirPreguntaDesambiguarVehiculo(
+          sesion.pendienteDesambiguarVehiculo.candidatos,
+          asesor
+        );
+        return res.json({
+          reply: `${avisoDuplicado}${avisoGuardado}${preguntaDesambiguarInicial}`,
+          opciones: opcionesDesambiguarVehiculo(sesion.pendienteDesambiguarVehiculo.candidatos),
+        });
+      }
+
+      // Si NO se logró el contacto, le preguntamos al asesor si de una vez
+      // quiere cerrar la interacción con este cliente (ya quedó guardado
+      // como "Contacto") o si prefiere seguir con las demás preguntas.
+      if (campo.id === 'contacto_logrado' && resultadoCampo.valor === 'No') {
+        sesion.pendienteCierre = true;
+        return res.json({
+          reply: `${avisoDuplicado}${avisoGuardado}${avisoVehiculo}¿Quieres cerrar la interacción con este cliente?`,
+          opciones: ['Sí', 'No'],
+        });
+      }
+
+      // Si el tipo de documento es NIT, el cliente es persona jurídica y
+      // necesitamos el nombre/razón social de la empresa antes de seguir
+      // (ese dato no existe todavía y es obligatorio para este tipo de
+      // cliente).
+      if (campo.id === 'tipo_identificacion' && resultadoCampo.valor === 'NIT') {
+        sesion.pendienteNombreEmpresa = true;
+        return res.json({
+          reply: `${avisoDuplicado}${avisoGuardado}${avisoVehiculo}✅ Anotado.\n\n¿Cuál es el nombre o razón social de la empresa?`,
+        });
+      }
+
+      if (sesion.stepIndex < campos.length) {
+        const siguiente = campos[sesion.stepIndex];
+        return res.json(conOpciones({ reply: `${avisoDuplicado}${avisoGuardado}${avisoVehiculo}✅ Anotado.\n\n${siguiente.prompt}` }, siguiente));
+      }
+
+      // Caso completo. Si ya se creó antes (en el paso de contacto), solo
+      // falta cerrar el estado local — los datos ya se fueron guardando
+      // incrementalmente. Si por algo no existiera todavía (no debería
+      // pasar), lo creamos aquí como respaldo.
+      if (!sesion.casoId) {
+        try {
+          const registro = await crearCaso(sessionId, asesor, sesion.data);
+          sesion.casoId = registro.id;
+        } catch (dbError) {
+          console.error('Error guardando el caso en Supabase:', dbError);
+          return res.json({
+            reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+              campos,
+              sesion.data
+            )}`,
+          });
+        }
+      }
+
+      // El caso ya tiene todos sus datos: el sistema lo categoriza solo
+      // como "Interesado" (antes se quedaba pegado en "Contacto").
+      try {
+        await actualizarCaso(sesion.casoId, { estado_pipeline: 'Interesado' });
+      } catch (dbError) {
+        console.error('Error actualizando estado_pipeline a Interesado:', dbError);
+      }
+
+      // Antes de arrancar las preguntas de negociación, le mostramos al
+      // asesor el resumen completo y le preguntamos si todo está correcto o
+      // si necesita corregir algún dato — así no toca escalar a soporte por
+      // un error de tipeo que se pudo arreglar ahí mismo.
+      sesion.estado = 'negociacion';
+      sesion.negociacion = { gateIndex: 0, sub: 'confirmar_datos' };
+      return res.json({
+        reply:
+          `${avisoDuplicado}${avisoGuardado}${avisoVehiculo}✅ Caso completo:\n\n${resumenCampos(campos, sesion.data)}\n\n` +
+          `¿Estos datos están correctos, o necesitas modificar alguno?`,
+        opciones: ['Están correctos', 'Modificar un dato'],
+      });
+    }
+
+    // --- Preguntas de negociación (estado de interés, negociación, cliente
+    // acepta todo), una detrás de otra, una vez el caso ya tiene todos sus
+    // datos. Cada una es un gate Sí/No: si es "No", pide el motivo con
+    // botones y luego pregunta si cerrar la interacción; si cierra, marca el
+    // caso como "Cierre perdido" (salvo el gate negociacion: Lo pensará etc.
+    // deja el caso en "Negociación", no perdido). Si es "Sí", sigue con la siguiente
+    // pregunta (la última, "Cliente acepta todo", en vez de eso pide el
+    // siguiente paso).
+    if (sesion.estado === 'negociacion' && sesion.negociacion) {
+      const neg = sesion.negociacion;
+      const gate = GATES_NEGOCIACION[neg.gateIndex];
+
+      if (neg.sub === 'confirmar_datos') {
+        const camposConfirmar = CAMPOS.caso_nuevo;
+        const entradaConfirmar = normalizarTexto(message).trim();
+        if (entradaConfirmar === normalizarTexto('Están correctos').trim() || interpretarSiNo(message) === 'sí') {
+          neg.sub = 'pregunta';
+          return res.json({ reply: `➡️ ${gate.pregunta}`, opciones: OPCIONES_GATE_PREGUNTA });
+        }
+        if (entradaConfirmar === normalizarTexto('Modificar un dato').trim()) {
+          const etiquetasConfirmar = camposConfirmar
+            .map((c) => c.label)
+            .concat(sesion.data.nombre_empresa !== undefined ? ['Nombre de la empresa'] : []);
+          neg.sub = 'pidiendo_campo_modificar';
+          return res.json({ reply: '¿Cuál dato quieres corregir?', opciones: etiquetasConfirmar });
+        }
+        return res.json({
+          reply: '⚠️ Selecciona una opción.',
+          opciones: ['Están correctos', 'Modificar un dato'],
+        });
+      }
+
+      if (neg.sub === 'pidiendo_campo_modificar') {
+        const camposMod = CAMPOS.caso_nuevo;
+        const etiquetasMod = camposMod
+          .map((c) => c.label)
+          .concat(sesion.data.nombre_empresa !== undefined ? ['Nombre de la empresa'] : []);
+        const entradaMod = normalizarTexto(message).trim();
+        const esEmpresaEspecial = entradaMod === normalizarTexto('Nombre de la empresa').trim();
+        const campoAModificar = esEmpresaEspecial
+          ? null
+          : camposMod.find((c) => normalizarTexto(c.label).trim() === entradaMod);
+        if (!campoAModificar && !esEmpresaEspecial) {
+          return res.json({ reply: '⚠️ Selecciona uno de los datos de la lista.', opciones: etiquetasMod });
+        }
+        neg.campoModificando = esEmpresaEspecial ? '__nombre_empresa__' : campoAModificar.id;
+        neg.sub = 'pidiendo_valor_modificar';
+        if (esEmpresaEspecial) {
+          return res.json({ reply: '¿Cuál es el nombre o razón social correcto de la empresa?' });
+        }
+        return res.json(conOpciones({ reply: campoAModificar.prompt }, campoAModificar));
+      }
+
+      if (neg.sub === 'pidiendo_valor_modificar') {
+        const camposVal = CAMPOS.caso_nuevo;
+        if (neg.campoModificando === '__nombre_empresa__') {
+          const nuevoNombreCrudo = message.trim();
+          if (!nuevoNombreCrudo || nuevoNombreCrudo.length < 2) {
+            return res.json({ reply: '⚠️ Escribe el nombre o razón social de la empresa (mínimo 2 caracteres).' });
+          }
+          const nuevoNombre = capitalizarNombrePropio(nuevoNombreCrudo);
+          sesion.data.nombre_empresa = nuevoNombre;
+          sesion.data.cuenta = nuevoNombre;
+          if (sesion.casoId) {
+            try {
+              await actualizarCaso(sesion.casoId, { nombre_empresa: nuevoNombre, cuenta: nuevoNombre });
+            } catch (dbError) {
+              console.error('Error corrigiendo el nombre de la empresa en Supabase:', dbError);
+            }
+          }
+        } else {
+          const campoMod = camposVal.find((c) => c.id === neg.campoModificando);
+          const resultadoMod = validarYNormalizarCampo(campoMod, message);
+          if (!resultadoMod.ok) {
+            return res.json(conOpciones({ reply: `⚠️ ${campoMod.errorMessage}\n\n${campoMod.prompt}` }, campoMod));
+          }
+          sesion.data[campoMod.id] = resultadoMod.valor;
+          // Si se corrige el tipo de documento, recalculamos tipo_cuenta y,
+          // si aplica (persona natural), el nombre de cuenta unificado.
+          if (campoMod.id === 'tipo_identificacion' && resultadoMod.valor) {
+            const esEmpresaMod = resultadoMod.valor === 'NIT';
+            sesion.data.tipo_cuenta = esEmpresaMod ? 'Empresa' : 'Persona natural';
+            if (!esEmpresaMod) sesion.data.cuenta = sesion.data.nombre_cliente || null;
+          }
+          if (campoMod.id === 'nombre_cliente' && sesion.data.tipo_cuenta === 'Persona natural') {
+            sesion.data.cuenta = resultadoMod.valor;
+          }
+          if (sesion.casoId) {
+            try {
+              const cambiosMod = { [campoMod.id]: resultadoMod.valor };
+              if (campoMod.id === 'tipo_identificacion') cambiosMod.tipo_cuenta = sesion.data.tipo_cuenta;
+              if (
+                (campoMod.id === 'tipo_identificacion' || campoMod.id === 'nombre_cliente') &&
+                sesion.data.cuenta !== undefined
+              ) {
+                cambiosMod.cuenta = sesion.data.cuenta;
+              }
+              await actualizarCaso(sesion.casoId, cambiosMod);
+            } catch (dbError) {
+              console.error(`Error corrigiendo el campo ${campoMod.id} en Supabase:`, dbError);
+            }
+          }
+        }
+
+        neg.sub = 'confirmar_datos';
+        neg.campoModificando = null;
+        return res.json({
+          reply: `✅ Corregido.\n\n${resumenCampos(camposVal, sesion.data)}\n\n¿Estos datos están correctos, o necesitas modificar otro?`,
+          opciones: ['Están correctos', 'Modificar un dato'],
+        });
+      }
+
+      if (neg.sub === 'pregunta') {
+        if (esCerrarInteraccion(message)) {
+          const nombreCerrado = sesion.data.nombre_cliente || 'el cliente';
+          Object.assign(sesion, nuevaSesion());
+          return res.json({
+            reply: `✅ Listo, guardé la interacción con ${nombreCerrado} tal como está — ya quedó en la base de datos, no se pierde nada. Cuéntame cuando el cliente vuelva a responder o tengas otro caso.`,
+          });
+        }
+        const respuesta = interpretarSiNo(message);
+        if (!respuesta) {
+          return res.json({ reply: gate.pregunta, opciones: OPCIONES_GATE_PREGUNTA });
+        }
+        if (respuesta === 'sí') {
+          // El sistema categoriza solo: en cuanto el cliente confirma que
+          // sigue interesado (o acepta en cualquiera de las 3 preguntas),
+          // el caso pasa a "Negociación" — sin que el asesor tenga que
+          // cambiarlo a mano en el desplegable.
+          if (sesion.casoId) {
+            try {
+              await actualizarCaso(sesion.casoId, { estado_pipeline: 'Negociación' });
+            } catch (dbError) {
+              console.error('Error actualizando estado_pipeline a Negociación:', dbError);
+            }
+          }
+          if (gate.siguientePasoOpciones) {
+            neg.sub = 'siguiente_paso';
+            return res.json({
+              reply: '¡Excelente! ¿Cuál es el siguiente paso con este cliente?',
+              opciones: gate.siguientePasoOpciones,
+            });
+          }
+          neg.gateIndex += 1;
+          neg.sub = 'pregunta';
+          const siguienteGate = GATES_NEGOCIACION[neg.gateIndex];
+          return res.json({ reply: `Listo.\n\n➡️ ${siguienteGate.pregunta}`, opciones: OPCIONES_GATE_PREGUNTA });
+        }
+        neg.sub = 'motivo';
+        return res.json({ reply: '¿Cuál es el motivo?', opciones: gate.motivos });
+      }
+
+      if (neg.sub === 'motivo') {
+        const entrada = normalizarTexto(message).trim();
+        const motivo = gate.motivos.find((m) => normalizarTexto(m).trim() === entrada);
+        if (!motivo) {
+          return res.json({ reply: '⚠️ Selecciona uno de los motivos.', opciones: gate.motivos });
+        }
+        if (sesion.casoId) {
+          try {
+            // El sistema categoriza solo: en cuanto se responde "No" a
+            // cualquiera de las 3 preguntas de negociación, el caso ya queda
+            // como "Cierre perdido" — sin esperar a que además confirmen
+            // que quieren cerrar la interacción ahora mismo.
+            // OJO: "Lo pensará / Pide volver a llamar / Va a consultar un
+            // tercero" (gate negociacion) NO es una pérdida: el cliente sigue
+            // en la fase Negociación. Solo se marca Cierre perdido en los
+            // gates interes y acepta.
+            const campos = { [gate.motivoCampo]: motivo };
+            campos.estado_pipeline = gate.id === 'negociacion' ? 'Negociación' : 'Cierre perdido';
+            await actualizarCaso(sesion.casoId, campos);
+          } catch (dbError) {
+            console.error(`Error guardando ${gate.motivoCampo} en Supabase:`, dbError);
+          }
+        }
+        if (gate.id === 'negociacion') {
+          // No se pregunta por cerrar: el caso sigue vivo en Interesado.
+          sesion.estado = 'caso_abierto';
+          sesion.negociacion = null;
+          return res.json({ reply: `Listo, el cliente sigue en "Negociación" (${motivo}). No se marca como perdido; seguimos gestionando este caso.` });
+        }
+        neg.sub = 'cierre';
+        return res.json({ reply: '¿Quieres cerrar la interacción con este cliente?', opciones: ['Sí', 'No'] });
+      }
+
+      if (neg.sub === 'cierre') {
+        const respuesta = interpretarSiNo(message);
+        if (!respuesta) {
+          return res.json({ reply: '¿Quieres cerrar la interacción con este cliente?', opciones: ['Sí', 'No'] });
+        }
+        if (respuesta === 'sí') {
+          neg.sub = 'completitud';
+          return res.json({
+            reply: '¿La información del caso quedó completa, o queda pendiente algún dato?',
+            opciones: ['Información completa', 'Pendiente de información'],
+          });
+        }
+        // No cierra: sigue con la siguiente pregunta igual.
+        neg.gateIndex += 1;
+        neg.sub = 'pregunta';
+        if (neg.gateIndex >= GATES_NEGOCIACION.length) {
+          sesion.estado = 'caso_abierto';
+          sesion.negociacion = null;
+          return res.json({ reply: 'Listo, seguimos gestionando este caso.' });
+        }
+        const siguienteGate = GATES_NEGOCIACION[neg.gateIndex];
+        return res.json({ reply: `Listo, seguimos.\n\n➡️ ${siguienteGate.pregunta}`, opciones: OPCIONES_GATE_PREGUNTA });
+      }
+
+      if (neg.sub === 'completitud') {
+        const opcionesCompletitud = ['Información completa', 'Pendiente de información'];
+        const entrada = normalizarTexto(message).trim();
+        const match = opcionesCompletitud.find((o) => normalizarTexto(o).trim() === entrada);
+        if (!match) {
+          return res.json({
+            reply: '⚠️ Selecciona una opción.',
+            opciones: opcionesCompletitud,
+          });
+        }
+        const nombreCerrado = sesion.data.nombre_cliente || 'el cliente';
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { estado_pipeline: 'Cierre perdido', info_completa: match });
+          } catch (dbError) {
+            console.error('Error cerrando la negociación en Supabase:', dbError);
+          }
+        }
+        Object.assign(sesion, nuevaSesion());
+        return res.json({
+          reply: `✅ Listo, dejamos cerrada la interacción con ${nombreCerrado} — quedó como "Cierre perdido" (${match}). Cuéntame cuando tengas otro cliente (dime "tengo un cliente nuevo") y arrancamos.`,
+        });
+      }
+
+      if (neg.sub === 'siguiente_paso') {
+        const opcionesSiguientePaso = gate.siguientePasoOpciones;
+        const entrada = normalizarTexto(message).trim();
+        const match = opcionesSiguientePaso.find((o) => normalizarTexto(o).trim() === entrada);
+        if (!match) {
+          return res.json({
+            reply: '⚠️ Selecciona una opción.',
+            opciones: opcionesSiguientePaso,
+          });
+        }
+        if (sesion.casoId) {
+          try {
+            const cambiosPaso = { siguiente_paso: match };
+            // Si ya se ejecutó todo el proceso, el sistema categoriza el
+            // caso solo como "Cliente" (documentos, firma y pago listos).
+            if (match === 'Proceso completado') cambiosPaso.estado_pipeline = 'Cliente';
+            await actualizarCaso(sesion.casoId, cambiosPaso);
+            if (match === 'Proceso completado') moverCarpetaSiCliente(sesion.casoId);
+          } catch (dbError) {
+            console.error('Error guardando el siguiente paso en Supabase:', dbError);
+          }
+        }
+        if (gate.servicioOpciones) {
+          neg.sub = 'servicio_contratado';
+          return res.json({
+            reply: `✅ Anotado: "${match}".\n\n¿Cuál es el servicio contratado?`,
+            opciones: gate.servicioOpciones,
+          });
+        }
+        sesion.estado = 'caso_abierto';
+        sesion.negociacion = null;
+        return res.json({
+          reply: `✅ Excelente, quedó registrado: "${match}". Sigamos gestionando: cuéntame cuando el caso se radique (dime algo como "ya se radicó") o si al final no aplicó (dime "no aplica" y el motivo).`,
+        });
+      }
+
+      if (neg.sub === 'servicio_contratado') {
+        const opcionesServicio = gate.servicioOpciones;
+        const entrada = normalizarTexto(message).trim();
+        const match = opcionesServicio.find((o) => normalizarTexto(o).trim() === entrada);
+        if (!match) {
+          return res.json({
+            reply: '⚠️ Selecciona una opción.',
+            opciones: opcionesServicio,
+          });
+        }
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { servicio_contratado: match });
+          } catch (dbError) {
+            console.error('Error guardando el servicio contratado en Supabase:', dbError);
+          }
+        }
+        sesion.data.servicio_contratado = match;
+        neg.sub = 'contrato_pregunta';
+        return res.json({
+          reply: `✅ Anotado el servicio: "${match}".\n\n📄 ¿Se necesita generar el contrato?`,
+          opciones: ['Sí, generar contrato', 'No, seguir'],
+        });
+      }
+
+      if (neg.sub === 'contrato_pregunta') {
+        const ent = normalizarTexto(message).trim();
+        if (ent === normalizarTexto('Sí, generar contrato') || interpretarSiNo(message) === 'sí') {
+          neg.sub = 'contrato_docs';
+          return res.json({ reply: TEXTO_DOCS_CONTRATO, opciones: ['Crear contrato', 'Lo hago después'] });
+        }
+        if (ent === normalizarTexto('No, seguir') || interpretarSiNo(message) === 'no') {
+          neg.sub = 'escalar';
+          return res.json({ reply: '👍 Sin contrato por ahora (después puedes usar "Generar contrato" en el inicio).\n\n¿Cómo quedan los documentos para escalar este caso?', opciones: OPCIONES_ESCALAR_DOCUMENTOS });
+        }
+        return res.json({ reply: '⚠️ Selecciona una opción.', opciones: ['Sí, generar contrato', 'No, seguir'] });
+      }
+
+      if (neg.sub === 'contrato_docs') {
+        // "Crear contrato" (botón) lo atiende el manejador global. Aquí: "Lo hago después"
+        // o frases como "listo, ya están los documentos" (que también crean la solicitud).
+        const ent = normalizarTexto(message).trim();
+        if (/despues|luego|mas tarde|^no\b/.test(ent)) {
+          neg.sub = 'escalar';
+          return res.json({ reply: '👍 Cuando tengas los documentos, usa "Generar contrato" en el inicio.\n\n¿Cómo quedan los documentos para escalar este caso?', opciones: OPCIONES_ESCALAR_DOCUMENTOS });
+        }
+        if (/listo|ya (est|sub|carg|adjunt)|document|sub[i]|cargu|^si\b|contrato/.test(ent) || interpretarSiNo(message) === 'sí') {
+          try {
+            const r = await crearSolicitudContrato(sesion, asesor);
+            neg.sub = 'escalar';
+            const aviso = r.yaExiste
+              ? '⏳ Ya hay una solicitud en proceso para este cliente.'
+              : '✅ Listo, mandé la solicitud. El sistema revisa los documentos y arma el contrato (2 a 4 minutos). Luego toca "Ver estado del contrato".';
+            return res.json({ reply: `${aviso}\n\nMientras tanto, sigamos: ¿cómo quedan los documentos para escalar este caso?`, opciones: OPCIONES_ESCALAR_DOCUMENTOS });
+          } catch (e) {
+            console.error('Error creando solicitud de contrato:', e);
+            return res.json({ reply: `⚠️ No pude enviar la solicitud (${e.message}). Intenta con el botón "Crear contrato".`, opciones: ['Crear contrato', 'Lo hago después'] });
+          }
+        }
+        return res.json({ reply: 'Adjunta cédula, RUT y factura con el clip 📎 y toca "Crear contrato" (o "Lo hago después").', opciones: ['Crear contrato', 'Lo hago después'] });
+      }
+
+      if (neg.sub === 'escalar') {
+        const entrada = normalizarTexto(message).trim();
+        const match = OPCIONES_ESCALAR_DOCUMENTOS.find((o) => normalizarTexto(o).trim() === entrada);
+        if (!match) {
+          return res.json({
+            reply: '⚠️ Selecciona una opción.',
+            opciones: OPCIONES_ESCALAR_DOCUMENTOS,
+          });
+        }
+        if (sesion.casoId) {
+          try {
+            await actualizarCaso(sesion.casoId, { escalamiento_documentos: match });
+          } catch (dbError) {
+            console.error('Error guardando el escalamiento de documentos en Supabase:', dbError);
+          }
+        }
+        neg.sub = 'cierre_final';
+        return res.json({
+          reply: `✅ Anotado: "${match}".\n\n¿Quieres cerrar la interacción con este cliente?`,
+          opciones: ['Sí', 'No'],
+        });
+      }
+
+      if (neg.sub === 'cierre_final') {
+        const respuesta = interpretarSiNo(message);
+        if (!respuesta) {
+          return res.json({ reply: '¿Quieres cerrar la interacción con este cliente?', opciones: ['Sí', 'No'] });
+        }
+        const nombreCerrado = sesion.data.nombre_cliente || 'el cliente';
+        sesion.estado = 'caso_abierto';
+        sesion.negociacion = null;
+        if (respuesta === 'sí') {
+          Object.assign(sesion, nuevaSesion());
+          return res.json({
+            reply: `✅ Listo, dejamos cerrada la interacción con ${nombreCerrado}. Cuéntame cuando tengas otro cliente (dime "tengo un cliente nuevo") y arrancamos.`,
+          });
+        }
+        return res.json({
+          reply: `Listo, seguimos gestionando el caso de ${nombreCerrado}: cuéntame cuando se radique (dime algo como "ya se radicó") o si al final no aplicó (dime "no aplica" y el motivo).`,
+        });
+      }
+    }
+
+    // --- Captura del resultado final (radicado / no_aplica) ---
+    if (sesion.estado === 'capturando_resultado') {
+      const campos = CAMPOS[sesion.tipo];
+      const campo = campos[sesion.stepIndex];
+
+      const esDuda = pareceDuda(message);
+      if (esDuda) {
+        const conocimiento = await obtenerConocimientoTexto(message);
+        const respuesta = await responderAyuda(
+          SOP_TEXT,
+          OBJECIONES_TEXT,
+          message,
+          {
+            estado: sesion.estado,
+            campoActual: campo.prompt,
+            datosCapturados: sesion.data,
+          },
+          conocimiento
+        );
+        return res.json(conOpciones({ reply: `${respuesta}\n\n➡️ ${campo.prompt}` }, campo));
+      }
+
+      const resultadoCampo = validarYNormalizarCampo(campo, message);
+      if (!resultadoCampo.ok) {
+        return res.json(conOpciones({ reply: `⚠️ ${campo.errorMessage}\n\n${campo.prompt}` }, campo));
+      }
+
+      sesion.data[campo.id] = resultadoCampo.valor;
+      sesion.stepIndex = siguienteIndicePendiente(campos, sesion.data);
+
+      if (sesion.stepIndex < campos.length) {
+        const siguiente = campos[sesion.stepIndex];
+        return res.json(conOpciones({ reply: `✅ Anotado.\n\n${siguiente.prompt}` }, siguiente));
+      }
+
+      try {
+        if (sesion.casoId) {
+          if (sesion.tipo === 'radicado') {
+            await actualizarCaso(sesion.casoId, {
+              resultado: 'radicado',
+              numero_radicado_dian: sesion.data.numero_radicado_dian || null,
+              seccional: sesion.data.seccional || null,
+              observaciones: sesion.data.observaciones || null,
+            });
+          } else {
+            await actualizarCaso(sesion.casoId, {
+              resultado: 'no_aplica',
+              motivo_no_aplica: sesion.data.motivo_no_aplica || null,
+              observaciones: sesion.data.observaciones || null,
+            });
+          }
+        }
+      } catch (dbError) {
+        console.error('Error actualizando el caso en Supabase:', dbError);
+        return res.json({
+          reply: `Se capturaron todos los datos, pero hubo un error guardándolos en la base de datos: ${dbError.message}. Avisa a soporte técnico; tus datos no se perdieron:\n\n${resumenCampos(
+            campos,
+            sesion.data
+          )}`,
+          saved: false,
+        });
+      }
+
+      sesion.estado = 'finalizado';
+      const tituloResumen = sesion.tipo === 'radicado' ? '🎉 Caso radicado' : 'Caso cerrado sin continuar';
+      return res.json({
+        reply: `✅ ${tituloResumen}. Estos son los datos capturados:\n\n${resumenCampos(
+          campos,
+          sesion.data
+        )}\n\n¡Buen trabajo! Cuéntame cuando tengas otro caso y seguimos.`,
+        saved: true,
+      });
+    }
+
+    // --- Mensaje libre fuera de una captura activa: dudas de proceso ---
+    const conocimientoLibre = await obtenerConocimientoTexto(message);
+    const respuesta = await responderAyuda(
+      SOP_TEXT,
+      OBJECIONES_TEXT,
+      message,
+      {
+        estado: sesion.estado,
+        campoActual: campoActualDe(sesion),
+        datosCapturados: sesion.data,
+      },
+      conocimientoLibre
+    );
+
+    let reply = respuesta;
+    const campoPendiente = campoActualDe(sesion);
+    if (campoPendiente) {
+      reply += `\n\n➡️ ${campoPendiente}`;
+    } else if (sesion.estado === 'inactivo' || sesion.estado === 'finalizado') {
+      reply += `\n\nCuéntame cuando tengas un caso nuevo y arrancamos.`;
+    }
+    return res.json({ reply });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || 'Error interno' });
   }
 });
 
-if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`Marce · Asistente de Venta escuchando en http://localhost:${PORT}`);
+
+// ============ Usuarios y perfiles del panel (solo el perfil "admin") ============
+// Un solo link para todos: cada correo tiene un perfil en la tabla panel_roles
+// (admin = todo + crear usuarios, bo = back office, hace todo, cliente = solo
+// Embudo y Seguimiento sin mover nada). Estas rutas crean/cambian usuarios con la llave de
+// servicio de Supabase, pero SOLO si quien llama es un admin con sesión válida.
+const PERFILES_VALIDOS = ['admin', 'bo', 'cliente'];
+
+function sbServicio() {
+  const { createClient } = require('@supabase/supabase-js');
+  return createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+    auth: { autoRefreshToken: false, persistSession: false },
   });
 }
 
-module.exports = { manejar, nuevaSesion };
+async function exigirAdmin(req, res) {
+  try {
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    if (!token) { res.status(401).json({ error: 'Falta iniciar sesión' }); return null; }
+    const sb = sbServicio();
+    const { data, error } = await sb.auth.getUser(token);
+    if (error || !data || !data.user || !data.user.email) { res.status(401).json({ error: 'Sesión no válida' }); return null; }
+    const email = data.user.email.toLowerCase();
+    const { data: fila } = await sb.from('panel_roles').select('rol, activo').ilike('email', email).maybeSingle();
+    if (!fila || fila.rol !== 'admin' || fila.activo === false) { res.status(403).json({ error: 'Solo un administrador puede hacer esto' }); return null; }
+    return { sb, email };
+  } catch (err) {
+    console.error('exigirAdmin:', err);
+    res.status(500).json({ error: 'No se pudo validar el usuario' });
+    return null;
+  }
+}
+
+async function buscarUsuarioAuth(sb, email) {
+  for (let pagina = 1; pagina <= 20; pagina++) {
+    const { data, error } = await sb.auth.admin.listUsers({ page: pagina, perPage: 200 });
+    if (error) throw error;
+    const u = (data.users || []).find((x) => (x.email || '').toLowerCase() === email);
+    if (u) return u;
+    if (!data.users || data.users.length < 200) break;
+  }
+  return null;
+}
+
+
+// ============ Documentos de SharePoint para el panel (Creación de caso UPME) ============
+// El panel pide aquí la lista de archivos de un cliente y un enlace temporal para verlos: nadie
+// tiene que descargar y volver a subir. Solo con sesión válida y perfil Admin o Back Office.
+async function exigirEquipo(req, res) {
+  try {
+    const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+    if (!token) { res.status(401).json({ error: 'Falta iniciar sesión' }); return null; }
+    const sb = sbServicio();
+    const { data, error } = await sb.auth.getUser(token);
+    if (error || !data || !data.user || !data.user.email) { res.status(401).json({ error: 'Sesión no válida' }); return null; }
+    const email = data.user.email.toLowerCase();
+    const { data: fila } = await sb.from('panel_roles').select('rol, activo').ilike('email', email).maybeSingle();
+    if (fila && (fila.rol === 'cliente' || fila.activo === false)) { res.status(403).json({ error: 'Tu perfil no tiene acceso a los documentos' }); return null; }
+    return { sb, email };
+  } catch (err) {
+    console.error('exigirEquipo:', err);
+    res.status(500).json({ error: 'No se pudo validar el usuario' });
+    return null;
+  }
+}
+
+// Crear cliente / subir documentos desde el panel: una sola carpeta por cédula (si ya existe, se usa esa;
+// si no, se crea en "00. En proceso"). Solo equipo (no perfil Cliente).
+app.post('/api/sp/subir', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    const { cedula, nombre, tipo, nombreArchivo, base64 } = req.body || {};
+    const ced = String(cedula || '').replace(/\D/g, '');
+    const nom = String(nombre || '').replace(/\s+/g, ' ').trim();
+    if (ced.length < 5 || ced.length > 12) return res.status(400).json({ error: 'La cédula debe tener entre 5 y 12 números.' });
+    if (nom.length < 3) return res.status(400).json({ error: 'Falta el nombre del cliente.' });
+    if (!TIPOS_DOC[tipo]) return res.status(400).json({ error: 'Tipo de documento no válido.' });
+    if (!base64) return res.status(400).json({ error: 'No llegó el archivo.' });
+    const buffer = Buffer.from(base64, 'base64');
+    if (buffer.length > 25 * 1024 * 1024) return res.status(413).json({ error: 'El archivo pesa más de 25 MB.' });
+    const r = await subirDocumento({ cedula: ced, nombre: nom, tipo, nombreArchivo, buffer, esCliente: false });
+    if (tipo === 'soporte_pago') require('./pagos').registrarPago({ cedula: ced, nombre: nom, canal: 'Panel (Crear cliente / UPME)', cargado_por: ctx.email, archivo: nombreArchivo, link: r.linkArchivo || r.linkCarpeta });
+    console.log(`[sp/subir] ${ctx.email} subió ${TIPOS_DOC[tipo]} de ${ced}`);
+    res.json({ ok: true, carpeta: r.carpeta, archivo: r.archivo, link: r.linkCarpeta || null });
+  } catch (err) {
+    console.error('Error en /api/sp/subir:', err);
+    res.status(500).json({ error: 'No pude guardar el archivo en SharePoint. ' + (err.message || '') });
+  }
+});
+
+app.get('/api/sp/documentos', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    if (req.query.carpeta) return res.json(await listarDocumentosDeCarpeta(String(req.query.carpeta)));
+    const cedula = String(req.query.cedula || '').replace(/\D/g, '');
+    if (cedula.length < 5) return res.status(400).json({ error: 'Escribe una cédula válida.' });
+    res.json(await listarDocumentosPorCedula(cedula));
+  } catch (err) {
+    console.error('Error listando documentos de SharePoint:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+app.get('/api/sp/clientes', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    res.json({ carpetas: await listarCarpetasClientes() });
+  } catch (err) {
+    console.error('Error listando carpetas de clientes:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+app.get('/api/sp/enlace', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    res.json(await enlaceDeArchivo(String(req.query.id || '')));
+  } catch (err) {
+    console.error('Error generando enlace de SharePoint:', err);
+    res.status(500).json({ error: err.message || 'Error interno' });
+  }
+});
+
+
+// ---- Correo "Solicitud cita DIAN" (cuando el cliente pasa de Certificado UPME emitido a Pendiente cita DIAN) ----
+app.post('/api/solicitud-cita-dian', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  const { clienteId, reenviar, documentos } = req.body || {};
+  const elegidos = Array.isArray(documentos) ? documentos.map(String) : null; // los que el equipo marcó en el panel
+  const sbx = ctx.sb;
+  let reclamado = false;
+  try {
+    if (!sharepointConfigurado()) return res.status(503).json({ error: 'SharePoint no está configurado en el servidor.' });
+    const { data: cli, error } = await sbx.from('BD_Cliente_GLA').select('*').eq('id', clienteId).maybeSingle();
+    if (error || !cli) return res.status(404).json({ error: 'No encontré el cliente.' });
+    if (!cli.fecha_certificado_upme_emitido) return res.status(400).json({ error: 'El cliente aún no tiene "Certificado UPME emitido".' });
+    if (String(cli.resultado_certificado_upme || '').toLowerCase() === 'rechazado') return res.status(400).json({ error: 'El certificado UPME quedó Rechazado: no se solicita cita DIAN.' });
+    // Regla: el paquete GLA se envía UNA sola vez por cliente (no hay reenvíos).
+    if (cli.correo_cita_dian_enviado_en) return res.json({ ok: true, yaEnviado: true, enviado_en: cli.correo_cita_dian_enviado_en });
+    // Reserva atómica: evita que dos clics/pestañas manden el mismo correo dos veces.
+    const ahora = new Date().toISOString();
+    {
+      const { data: tomado } = await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: ahora }).eq('id', cli.id).is('correo_cita_dian_enviado_en', null).select('id');
+      if (!tomado || !tomado.length) return res.json({ ok: true, yaEnviado: true });
+      reclamado = true;
+    }
+    // Ciudad del cliente (define la seccional DIAN): del cliente o, si falta, de su caso.
+    if (cli.caso_id && (!cli.ciudad || !cli.seccional)) {
+      const { data: caso } = await sbx.from('Perfilamiento_y_ventas_GLA').select('*').eq('id', cli.caso_id).maybeSingle();
+      if (caso) { cli.ciudad = cli.ciudad || caso.ciudad || caso.municipio || null; cli.seccional = cli.seccional || caso.seccional || null; }
+    }
+    const ced = String(cli.numero_identificacion || '').replace(/\D/g, '');
+    const lista = await listarDocumentosPorCedula(ced);
+    if (!lista.encontrada) throw new Error('No encontré la carpeta del cliente en SharePoint (cédula ' + ced + ').');
+    let archivos = lista.archivos.filter((a) => a.tipo !== 'Contrato' && !/CONTRATO|BORRADOR/i.test(a.nombre));
+    if (elegidos && elegidos.length) archivos = archivos.filter((a) => elegidos.includes(String(a.id)));
+    // Cliente con varios vehículos: solo viajan los documentos del vehículo de ESTA tarjeta (su placa)
+    // más los comunes (sin ninguna placa en el nombre: cédula, RUT, certificación bancaria...).
+    const normPl = (t) => String(t || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    const miPlaca = normPl(cli.placa);
+    if (miPlaca.length >= 5 && !(elegidos && elegidos.length)) {
+      const { data: otros } = await sbx.from('BD_Cliente_GLA').select('placa').eq('numero_identificacion', cli.numero_identificacion).neq('id', cli.id);
+      const otrasPlacas = (otros || []).map((o) => normPl(o.placa)).filter((x) => x.length >= 5 && x !== miPlaca);
+      if (otrasPlacas.length) archivos = archivos.filter((a) => { const n = normPl(a.nombre); return !otrasPlacas.some((pl) => n.includes(pl)); });
+    }
+    if (!archivos.length) throw new Error('La carpeta del cliente no tiene documentos para adjuntar.');
+    // Se ordena (sin duplicados), se descarga y se arma UNA carpeta .zip con todo numerado.
+    archivos = ordenarArchivos(archivos);
+    const descargados = [];
+    let total = 0;
+    for (const a of archivos) {
+      const d = await descargarArchivo(a.id);
+      total += d.buffer.length;
+      descargados.push({ tipo: a.tipo, nombre: d.nombre || a.nombre, buffer: d.buffer });
+    }
+    if (total > 30 * 1024 * 1024) throw new Error('Los documentos pesan ' + mbCorreo(total) + ' en total (el máximo del correo es ~30 MB).');
+    const paquete = armarPaquete(cli, sinRepetidos(descargados));
+    const adjuntos = [paquete.adjunto];
+    const asunto = (ES_REAL() ? '' : '[PRUEBA] ') + `Solicitud cita DIAN – ${cli.nombre_cliente || ''} (CC ${ced}${cli.placa ? ' · placa ' + cli.placa : ''}${cli.ciudad ? ' · ' + cli.ciudad : ''})`;
+    await enviarCorreo({ remitente: REMITENTE(), destinatarios: DESTINOS(), asunto, html: htmlCorreo({ cli, archivos: paquete.lista, paquete: paquete.nombreZip }), adjuntos });
+    await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: ahora }).eq('id', cli.id);
+    if (cli.caso_id) await sbx.from('panel_historial').insert({ caso_id: cli.caso_id, campo: 'correo_cita_dian', valor_anterior: null, valor_nuevo: `${ES_REAL() ? '' : '[PRUEBA] '}${reenviar ? 'Reenvío: ' : ''}Enviado a ${DESTINOS().length} destinatarios (${DESTINOS().join(', ')}) con 1 carpeta (${paquete.lista.length} documentos)`, usuario_email: ctx.email }).then(() => {}, () => {});
+    console.log(`[cita-dian] ${ctx.email} → correo de ${ced} con carpeta de ${paquete.lista.length} documentos`);
+    res.json({ ok: true, adjuntos: paquete.lista.length, destinatarios: DESTINOS().length });
+  } catch (err) {
+    if (reclamado) await sbx.from('BD_Cliente_GLA').update({ correo_cita_dian_enviado_en: null }).eq('id', clienteId).then(() => {}, () => {});
+    console.error('Error en /api/solicitud-cita-dian:', err);
+    res.status(500).json({ error: 'No pude enviar el correo. ' + (err.message || '') });
+  }
+});
+
+// ============ Análisis de conversaciones (Chattigo) con IA ============
+async function llamarIA(sistema, mensajes, maxTokens) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) throw new Error('Falta ANTHROPIC_API_KEY en el servidor.');
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+    body: JSON.stringify({ model: process.env.CHAT_ANALISIS_MODELO || 'claude-sonnet-4-5', max_tokens: maxTokens || 1200, system: sistema, messages: mensajes }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((j.error && j.error.message) || ('IA error ' + r.status));
+  return (j.content || []).map((b) => b.text || '').join('').trim();
+}
+const CAMPOS_CLIENTE_IA = ['nombre_cliente', 'placa', 'numero_identificacion', 'estado', 'estado_caso', 'etapa', 'tipo_servicio', 'servicio', 'vehiculo', 'asesor', 'observaciones'];
+function resumenClienteIA(fila) {
+  if (!fila) return null;
+  const o = {};
+  for (const k of CAMPOS_CLIENTE_IA) if (fila[k] != null && fila[k] !== '') o[k] = fila[k];
+  for (const k of Object.keys(fila)) if (/^fecha_/.test(k) && fila[k]) o[k] = String(fila[k]).slice(0, 10);
+  return o;
+}
+function textoChatIA(c, max) {
+  const ms = (c.mensajes || []).slice(-(max || 60));
+  return ms.map((m) => `[${String(m.fecha || '').slice(0, 16).replace('T', ' ')}] ${m.tipo === 'INBOUND' ? 'CLIENTE' : (m.tipo === 'OUTBOUND' ? 'AGENTE ' + (m.remitente || '') : (m.tipo === 'MASSIVE' ? 'PLANTILLA' : 'SISTEMA'))}: ${String(m.texto || '').replace(/\s+/g, ' ').slice(0, 500)}`).join('\n');
+}
+async function datosCruzadosIA(sbx, convs) {
+  const cIds = [...new Set(convs.map((c) => c.cliente_id).filter(Boolean))];
+  const kIds = [...new Set(convs.map((c) => c.caso_id).filter(Boolean))];
+  const [a, b] = await Promise.all([
+    cIds.length ? sbx.from('BD_Cliente_GLA').select('*').in('id', cIds) : { data: [] },
+    kIds.length ? sbx.from('Perfilamiento_y_ventas_GLA').select('*').in('id', kIds) : { data: [] },
+  ]);
+  const mc = new Map((a.data || []).map((x) => [String(x.id), x]));
+  const mk = new Map((b.data || []).map((x) => [String(x.id), x]));
+  return (c) => ({ cliente: resumenClienteIA(mc.get(String(c.cliente_id))), caso: resumenClienteIA(mk.get(String(c.caso_id))) });
+}
+const ESTADOS_CHAT_IA = ['Sin clasificar / fuera de alcance', 'Sin respuesta del cliente', 'Interesado / pidiendo información', 'Reagendar llamada', 'Cotización / precio enviado', 'Aceptó, en trámite', 'No interesado / cerrado', 'Requiere atención humana'];
+
+app.post('/api/chats/analizar', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    const ids = (Array.isArray(req.body && req.body.ids) ? req.body.ids : []).map(String).slice(0, 5);
+    if (!ids.length) return res.json({ ok: true, hechos: 0 });
+    const { data: convs, error } = await ctx.sb.from('chat_conversaciones').select('*').in('id_chat', ids);
+    if (error) throw error;
+    const cruz = await datosCruzadosIA(ctx.sb, convs || []);
+    let hechos = 0; const errores = [];
+    for (const c of convs || []) {
+      try {
+        const extra = cruz(c);
+        const sistema = 'Eres analista comercial y de calidad de Gómez Legal Abogados (devolución de IVA en vehículos eléctricos/híbridos, alianza con SURA; el trámite incluye certificado UPME y cita DIAN). Analizas conversaciones de WhatsApp (Chattigo) entre clientes, el bot/agentes de SURA y nuestros agentes. Responde SOLO un JSON válido, sin texto extra, con estas claves: ' +
+          'estado (uno de: ' + ESTADOS_CHAT_IA.join(' | ') + '; usa "Sin clasificar / fuera de alcance" si el chat no trata de nuestro servicio, p.ej. citas médicas de SURA, o si no hay información suficiente), ' +
+          'tipificacion (etiqueta corta de 2-5 palabras, p.ej. "Pide reagendar llamada", "Sin dinero por ahora", "Duda de gratuidad con SURA"), confianza (alta|media|baja: qué tan seguro estás del estado), ' +
+          'resumen (máx 3 frases), sentimiento (positivo|neutral|negativo), temperatura (caliente|tibio|frio: probabilidad de comprar/continuar), probabilidad (entero 0-100 de que el cliente contrate), ' +
+          'intencion (qué quiere el cliente, 1 frase), objeciones (lista de strings cortos: precio, desconfianza, no tiene tiempo, falta documentos, etc.; [] si no hay), ' +
+          'documentos_pendientes (lista de documentos que se le pidieron y no ha enviado; []), datos_detectados (objeto con nombre, cedula, placa, vehiculo, ciudad, correo: solo lo que aparezca en el chat, si no null), ' +
+          'calidad_atencion (objeto {puntaje: 1-5, nota: 1 frase sobre cómo atendimos: rapidez, claridad, empatía}), mejora_bot (1 frase: qué falló o se puede mejorar en el flujo automático/bot o agente; "" si nada), ' +
+          'siguiente_paso (acción concreta para el equipo, 1 frase), mensaje_sugerido (texto listo para enviar por WhatsApp al cliente, cordial, máx 350 caracteres, en español, sin inventar precios distintos a los del chat), ' +
+          'temas_criticos (lista de 0-4 temas críticos o sensibles que aparecen: p.ej. "desconfianza", "confusión con SURA Salud", "precio", "cliente molesto", "sin respuesta del equipo"), oportunidad (1 frase: la oportunidad comercial concreta que hay con este cliente y cómo aprovecharla; "" si no hay), motivo_no_cierre (1 frase: por qué aún no cierra o por qué se perdió; "" si ya cerró), riesgo (alto|medio|bajo: riesgo de perder al cliente), '+
+          'alerta (true si hay riesgo: cliente molesto, sin respuesta del equipo, pidió reagendar y nadie respondió, o varios días sin atención), motivo_alerta (texto corto o ""), tema (2-4 palabras). ' +
+          'Los mensajes PLANTILLA son envíos masivos automáticos; SISTEMA son asignaciones de chat. Sé fiel a la conversación; no inventes datos.';
+        const usuario = `Contacto: ${c.contacto || 'sin nombre'} (tel ${c.telefono10 || '—'}). Agente actual: ${c.agente || 'sin asignar'}.\nDatos que ya tenemos del cliente en el panel: ${JSON.stringify(extra)}\n\nConversación:\n${textoChatIA(c, 80)}`;
+        let t = await llamarIA(sistema, [{ role: 'user', content: usuario }], 1500);
+        t = t.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+        const a = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1));
+        a.v = 3;
+        if (c.analisis && c.analisis.estado_manual) a.estado_manual = c.analisis.estado_manual;
+        await ctx.sb.from('chat_conversaciones').update({ analisis: a, analizado_en: new Date().toISOString(), msgs_analizados: (c.mensajes || []).length }).eq('id_chat', c.id_chat);
+        hechos++;
+      } catch (e1) { errores.push(c.id_chat + ': ' + (e1.message || e1)); }
+    }
+    res.json({ ok: true, hechos, errores });
+  } catch (err) {
+    console.error('Error en /api/chats/analizar:', err);
+    res.status(500).json({ error: err.message || 'No pude analizar las conversaciones' });
+  }
+});
+
+app.post('/api/chats/preguntar', async (req, res) => {
+  const ctx = await exigirEquipo(req, res); if (!ctx) return;
+  try {
+    const pregunta = String((req.body && req.body.pregunta) || '').slice(0, 1500).trim();
+    if (!pregunta) return res.status(400).json({ error: 'Escribe una pregunta.' });
+    const hist = (Array.isArray(req.body.historial) ? req.body.historial : []).slice(-6).map((h) => ({ role: h.rol === 'ia' ? 'assistant' : 'user', content: String(h.texto || '').slice(0, 2000) }));
+    const { data: convs, error } = await ctx.sb.from('chat_conversaciones').select('*').order('ultimo_mensaje', { ascending: false }).limit(400);
+    if (error) throw error;
+    const cruz = await datosCruzadosIA(ctx.sb, convs || []);
+    const ahora = Date.now();
+    const bloques = (convs || []).map((c) => {
+      const a = c.analisis || {};
+      const dias = c.ultimo_mensaje ? Math.floor((ahora - new Date(c.ultimo_mensaje).getTime()) / 86400000) : null;
+      const ult = (c.mensajes || []).filter((m) => m.tipo === 'INBOUND' || m.tipo === 'OUTBOUND').slice(-3).map((m) => (m.tipo === 'INBOUND' ? 'CLIENTE: ' : 'AGENTE: ') + String(m.texto || '').replace(/\s+/g, ' ').slice(0, 200)).join(' | ');
+      return `#chat:${c.id_chat} | ${c.contacto || 'sin nombre'} | tel ${c.telefono10 || '—'} | agente ${c.agente || '—'} | último mensaje hace ${dias == null ? '?' : dias} d | estado: ${a.estado_manual || a.estado || 'sin analizar'} | resumen: ${a.resumen || '—'} | siguiente paso: ${a.siguiente_paso || '—'} | tipificación: ${a.tipificacion || '—'} | temperatura: ${a.temperatura || '—'} | prob. cierre: ${a.probabilidad == null ? '—' : a.probabilidad + '%'} | objeciones: ${(a.objeciones || []).join(', ') || '—'} | temas críticos: ${(Array.isArray(a.temas_criticos) ? a.temas_criticos : []).join(', ') || '—'} | oportunidad: ${a.oportunidad || '—'} | por qué no cierra: ${a.motivo_no_cierre || '—'} | riesgo: ${a.riesgo || '—'} | abierta desde: ${String(c.primer_mensaje || '').slice(0, 10)} | docs pendientes: ${(a.documentos_pendientes || []).join(', ') || '—'} | alerta: ${a.alerta ? 'SÍ ' + (a.motivo_alerta || '') : 'no'} | en panel: ${JSON.stringify(cruz(c))} | últimos mensajes: ${ult}`;
+    }).join('\n');
+    const sistema = 'Eres el asistente de análisis de conversaciones de Gómez Legal Abogados (canal WhatsApp/Chattigo, campaña de beneficio tributario SURA). Respondes en español, claro y breve, SOLO con base en las conversaciones listadas abajo. Cada vez que menciones a un cliente, cita su conversación con el formato exacto [[chat:ID]] (el ID aparece como #chat:ID) para que el panel ponga un enlace a la conversación. Si no hay datos suficientes, dilo. Si piden listas, usa viñetas cortas con nombre, estado y [[chat:ID]]. Hoy es ' + new Date().toISOString().slice(0, 10) + '.\n\nCONVERSACIONES:\n' + (bloques || '(no hay conversaciones cargadas)');
+    const respuesta = await llamarIA(sistema, [...hist, { role: 'user', content: pregunta }], 1500);
+    res.json({ ok: true, respuesta });
+  } catch (err) {
+    console.error('Error en /api/chats/preguntar:', err);
+    res.status(500).json({ error: err.message || 'No pude responder' });
+  }
+});
+
+app.get('/api/usuarios', async (req, res) => {
+  const ctx = await exigirAdmin(req, res); if (!ctx) return;
+  const { data, error } = await ctx.sb.from('panel_roles').select('email, rol, nombre, activo, creado_en').order('email');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ usuarios: data || [], yo: ctx.email });
+});
+
+// Crear usuario (o, si el correo ya existe en Supabase, solo asignarle perfil)
+app.post('/api/usuarios', async (req, res) => {
+  const ctx = await exigirAdmin(req, res); if (!ctx) return;
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const clave = String(req.body.clave || '');
+    const rol = String(req.body.rol || '').trim();
+    const nombre = String(req.body.nombre || '').trim() || null;
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Correo no válido' });
+    if (!PERFILES_VALIDOS.includes(rol)) return res.status(400).json({ error: 'Perfil no válido' });
+    let existente = await buscarUsuarioAuth(ctx.sb, email);
+    let creado = false;
+    if (!existente) {
+      if (clave.length < 8) return res.status(400).json({ error: 'La contraseña debe tener mínimo 8 caracteres' });
+      const { error } = await ctx.sb.auth.admin.createUser({ email, password: clave, email_confirm: true });
+      if (error) return res.status(400).json({ error: error.message });
+      creado = true;
+    }
+    const { error: e2 } = await ctx.sb.from('panel_roles').upsert({ email, rol, nombre, activo: true }, { onConflict: 'email' });
+    if (e2) return res.status(500).json({ error: e2.message });
+    res.json({ ok: true, creado });
+  } catch (err) {
+    console.error('crear usuario:', err);
+    res.status(500).json({ error: err.message || 'No se pudo crear el usuario' });
+  }
+});
+
+// Cambiar perfil, nombre, activar/desactivar o poner nueva contraseña
+app.patch('/api/usuarios', async (req, res) => {
+  const ctx = await exigirAdmin(req, res); if (!ctx) return;
+  try {
+    const email = String(req.body.email || '').trim().toLowerCase();
+    if (!email) return res.status(400).json({ error: 'Falta el correo' });
+    const cambios = {};
+    if (req.body.rol !== undefined) {
+      if (!PERFILES_VALIDOS.includes(req.body.rol)) return res.status(400).json({ error: 'Perfil no válido' });
+      cambios.rol = req.body.rol;
+    }
+    if (req.body.nombre !== undefined) cambios.nombre = String(req.body.nombre || '').trim() || null;
+    if (req.body.activo !== undefined) cambios.activo = !!req.body.activo;
+    if (email === ctx.email && ((cambios.rol && cambios.rol !== 'admin') || cambios.activo === false)) {
+      return res.status(400).json({ error: 'No puedes quitarte el perfil admin ni desactivarte a ti mismo' });
+    }
+    if (Object.keys(cambios).length) {
+      const { error } = await ctx.sb.from('panel_roles').update(cambios).ilike('email', email);
+      if (error) return res.status(500).json({ error: error.message });
+    }
+    const u = (cambios.activo !== undefined || req.body.clave) ? await buscarUsuarioAuth(ctx.sb, email) : null;
+    if (cambios.activo !== undefined && u) {
+      const { error } = await ctx.sb.auth.admin.updateUserById(u.id, { ban_duration: cambios.activo ? 'none' : '876000h' });
+      if (error) return res.status(500).json({ error: error.message });
+    }
+    if (req.body.clave) {
+      if (String(req.body.clave).length < 8) return res.status(400).json({ error: 'La contraseña debe tener mínimo 8 caracteres' });
+      if (!u) return res.status(404).json({ error: 'Ese correo no existe en Supabase' });
+      const { error } = await ctx.sb.auth.admin.updateUserById(u.id, { password: String(req.body.clave) });
+      if (error) return res.status(500).json({ error: error.message });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('editar usuario:', err);
+    res.status(500).json({ error: err.message || 'No se pudo actualizar' });
+  }
+});
+
+require('./wasapi')(app, { obtenerConocimientoTexto, sbServicio });
+// Firma electrónica de contratos (envío a firma, código, aceptación y constancia).
+require('./firma')(app, { sbServicio, exigirEquipo });
+require('./chattigo')(app, { sbServicio });
+require('./pagos').montarPagos(app); // informe diario de pagos cargados (8:00 p. m.)
+require('./informe_seguimiento').montarInformeSeguimiento(app, { exigirEquipo }); // informe gerencial diario del tablero de Seguimiento (8:00 p. m.)
+require('./aviso_pago_upme').montarAvisoPagoUpme(app, { exigirEquipo, sbServicio }); // aviso a Teams al pasar a Pendiente pago UPME
+require('./portal')(app, { sbServicio, exigirEquipo });
+
+app.listen(PORT, () => {
+  console.log(`Servidor de Daniela (Gómez Legal Abogados) escuchando en http://localhost:${PORT}`);
+});

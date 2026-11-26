@@ -17,6 +17,7 @@ function fuenteDeOrigen(origen) {
   if (/epm|fepep/.test(t)) return 'EPM';
   if (/confamilia|familia/.test(t)) return 'Confamilia';
   if (/referix/.test(t)) return 'Referix';
+  if (/instagram|daniela g[oó]mez/.test(t)) return 'RRSS'; // link gomezlegalabogados.netlify.app/danielagomez
   return t ? 'WhatsApp Cliente' : null;
 }
 function certificadoTexto(v) {

@@ -236,7 +236,16 @@ async function procesar(waId, deps) {
 
     let conocimiento = '';
     try { conocimiento = await deps.obtenerConocimientoTexto(textoCliente); } catch (_) {}
-    const sistema = BASE_PROMPT + '\n' + REGLAS_EXTRA +
+    // 26/11/2026: SOLO el cliente que viene de atención al cliente de SURA es "cliente que ya viene de otro canal"
+    // (bienvenida especial y traspaso al consultor). ReferiX, EPM, Confamilia, Instagram y cualquier otro origen
+    // son CLIENTES NUEVOS: bienvenida normal y Daniela los atiende de principio a fin.
+    const primerCliente = String((historial.find((m) => m.rol === 'cliente') || {}).texto || '');
+    const viaSura = /sura/i.test(String((conv.perfil || {}).origen || '')) || /(atenci[oó]n al cliente de sura|vengo de sura|\bsura\b)/i.test(primerCliente);
+    const notaOrigen = viaSura
+      ? '\nORIGEN DE ESTE CLIENTE: viene de atención al cliente de SURA (aplica la sección de clientes que vienen de SURA).'
+      : '\nORIGEN DE ESTE CLIENTE: NO viene de SURA' + (/referix|epm|fepep|familia|instagram|daniela g/i.test(primerCliente) ? ' (llegó por ' + (primerCliente.match(/referix|epm|fepep|confamilia|familia|instagram/i) || ['otro canal'])[0] + ')' : '') +
+        '. Es un CLIENTE NUEVO: NO uses la bienvenida de SURA ni digas que "no tiene que empezar de cero" o que "ya hizo algo en otro canal". Usa el primer mensaje normal, perfílalo y atiéndelo tú misma de principio a fin; NO lo traspases al consultor salvo las causas de escalamiento.';
+    const sistema = BASE_PROMPT + '\n' + REGLAS_EXTRA + notaOrigen +
       '\n\nFICHA ACTUAL DEL CLIENTE (JSON): ' + JSON.stringify(fichaVisible(conv.perfil)) +
       (tarifaUpme((conv.perfil || {}).valor_sin_iva) ? '\nTARIFA UPME DE ESTE CLIENTE (calculadora oficial de la UPME, Resolución 135 de 2025, con el valor sin IVA de su factura): ' + tarifaUpme(conv.perfil.valor_sin_iva).texto + '. Úsala tal cual cuando hables de la tarifa de la UPME.' : '') +
       (conv.perfil && conv.perfil.nombre ? '\nNOMBRE DE PILA PARA DIRIGIRTE: ' + String(conv.perfil.nombre).trim().split(/\s+/)[0] + '. Nunca uses el apellido al hablar con el cliente.' : '') +
@@ -268,6 +277,16 @@ async function procesar(waId, deps) {
       console.log('wasapi: cliente SURA, pregunta de perfilamiento descartada y traspaso inmediato. Era:', respuesta.slice(0, 200));
       j = Object.assign({}, j || {}, { traspasar: true, motivo_traspaso: 'escalamiento', causa_escalamiento: 'sura_en_proceso' });
       respuesta = '';
+    }
+    // Cliente que NO viene de SURA (ReferiX, EPM, Confamilia, Instagram, directo…): es cliente nuevo.
+    // Nunca la bienvenida de "ya viene de otro canal" ni el traspaso "sura_en_proceso".
+    if (!esSura) {
+      if (j && j.causa_escalamiento === 'sura_en_proceso') { console.log('wasapi: sura_en_proceso descartado (no viene de SURA)'); j = Object.assign({}, j, { traspasar: false, motivo_traspaso: null, causa_escalamiento: null }); }
+      if (/empezar de cero|repetir lo que ya hizo|en el otro canal|ya hizo en otro canal/i.test(respuesta)) {
+        console.log('wasapi: bienvenida de SURA corregida para cliente nuevo. Era:', respuesta.slice(0, 200));
+        respuesta = respuesta.split(/\n\s*\n/).filter((x) => !/empezar de cero|repetir lo que ya hizo|en el otro canal|ya hizo en otro canal/i.test(x)).join('\n\n');
+        if (!/gusto de hablar|su nombre/i.test(respuesta)) respuesta = (respuesta ? respuesta + '\n\n' : '') + 'Con mucho gusto le ayudo a recuperar el IVA que pagó por su vehículo. ¿Con quién tengo el gusto de hablar?';
+      }
     }
     let estado = 'bot';
     let partes = respuesta ? respuesta.split(/\n\s*\n/).filter((x) => x.trim()) : [];

@@ -17,6 +17,7 @@ MEMORIA Y ARCHIVOS (muy importante)
 - Si manda un archivo que no puedes leer, dile que lo revisará un consultor y sigue con la siguiente pregunta pendiente.
 - La guía de conocimiento puede traer precios, honorarios o tarifas: IGNÓRALOS. Los únicos valores que puedes decir son los de la ETAPA 3 del prompt (según origen), y solo en esa etapa.
 - Suena como un abogado cercano asesorando, no como un formulario.
+- NOTAS DE VOZ: SÍ puedes escucharlas. Te llegan transcritas como "[Nota de voz del cliente, transcrita]: ...". Respóndelas con naturalidad como cualquier mensaje. NUNCA digas que no puedes escuchar audios ni le pidas que escriba en vez de mandar audios.
 - Si el cliente manda varios mensajes seguidos, respóndelos juntos en un solo mensaje corto.
 FORMATO: texto plano. NUNCA uses asteriscos, negritas, guiones de lista ni Markdown; WhatsApp los muestra mal.
 SALIDA: responde SOLO un JSON válido, sin texto fuera de él:
@@ -90,6 +91,82 @@ function bloqueArchivo(buf, tipo, nombre) {
   if (/^image\/(jpeg|png|gif|webp)$/i.test(tipo)) return { type: 'image', source: { type: 'base64', media_type: tipo.toLowerCase(), data: b64 } };
   return null;
 }
+
+// ---- 27/11/2026: NOTAS DE VOZ ----
+// Escuchar: la nota de voz del cliente se transcribe a texto (ElevenLabs Scribe o OpenAI) y Daniela la responde normal.
+// Variables en Render (basta UNA): ELEVENLABS_API_KEY  u  OPENAI_API_KEY.
+async function transcribirAudio(buf, mime) {
+  const tipo = mime && /^audio\//i.test(mime) ? mime : 'audio/ogg';
+  const ext = (/mpeg|mp3/i.test(tipo) && 'mp3') || (/mp4|m4a|aac/i.test(tipo) && 'm4a') || (/wav/i.test(tipo) && 'wav') || 'ogg';
+  const errores = [];
+  if (process.env.ELEVENLABS_API_KEY) {
+    try {
+      const fd = new FormData();
+      fd.append('model_id', process.env.ELEVENLABS_STT_MODELO || 'scribe_v1');
+      fd.append('language_code', 'spa');
+      fd.append('file', new Blob([buf], { type: tipo }), 'nota.' + ext);
+      const r = await fetch('https://api.elevenlabs.io/v1/speech-to-text', { method: 'POST', headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY }, body: fd });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.text) return String(j.text).trim();
+      errores.push('ElevenLabs ' + r.status + ' ' + JSON.stringify(j).slice(0, 200));
+    } catch (e) { errores.push('ElevenLabs ' + e.message); }
+  }
+  if (process.env.OPENAI_API_KEY) {
+    try {
+      const fd = new FormData();
+      fd.append('model', process.env.OPENAI_STT_MODELO || 'whisper-1');
+      fd.append('language', 'es');
+      fd.append('file', new Blob([buf], { type: tipo }), 'nota.' + ext);
+      const r = await fetch('https://api.openai.com/v1/audio/transcriptions', { method: 'POST', headers: { Authorization: 'Bearer ' + process.env.OPENAI_API_KEY }, body: fd });
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.text) return String(j.text).trim();
+      errores.push('OpenAI ' + r.status + ' ' + JSON.stringify(j).slice(0, 200));
+    } catch (e) { errores.push('OpenAI ' + e.message); }
+  }
+  if (!errores.length) errores.push('falta ELEVENLABS_API_KEY u OPENAI_API_KEY en Render');
+  throw new Error(errores.join(' | '));
+}
+const sttActivo = () => !!(process.env.ELEVENLABS_API_KEY || process.env.OPENAI_API_KEY);
+
+// Enviar audio (bienvenida de redes). Wasapi recibe el enlace público del archivo.
+// El archivo va en la carpeta "audios" del repositorio (bienvenida_redes.mp3/.ogg/.m4a) o en AUDIO_REDES_URL.
+const DIR_AUDIOS = path.join(__dirname, 'audios');
+function archivoAudioRedes() {
+  for (const n of ['bienvenida_redes.ogg', 'bienvenida_redes.mp3', 'bienvenida_redes.m4a', 'bienvenida_redes.aac']) if (fs.existsSync(path.join(DIR_AUDIOS, n))) return n;
+  return null;
+}
+function urlAudioRedes() {
+  if (process.env.AUDIO_REDES_URL) return process.env.AUDIO_REDES_URL;
+  const n = archivoAudioRedes(); const base = (process.env.SERVIDOR_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+  return n && base ? base + '/audios/' + n : null;
+}
+const ultimosAudios = [];
+async function enviarAudio(waId, fromId, url) {
+  const H = { Authorization: 'Bearer ' + process.env.WASAPI_API_KEY, Accept: 'application/json' };
+  const intentos = [
+    () => fetch(API + '/whatsapp-messages/attachment', { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, H), body: JSON.stringify({ wa_id: waId, from_id: fromId, file: 'audio', filePath: url, caption: '' }) }),
+    () => fetch(API + '/whatsapp-messages/attachment', { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json' }, H), body: JSON.stringify({ wa_id: waId, from_id: fromId, type: 'audio', url, file_url: url }) }),
+    async () => {
+      const f = await bajarArchivo(url); const fd = new FormData();
+      fd.append('wa_id', waId); fd.append('from_id', String(fromId)); fd.append('caption', '');
+      fd.append('file', new Blob([f.buf], { type: f.tipo || 'audio/mpeg' }), url.split('/').pop() || 'audio.mp3');
+      return fetch(API + '/whatsapp-messages/attachment', { method: 'POST', headers: H, body: fd });
+    },
+  ];
+  const log = [];
+  for (let i = 0; i < intentos.length; i++) {
+    try {
+      const r = await intentos[i](); const t = (await r.text().catch(() => '')).slice(0, 300);
+      log.push({ intento: i + 1, status: r.status, respuesta: t });
+      if (r.ok && !/"success"\s*:\s*false|error/i.test(t)) { ultimosAudios.push({ ts: new Date().toISOString(), ok: true, log }); if (ultimosAudios.length > 10) ultimosAudios.shift(); return { ok: true, intento: i + 1, log }; }
+    } catch (e) { log.push({ intento: i + 1, error: e.message }); }
+  }
+  ultimosAudios.push({ ts: new Date().toISOString(), ok: false, log }); if (ultimosAudios.length > 10) ultimosAudios.shift();
+  console.error('wasapi audio: no se pudo enviar', JSON.stringify(log).slice(0, 1200));
+  return { ok: false, log };
+}
+// Cliente que llega por el link de redes de Daniela (/instagram, /danielagomez)
+const esDeRedes = (t) => /instagram|redes de daniela|tiktok de daniela|facebook de daniela/i.test(String(t || ''));
 
 async function llamarClaude(sistema, mensajes) {
   const r = await fetch('https://api.anthropic.com/v1/messages', {
@@ -221,8 +298,18 @@ async function procesar(waId, deps) {
           textos.push('[El cliente envió un archivo (' + (d.filename || d.message_type) + ') que no pude abrir]');
           conv.ultimo_payload_archivo = d; console.log('wasapi archivo sin URL:', JSON.stringify(d).slice(0, 1500)); // para ajustar la lectura de adjuntos
         }
-      } else if (['audio', 'video'].includes(d.message_type)) {
-        textos.push('[El cliente envió un ' + d.message_type + ' que no se puede escuchar; pídele amablemente que lo escriba]');
+      } else if (['audio', 'voice', 'ptt'].includes(d.message_type)) {
+        // Nota de voz: se transcribe y Daniela la responde como si fuera texto.
+        let dicho = '';
+        try {
+          const url = await urlDeArchivo(d);
+          if (url) { const f = await bajarArchivo(url); dicho = await transcribirAudio(f.buf, f.tipo); }
+          else { conv.ultimo_payload_archivo = d; console.log('wasapi audio sin URL:', JSON.stringify(d).slice(0, 1500)); }
+        } catch (e) { console.error('wasapi transcripción:', e.message); }
+        if (dicho) { textos.push('[Nota de voz del cliente, transcrita]: ' + dicho); archivos.push('nota de voz'); }
+        else textos.push('[El cliente envió una nota de voz que no se alcanzó a escuchar bien; pídele con amabilidad que la repita o la escriba, sin decir que no puedes escuchar audios]');
+      } else if (d.message_type === 'video') {
+        textos.push('[El cliente envió un video; dile con amabilidad que un consultor lo revisa y sigue con la siguiente pregunta pendiente]');
       }
     }
     const textoCliente = textos.join('\n').trim();
@@ -338,6 +425,16 @@ async function procesar(waId, deps) {
       console.log('wasapi: un humano tomó el chat durante la respuesta, se descarta');
       return;
     }
+    // 27/11/2026: cliente que llega por el link de redes de Daniela → nota de voz de bienvenida (una sola vez).
+    if (partes.length && !(perfil && perfil._audio_redes) && esDeRedes(historial.filter((m) => m.rol === 'cliente').slice(0, 2).map((m) => m.texto).join(' '))) {
+      const urlA = urlAudioRedes();
+      if (urlA) {
+        try {
+          const ra = await enviarAudio(waId, p.from_id, urlA);
+          if (ra.ok) { perfil._audio_redes = new Date().toISOString(); historial.push({ rol: 'daniela', texto: '[Nota de voz de bienvenida de la Dra. Daniela Gómez]', ts: new Date().toISOString(), sistema: true }); await new Promise((r) => setTimeout(r, 2500)); }
+        } catch (e) { console.error('wasapi audio redes:', e.message); }
+      } else console.log('wasapi: cliente de redes, pero no hay audio configurado (carpeta audios/ o AUDIO_REDES_URL)');
+    }
     if (partes.length) {
       for (const parte of partes) { if (await estaEnHumano(waId, deps)) { console.log('wasapi: humano intervino, se corta el envío'); return; } if (parte.trim()) { await enviarTexto(waId, p.from_id, parte.trim()); await new Promise((r) => setTimeout(r, 1200)); } }
       historial.push({ rol: 'daniela', texto: partes.join('\n\n'), ts: new Date().toISOString() });
@@ -447,8 +544,32 @@ module.exports = function montarWasapi(app, deps) {
     } catch (e) { console.error('wasapi webhook:', e); }
   });
 
+  // Archivos de audio públicos (Wasapi los descarga para enviarlos por WhatsApp)
+  app.get('/audios/:f', (req, res) => {
+    const f = path.basename(req.params.f || '');
+    const ruta = path.join(DIR_AUDIOS, f);
+    if (!/\.(ogg|mp3|m4a|aac)$/i.test(f) || !fs.existsSync(ruta)) return res.status(404).end();
+    res.type(({ ogg: 'audio/ogg', mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac' })[f.split('.').pop().toLowerCase()]);
+    res.sendFile(ruta);
+  });
+  // Prueba: /api/wasapi/prueba-audio?tel=3001234567&token=<WASAPI_WEBHOOK_TOKEN> → envía el audio de bienvenida a ese número
+  app.get('/api/wasapi/prueba-audio', async (req, res) => {
+    if (process.env.WASAPI_WEBHOOK_TOKEN && req.query.token !== process.env.WASAPI_WEBHOOK_TOKEN) return res.status(403).json({ error: 'token' });
+    const cel = String(req.query.tel || '').replace(/\D/g, '').slice(-10);
+    const url = urlAudioRedes();
+    if (!url) return res.json({ ok: false, error: 'No hay audio: suba audios/bienvenida_redes.mp3 al repositorio o ponga AUDIO_REDES_URL' });
+    const sb = deps.sbServicio();
+    const { data } = await sb.from('wasapi_conversaciones').select('wa_id,from_id').like('wa_id', '%' + cel).not('from_id', 'is', null).order('actualizado_en', { ascending: false }).limit(1);
+    const c = data && data[0];
+    if (!c) return res.json({ ok: false, error: 'Ese número no ha escrito al WhatsApp de Daniela (primero escríbale desde ese celular).' });
+    res.json(Object.assign({ url }, await enviarAudio(c.wa_id, c.from_id, url)));
+  });
+
   app.get('/api/wasapi/salud', (req, res) => res.json({
     ok: true,
+    escucha_notas_de_voz: sttActivo() ? (process.env.ELEVENLABS_API_KEY ? 'ElevenLabs' : 'OpenAI') : 'NO (falta ELEVENLABS_API_KEY u OPENAI_API_KEY)',
+    audio_bienvenida_redes: urlAudioRedes() || 'NO configurado',
+    ultimos_audios_enviados: ultimosAudios,
     wasapi_api_key: !!process.env.WASAPI_API_KEY,
     token_webhook: !!process.env.WASAPI_WEBHOOK_TOKEN,
     anthropic: !!process.env.ANTHROPIC_API_KEY,

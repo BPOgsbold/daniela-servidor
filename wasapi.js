@@ -131,8 +131,10 @@ const sttActivo = () => !!(process.env.ELEVENLABS_API_KEY || process.env.OPENAI_
 // Enviar audio (bienvenida de redes). Wasapi recibe el enlace público del archivo.
 // El archivo va en la carpeta "audios" del repositorio (bienvenida_redes.mp3/.ogg/.m4a) o en AUDIO_REDES_URL.
 const DIR_AUDIOS = path.join(__dirname, 'audios');
+// El audio puede estar en la carpeta "audios" o suelto junto a server.js (más fácil de subir a GitHub).
+function rutaAudio(n) { for (const d of [DIR_AUDIOS, __dirname]) { const r = path.join(d, n); if (fs.existsSync(r)) return r; } return null; }
 function archivoAudioRedes() {
-  for (const n of ['bienvenida_redes.ogg', 'bienvenida_redes.mp3', 'bienvenida_redes.m4a', 'bienvenida_redes.aac']) if (fs.existsSync(path.join(DIR_AUDIOS, n))) return n;
+  for (const n of ['bienvenida_redes.ogg', 'bienvenida_redes.mp3', 'bienvenida_redes.m4a', 'bienvenida_redes.aac']) if (rutaAudio(n)) return n;
   return null;
 }
 function urlAudioRedes() {
@@ -547,8 +549,8 @@ module.exports = function montarWasapi(app, deps) {
   // Archivos de audio públicos (Wasapi los descarga para enviarlos por WhatsApp)
   app.get('/audios/:f', (req, res) => {
     const f = path.basename(req.params.f || '');
-    const ruta = path.join(DIR_AUDIOS, f);
-    if (!/\.(ogg|mp3|m4a|aac)$/i.test(f) || !fs.existsSync(ruta)) return res.status(404).end();
+    const ruta = /\.(ogg|mp3|m4a|aac)$/i.test(f) ? rutaAudio(f) : null;
+    if (!ruta) return res.status(404).end();
     res.type(({ ogg: 'audio/ogg', mp3: 'audio/mpeg', m4a: 'audio/mp4', aac: 'audio/aac' })[f.split('.').pop().toLowerCase()]);
     res.sendFile(ruta);
   });

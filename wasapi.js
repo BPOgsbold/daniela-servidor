@@ -139,7 +139,7 @@ function archivoAudioRedes() {
 }
 function urlAudioRedes() {
   if (process.env.AUDIO_REDES_URL) return process.env.AUDIO_REDES_URL;
-  const n = archivoAudioRedes(); const base = (process.env.SERVIDOR_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, '');
+  const n = archivoAudioRedes(); const base = (process.env.SERVIDOR_URL || process.env.RENDER_EXTERNAL_URL || 'https://daniela-servidor.onrender.com').replace(/\/+$/, '');
   return n && base ? base + '/audios/' + n : null;
 }
 const ultimosAudios = [];
@@ -570,7 +570,8 @@ module.exports = function montarWasapi(app, deps) {
   app.get('/api/wasapi/salud', (req, res) => res.json({
     ok: true,
     escucha_notas_de_voz: sttActivo() ? (process.env.ELEVENLABS_API_KEY ? 'ElevenLabs' : 'OpenAI') : 'NO (falta ELEVENLABS_API_KEY u OPENAI_API_KEY)',
-    audio_bienvenida_redes: urlAudioRedes() || 'NO configurado',
+    audio_bienvenida_redes: urlAudioRedes() || 'NO configurado (no encuentro bienvenida_redes.ogg/.mp3 en el servidor)',
+    version_wasapi: 'v73b',
     ultimos_audios_enviados: ultimosAudios,
     wasapi_api_key: !!process.env.WASAPI_API_KEY,
     token_webhook: !!process.env.WASAPI_WEBHOOK_TOKEN,

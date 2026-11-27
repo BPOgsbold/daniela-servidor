@@ -1,0 +1,212 @@
+// CONTROL DE PAGOS (honorarios) — 27/11/2026
+// - Busca en TODAS las carpetas de clientes de SharePoint los soportes de pago (no UPME).
+// - La IA lee cada soporte: valor, fecha de pago, medio y referencia. Queda en la tabla pagos_honorarios
+//   (una fila por archivo; nunca se lee dos veces el mismo archivo).
+// - Cruza con BD_Cliente_GLA / Perfilamiento: fecha en que se creó el cliente, convenio y teléfono.
+// - El equipo revisa/corrige en el panel (pestaña "Control de pagos"); también se pueden registrar pagos a mano.
+// Tabla: pagos_honorarios.sql
+//
+// POST /api/pagos/escanear {mes:'AAAA-MM'}   → inicia la búsqueda en SharePoint (en segundo plano)
+// GET  /api/pagos/escanear/estado            → avance de la búsqueda
+// GET  /api/pagos/lista?mes=AAAA-MM          → pagos del mes
+// POST /api/pagos/editar {id, ...}           → corrige valor/fecha/estado/nota
+// POST /api/pagos/manual {...}               → registra un pago a mano
+// GET  /api/pagos/auto                       → (tarea programada) busca los del mes actual, máx. 1 vez cada 3 h
+
+const digitos = (t) => String(t == null ? '' : t).replace(/\D/g, '');
+const fechaBog = (d = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZone: 'America/Bogota' }).format(d);
+const finDeMes = (mes) => { const d = new Date(Date.UTC(+mes.slice(0, 4), +mes.slice(5, 7), 0)); return d.toISOString().slice(0, 10); };
+const sumarDias = (f, n) => { const d = new Date(f + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+const ES_PAGO = /pago|comprobante|transferencia|consignaci|recibo|soporte de pago|nequi|daviplata|bancolombia|pse/i;
+
+function convenioDe(t) {
+  t = String(t || '').toLowerCase();
+  if (t.includes('sura')) return 'SURA';
+  if (t.includes('epm') || t.includes('fepep')) return 'EPM';
+  if (t.includes('confamilia') || t.includes('familia')) return 'Confamilia';
+  if (t.includes('referix')) return 'ReferiX';
+  if (/\brrss\b|redes|instagram/.test(t)) return 'Redes Daniela';
+  return t ? 'Otros' : 'Sin dato';
+}
+
+const PROMPT = `Eres auxiliar contable de Gómez Legal Abogados. Te muestro UN archivo de la carpeta de un cliente que parece un soporte de pago.
+Responde SOLO un JSON válido, sin texto extra:
+{"es_pago":true|false,"es_upme":true|false,"valor":numero_en_pesos_o_null,"fecha_pago":"AAAA-MM-DD" o null,"medio":"Bancolombia|Nequi|Daviplata|PSE|Davivienda|Efectivo|Otro" o null,"referencia":"número de comprobante/aprobación" o null,"pagador":"nombre de quien paga" o null,"destinatario":"a quién se pagó" o null,"observacion":"texto corto" o null}
+Reglas:
+- es_pago=true solo si es un comprobante real de un pago/transferencia ya hecho (no una factura de compra del carro, no una certificación bancaria, no un RUT).
+- es_upme=true si el pago es a la UPME (Unidad de Planeación Minero Energética, tarifa del certificado) y no a Gómez Legal.
+- valor: el monto pagado, en pesos, número sin puntos ni signos (ej. 352000). Si hay varios, el total transferido.
+- fecha_pago: la fecha de la transacción.`;
+
+async function leerSoporte(buf, mime, nombre, llamarClaude) {
+  const b64 = buf.toString('base64');
+  let bloque = null;
+  if (/pdf/i.test(mime || '') || /\.pdf$/i.test(nombre || '')) bloque = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: b64 } };
+  else {
+    const m = String(mime || '').toLowerCase();
+    const tipo = /png/.test(m) || /\.png$/i.test(nombre) ? 'image/png' : /webp/.test(m) ? 'image/webp' : /gif/.test(m) ? 'image/gif' : (/jpe?g/.test(m) || /\.jpe?g$/i.test(nombre) ? 'image/jpeg' : null);
+    if (tipo) bloque = { type: 'image', source: { type: 'base64', media_type: tipo, data: b64 } };
+  }
+  if (!bloque) return null;
+  if (buf.length > 18 * 1024 * 1024) return null;
+  const txt = await llamarClaude(PROMPT, [{ role: 'user', content: [bloque, { type: 'text', text: 'Archivo: ' + nombre }] }]);
+  const m = String(txt).match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try { return JSON.parse(m[0]); } catch (_) { return null; }
+}
+
+function montarRecaudo(app, { exigirEquipo, sbServicio }) {
+  const sp = require('./sharepoint');
+  const llamarClaude = (s, m) => require('./wasapi').ia.llamarClaude(s, m);
+  const estado = { corriendo: false, mes: null, carpetas: 0, revisadas: 0, soportes: 0, nuevos: 0, errores: 0, inicio: null, fin: null, ultimo_error: null };
+  let ultimoAuto = 0;
+
+  async function datosCliente(sb, ced) {
+    if (!ced) return {};
+    const { data: clis } = await sb.from('BD_Cliente_GLA').select('*').eq('numero_identificacion', ced).limit(5);
+    let cli = (clis || [])[0];
+    if (!cli) { const r = await sb.from('BD_Cliente_GLA').select('*').ilike('numero_identificacion', '%' + ced + '%').limit(1); cli = (r.data || [])[0]; }
+    let caso = null;
+    if (cli && cli.caso_id) { const r = await sb.from('Perfilamiento_y_ventas_GLA').select('*').eq('id', cli.caso_id).maybeSingle(); caso = r.data; }
+    if (!caso) { const r = await sb.from('Perfilamiento_y_ventas_GLA').select('*').ilike('cedula', '%' + ced + '%').limit(1); caso = (r.data || [])[0] || null; }
+    const fuente = (cli && cli.fuente) || (caso && caso.fuente) || (caso && caso.campana) || '';
+    return {
+      cliente_id: cli ? String(cli.id) : null, caso_id: caso ? String(caso.id) : (cli && cli.caso_id ? String(cli.caso_id) : null),
+      nombre: (cli && cli.nombre_cliente) || (caso && (caso.nombre_completo || caso.nombre)) || null,
+      telefono: digitos((cli && cli.telefono) || (caso && (caso.telefono || caso.celular)) || '').slice(-10) || null,
+      convenio: convenioDe(fuente),
+      fecha_creacion_cliente: (cli && (cli.creado_en || cli.created_at)) || null,
+      fecha_lead: (caso && (caso.created_at || caso.creado_en)) || null,
+    };
+  }
+
+  async function escanear(mes) {
+    if (estado.corriendo) return;
+    Object.assign(estado, { corriendo: true, mes, carpetas: 0, revisadas: 0, soportes: 0, nuevos: 0, errores: 0, inicio: new Date().toISOString(), fin: null, ultimo_error: null });
+    const sb = sbServicio();
+    const desde = mes + '-01', hasta = sumarDias(finDeMes(mes), 10); // un soporte del 30 se puede subir unos días después
+    try {
+      if (!sp.configurado || !sp.configurado()) throw new Error('SharePoint no está configurado en el servidor');
+      const carpetas = (await sp.listarCarpetasClientes()) || [];
+      estado.carpetas = carpetas.length;
+      const { data: ya } = await sb.from('pagos_honorarios').select('sp_item_id').not('sp_item_id', 'is', null).limit(20000);
+      const vistos = new Set((ya || []).map((x) => x.sp_item_id));
+      let i = 0;
+      const trabajar = async () => {
+        while (i < carpetas.length) {
+          const c = carpetas[i++];
+          try {
+            const r = await sp.listarDocumentosDeCarpeta(String(c.id));
+            for (const a of (r && r.archivos) || []) {
+              if (a.subcarpeta && /^paquete dian/i.test(a.subcarpeta)) continue;
+              const texto = String(a.tipo || '') + ' ' + String(a.nombre || '');
+              if (!ES_PAGO.test(texto) || /upme/i.test(a.nombre || '') || /certificaci[oó]n bancaria|bancaria/i.test(texto)) continue;
+              const dia = a.modificado ? fechaBog(new Date(a.modificado)) : '';
+              if (!dia || dia < desde || dia > hasta) continue;
+              estado.soportes++;
+              if (vistos.has(a.id)) continue;
+              vistos.add(a.id);
+              const ced = digitos(c.cedula || String(c.nombre || '').split('-')[0]);
+              const nomCarpeta = String(c.nombre || '').replace(/^\s*\d+\s*-\s*/, '').trim();
+              let leido = null, link = r.webUrl || null, err = null;
+              try {
+                const e = await sp.enlaceDeArchivo(a.id);
+                link = e.webUrl || link;
+                const resp = await fetch(e.url);
+                if (!resp.ok) throw new Error('descarga ' + resp.status);
+                const buf = Buffer.from(await resp.arrayBuffer());
+                leido = await leerSoporte(buf, e.mime || a.mime, a.nombre, llamarClaude);
+              } catch (e) { err = e.message; }
+              const cli = await datosCliente(sb, ced).catch(() => ({}));
+              const noEs = leido && (leido.es_pago === false || leido.es_upme === true);
+              const fila = {
+                sp_item_id: a.id, cedula: ced || null, nombre: cli.nombre || nomCarpeta || null, telefono: cli.telefono || null,
+                cliente_id: cli.cliente_id || null, caso_id: cli.caso_id || null, convenio: cli.convenio || 'Sin dato',
+                fecha_creacion_cliente: cli.fecha_creacion_cliente || null, fecha_lead: cli.fecha_lead || null,
+                fecha_pago: (leido && /^\d{4}-\d{2}-\d{2}$/.test(String(leido.fecha_pago || '')) ? leido.fecha_pago : dia),
+                valor: leido && Number(leido.valor) > 0 ? Math.round(Number(leido.valor)) : null,
+                medio: (leido && leido.medio) || null, referencia: (leido && leido.referencia) ? String(leido.referencia).slice(0, 80) : null,
+                archivo: a.nombre, link, carpeta_link: r.webUrl || null, origen: 'SharePoint',
+                estado: noEs ? 'no_es_pago' : 'por_revisar',
+                nota: noEs ? (leido.es_upme ? 'La IA lo leyó como pago a la UPME' : 'La IA no lo reconoce como comprobante de pago') : (err ? 'No se pudo leer: ' + err : (!leido ? 'Revisar a mano: la IA no pudo leer el archivo' : null)),
+                leido_ia: leido || null, subido_en: a.modificado || null,
+              };
+              const { error } = await sb.from('pagos_honorarios').insert(fila);
+              if (error) { estado.errores++; estado.ultimo_error = error.message; if (/does not exist|relation/i.test(error.message)) throw new Error('Falta crear la tabla pagos_honorarios (ejecutar pagos_honorarios.sql en Supabase)'); }
+              else estado.nuevos++;
+            }
+          } catch (e) { if (/Falta crear la tabla/.test(e.message)) throw e; estado.errores++; estado.ultimo_error = e.message; }
+          estado.revisadas++;
+        }
+      };
+      await Promise.all(Array.from({ length: 5 }, trabajar));
+    } catch (e) { estado.ultimo_error = e.message; console.error('[recaudo]', e.message); }
+    estado.corriendo = false; estado.fin = new Date().toISOString();
+    console.log(`[recaudo] ${mes}: ${estado.revisadas}/${estado.carpetas} carpetas, ${estado.soportes} soportes, ${estado.nuevos} nuevos, ${estado.errores} errores`);
+  }
+
+  const mesValido = (m) => (/^\d{4}-\d{2}$/.test(String(m || '')) ? m : fechaBog().slice(0, 7));
+
+  app.post('/api/pagos/escanear', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    const mes = mesValido(req.body && req.body.mes);
+    if (!estado.corriendo) escanear(mes);
+    res.json(estado);
+  });
+  app.get('/api/pagos/escanear/estado', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    res.json(estado);
+  });
+  app.get('/api/pagos/auto', (req, res) => {
+    if (!estado.corriendo && Date.now() - ultimoAuto > 3 * 3600e3) { ultimoAuto = Date.now(); escanear(fechaBog().slice(0, 7)); }
+    res.json({ ok: true, corriendo: estado.corriendo });
+  });
+
+  app.get('/api/pagos/lista', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    const mes = mesValido(req.query.mes);
+    const sb = sbServicio();
+    const { data, error } = await sb.from('pagos_honorarios').select('*')
+      .gte('fecha_pago', mes + '-01').lte('fecha_pago', finDeMes(mes)).order('fecha_pago', { ascending: true }).limit(5000);
+    if (error) return res.status(500).json({ error: /does not exist|relation/i.test(error.message) ? 'Falta crear la tabla pagos_honorarios: ejecuta pagos_honorarios.sql en Supabase.' : error.message });
+    res.json({ mes, pagos: data || [], escaneo: estado });
+  });
+
+  const CAMPOS_EDIT = ['valor', 'fecha_pago', 'estado', 'nota', 'medio', 'referencia', 'convenio', 'nombre', 'telefono'];
+  app.post('/api/pagos/editar', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    const b = req.body || {};
+    if (!b.id) return res.status(400).json({ error: 'Falta id' });
+    const cambios = {};
+    for (const k of CAMPOS_EDIT) if (k in b) cambios[k] = b[k] === '' ? null : b[k];
+    if ('valor' in cambios && cambios.valor != null) cambios.valor = Math.round(Number(digitos(cambios.valor)) || 0) || null;
+    if ('estado' in cambios && !['por_revisar', 'confirmado', 'no_es_pago', 'duplicado'].includes(cambios.estado)) return res.status(400).json({ error: 'Estado no válido' });
+    cambios.revisado_por = ctx.email; cambios.revisado_en = new Date().toISOString();
+    const { data, error } = await sbServicio().from('pagos_honorarios').update(cambios).eq('id', b.id).select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, pago: data });
+  });
+
+  app.post('/api/pagos/manual', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    const b = req.body || {};
+    const ced = digitos(b.cedula);
+    const valor = Math.round(Number(digitos(b.valor)) || 0);
+    if (!ced || !valor || !/^\d{4}-\d{2}-\d{2}$/.test(String(b.fecha_pago || ''))) return res.status(400).json({ error: 'Faltan cédula, valor o fecha de pago.' });
+    const sb = sbServicio();
+    const cli = await datosCliente(sb, ced).catch(() => ({}));
+    const { data, error } = await sb.from('pagos_honorarios').insert({
+      cedula: ced, nombre: b.nombre || cli.nombre || null, telefono: cli.telefono || null, cliente_id: cli.cliente_id || null, caso_id: cli.caso_id || null,
+      convenio: cli.convenio || 'Sin dato', fecha_creacion_cliente: cli.fecha_creacion_cliente || null, fecha_lead: cli.fecha_lead || null,
+      fecha_pago: b.fecha_pago, valor, medio: b.medio || null, referencia: b.referencia || null, nota: b.nota || null,
+      origen: 'Manual', estado: 'confirmado', revisado_por: ctx.email, revisado_en: new Date().toISOString(),
+    }).select().single();
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, pago: data });
+  });
+
+  // Mientras el servidor esté despierto, revisa el mes actual cada 3 horas (así el registro se va llenando solo).
+  setInterval(() => { if (!estado.corriendo && Date.now() - ultimoAuto > 3 * 3600e3) { ultimoAuto = Date.now(); escanear(fechaBog().slice(0, 7)); } }, 30 * 60e3).unref();
+}
+
+module.exports = { montarRecaudo, convenioDe, leerSoporte };

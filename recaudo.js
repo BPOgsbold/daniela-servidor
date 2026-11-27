@@ -84,7 +84,9 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     if (estado.corriendo) return;
     Object.assign(estado, { corriendo: true, mes, carpetas: 0, revisadas: 0, soportes: 0, nuevos: 0, errores: 0, inicio: new Date().toISOString(), fin: null, ultimo_error: null });
     const sb = sbServicio();
-    const desde = mes + '-01', hasta = sumarDias(finDeMes(mes), 10); // un soporte del 30 se puede subir unos días después
+    // mes = 'todo' → todo el historial (todas las fechas)
+    const desde = mes === 'todo' ? '2000-01-01' : mes + '-01';
+    const hasta = mes === 'todo' ? sumarDias(fechaBog(), 1) : sumarDias(finDeMes(mes), 10); // un soporte del 30 se puede subir unos días después
     try {
       if (!sp.configurado || !sp.configurado()) throw new Error('SharePoint no está configurado en el servidor');
       const carpetas = (await sp.listarCarpetasClientes()) || [];
@@ -145,7 +147,7 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     console.log(`[recaudo] ${mes}: ${estado.revisadas}/${estado.carpetas} carpetas, ${estado.soportes} soportes, ${estado.nuevos} nuevos, ${estado.errores} errores`);
   }
 
-  const mesValido = (m) => (/^\d{4}-\d{2}$/.test(String(m || '')) ? m : fechaBog().slice(0, 7));
+  const mesValido = (m) => (m === 'todo' || /^\d{4}-\d{2}$/.test(String(m || '')) ? m : fechaBog().slice(0, 7));
 
   app.post('/api/pagos/escanear', async (req, res) => {
     const ctx = await exigirEquipo(req, res); if (!ctx) return;
@@ -166,8 +168,9 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     const ctx = await exigirEquipo(req, res); if (!ctx) return;
     const mes = mesValido(req.query.mes);
     const sb = sbServicio();
-    const { data, error } = await sb.from('pagos_honorarios').select('*')
-      .gte('fecha_pago', mes + '-01').lte('fecha_pago', finDeMes(mes)).order('fecha_pago', { ascending: true }).limit(5000);
+    let q = sb.from('pagos_honorarios').select('*');
+    if (mes !== 'todo') q = q.gte('fecha_pago', mes + '-01').lte('fecha_pago', finDeMes(mes));
+    const { data, error } = await q.order('fecha_pago', { ascending: true }).limit(20000);
     if (error) return res.status(500).json({ error: /does not exist|relation/i.test(error.message) ? 'Falta crear la tabla pagos_honorarios: ejecuta pagos_honorarios.sql en Supabase.' : error.message });
     res.json({ mes, pagos: data || [], escaneo: estado });
   });

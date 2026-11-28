@@ -279,11 +279,13 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
       clientes.push({ caso_id: c.id, nombre, cedula: k || '', telefono: digitos(c.telefono || (cli && cli.telefono) || '').slice(-10),
         fuente: c.fuente || (cli && cli.fuente) || c.campana || '', convenio: convenioDe(c.fuente || (cli && cli.fuente) || c.campana), asesor: c.asesor || '', servicio: c.servicio_contratado || '',
         placa, vehiculos: nVeh, vehiculo_n: idxVeh + 1,
-        cliente_desde: desde, estado_pago: !susPagos.length ? 'sin_soporte' : susPagos.length < nVeh && idxVeh >= susPagos.length ? 'parcial' : susPagos.some((x) => x.estado === 'confirmado') ? 'confirmado' : 'por_revisar',
-        n_pagos: susPagos.length, valor: susPagos.reduce((a, x) => a + (Number(x.valor) || 0), 0), sin_valor: susPagos.some((x) => !x.valor), ultimo_pago: ult ? ult.fecha_pago : null,
+        // 28/11/2026: el cliente con 2 o 3 vehículos paga TODO en un solo pago → ese pago cubre todos sus vehículos.
+        cliente_desde: desde, estado_pago: !susPagos.length ? 'sin_soporte' : susPagos.some((x) => x.estado === 'confirmado') ? 'confirmado' : 'por_revisar',
+        n_pagos: susPagos.length, valor: susPagos.reduce((a, x) => a + (Number(x.valor) || 0), 0),
+        valor_bajo: nVeh > 1 && susPagos.length > 0 && susPagos.reduce((a, x) => a + (Number(x.valor) || 0), 0) / nVeh < 300000, sin_valor: susPagos.some((x) => !x.valor), ultimo_pago: ult ? ult.fecha_pago : null,
         carpeta_id: car ? car.id : null, carpeta_link: car ? car.webUrl : null, cedula_carpeta: cedCarpeta && cedCarpeta !== k ? cedCarpeta : null });
       // Ya tiene pago (con su cédula o la de su carpeta). Con varios vehículos: falta pago si hay menos pagos que vehículos.
-      if (susPagos.length && (susPagos.length >= nVeh || idxVeh < susPagos.length)) return;
+      if (susPagos.length) return;
       sinSoporte.push({ caso_id: c.id, cliente_id: cli ? cli.id : null, nombre, cedula: k || '', telefono: digitos(c.telefono || (cli && cli.telefono) || '').slice(-10),
         fuente: c.fuente || (cli && cli.fuente) || c.campana || '', convenio: convenioDe(c.fuente || (cli && cli.fuente) || c.campana), asesor: c.asesor || '', servicio: c.servicio_contratado || '',
         cliente_desde: desde, dias: desde ? Math.floor((hoy - new Date(desde).getTime()) / 864e5) : null,

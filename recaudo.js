@@ -157,8 +157,8 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
 
   app.post('/api/pagos/escanear', async (req, res) => {
     const ctx = await exigirEquipo(req, res); if (!ctx) return;
-    const mes = mesValido(req.body && req.body.mes);
-    if (!estado.corriendo) escanear(mes);
+    // 28/11/2026: la búsqueda SIEMPRE revisa todas las fechas (lo ya leído no se vuelve a leer), así nunca se queda un mes por fuera.
+    if (!estado.corriendo) escanear('todo');
     res.json(estado);
   });
   app.get('/api/pagos/escanear/estado', async (req, res) => {
@@ -166,7 +166,7 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     res.json(estado);
   });
   app.get('/api/pagos/auto', (req, res) => {
-    if (!estado.corriendo && Date.now() - ultimoAuto > 3 * 3600e3) { ultimoAuto = Date.now(); escanear(fechaBog().slice(0, 7)); }
+    if (!estado.corriendo && Date.now() - ultimoAuto > 3 * 3600e3) { ultimoAuto = Date.now(); escanear('todo'); }
     res.json({ ok: true, corriendo: estado.corriendo });
   });
 
@@ -200,6 +200,17 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     const { data, error } = await sbServicio().from('pagos_honorarios').update(cambios).eq('id', b.id).select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.json({ ok: true, pago: data });
+  });
+
+  // Confirmar varios pagos de una vez (los que ya tienen valor leído)
+  app.post('/api/pagos/confirmar-varios', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids.slice(0, 2000) : [];
+    if (!ids.length) return res.json({ ok: true, n: 0 });
+    const { data, error } = await sbServicio().from('pagos_honorarios').update({ estado: 'confirmado', revisado_por: ctx.email, revisado_en: new Date().toISOString() })
+      .in('id', ids).eq('estado', 'por_revisar').not('valor', 'is', null).select('id');
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, n: (data || []).length });
   });
 
   app.post('/api/pagos/manual', async (req, res) => {
@@ -345,7 +356,9 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
   });
 
   // Mientras el servidor esté despierto, revisa el mes actual cada 3 horas (así el registro se va llenando solo).
-  setInterval(() => { if (!estado.corriendo && Date.now() - ultimoAuto > 3 * 3600e3) { ultimoAuto = Date.now(); escanear(fechaBog().slice(0, 7)); } }, 30 * 60e3).unref();
+  setInterval(() => { if (!estado.corriendo && Date.now() - ultimoAuto > 3 * 3600e3) { ultimoAuto = Date.now(); escanear('todo'); } }, 30 * 60e3).unref();
+  // Al arrancar el servidor (Render lo despierta), una revisión completa a los 2 minutos.
+  setTimeout(() => { if (!estado.corriendo) { ultimoAuto = Date.now(); escanear('todo'); } }, 2 * 60e3).unref();
 }
 
 module.exports = { montarRecaudo, convenioDe, leerSoporte };

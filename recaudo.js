@@ -83,16 +83,18 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     };
   }
 
-  async function escanear(mes) {
+  async function escanear(mes, soloCarpetas) {
     if (estado.corriendo) return;
     Object.assign(estado, { corriendo: true, mes, carpetas: 0, revisadas: 0, soportes: 0, nuevos: 0, errores: 0, inicio: new Date().toISOString(), fin: null, ultimo_error: null });
     const sb = sbServicio();
     // mes = 'todo' → todo el historial (todas las fechas)
-    const desde = mes === 'todo' ? '2000-01-01' : mes + '-01';
-    const hasta = mes === 'todo' ? sumarDias(fechaBog(), 1) : sumarDias(finDeMes(mes), 10); // un soporte del 30 se puede subir unos días después
+    const sinFecha = mes === 'todo' || mes === 'clientes';
+    const desde = sinFecha ? '2000-01-01' : mes + '-01';
+    const hasta = sinFecha ? sumarDias(fechaBog(), 1) : sumarDias(finDeMes(mes), 10); // un soporte del 30 se puede subir unos días después
     try {
       if (!sp.configurado || !sp.configurado()) throw new Error('SharePoint no está configurado en el servidor');
-      const carpetas = (await sp.listarCarpetasClientes()) || [];
+      let carpetas = (await sp.listarCarpetasClientes()) || [];
+      if (Array.isArray(soloCarpetas)) { const set = new Set(soloCarpetas.map(String)); carpetas = carpetas.filter((c) => set.has(String(c.id))); }
       estado.carpetas = carpetas.length;
       const { data: ya, error: errYa } = await todo(() => sb.from('pagos_honorarios').select('id,sp_item_id').not('sp_item_id', 'is', null).order('id'));
       if (errYa && /does not exist|schema cache|relation/i.test(errYa.message)) throw new Error('Falta crear la tabla pagos_honorarios (ejecutar pagos_honorarios.sql en Supabase)');
@@ -186,6 +188,14 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     for (const k of CAMPOS_EDIT) if (k in b) cambios[k] = b[k] === '' ? null : b[k];
     if ('valor' in cambios && cambios.valor != null) cambios.valor = Math.round(Number(digitos(cambios.valor)) || 0) || null;
     if ('estado' in cambios && !['por_revisar', 'confirmado', 'no_es_pago', 'duplicado'].includes(cambios.estado)) return res.status(400).json({ error: 'Estado no válido' });
+    // Corregir la cédula: se vuelve a cruzar con el cliente correcto (nombre, teléfono, convenio, fechas).
+    if (b.cedula !== undefined && digitos(b.cedula)) {
+      cambios.cedula = digitos(b.cedula);
+      const cli = await datosCliente(sbServicio(), cambios.cedula).catch(() => ({}));
+      Object.assign(cambios, { cliente_id: cli.cliente_id || null, caso_id: cli.caso_id || null, telefono: cli.telefono || null, fecha_creacion_cliente: cli.fecha_creacion_cliente || null, fecha_lead: cli.fecha_lead || null });
+      if (cli.nombre) cambios.nombre = cli.nombre;
+      if (cli.convenio) cambios.convenio = cli.convenio;
+    }
     cambios.revisado_por = ctx.email; cambios.revisado_en = new Date().toISOString();
     const { data, error } = await sbServicio().from('pagos_honorarios').update(cambios).eq('id', b.id).select().single();
     if (error) return res.status(500).json({ error: error.message });
@@ -211,47 +221,127 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
   });
 
   // CRUCE: clientes (estado Cliente) SIN soporte de pago, y pagos de personas que NO están en estado Cliente.
+  const normNom = (t) => String(t || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-zñ ]/g, ' ').split(/\s+/).filter((w) => w.length > 1);
+  async function cruceDatos(sb) {
+    const [casosR, clisR, pagosR] = await Promise.all([
+      todo(() => sb.from('Perfilamiento_y_ventas_GLA').select('*').order('id')),
+      todo(() => sb.from('BD_Cliente_GLA').select('*').order('id')),
+      todo(() => sb.from('pagos_honorarios').select('*').in('estado', ['por_revisar', 'confirmado']).order('id')),
+    ]);
+    if (pagosR.error) throw new Error(/does not exist|schema cache|relation/i.test(pagosR.error.message) ? 'Falta crear la tabla pagos_honorarios en Supabase.' : pagosR.error.message);
+    const casos = casosR.data || [], clis = clisR.data || [], pagos = pagosR.data || [];
+    let carpetas = [];
+    try { if (sp.configurado && sp.configurado()) carpetas = (await sp.listarCarpetasClientes()) || []; } catch (e) { console.error('[recaudo] carpetas:', e.message); }
+    const carpetaDe = {}; carpetas.forEach((c) => { const k = digitos(c.cedula); if (k && !carpetaDe[k]) carpetaDe[k] = c; });
+    // Si la cédula del caso no tiene carpeta, se busca la carpeta por NOMBRE (todas las palabras del nombre de la carpeta están en el nombre del cliente).
+    const carpetaPorNombre = (nombre) => {
+      const t = new Set(normNom(nombre)); if (t.size < 2) return null;
+      const hall = carpetas.filter((c) => { const w = normNom(String(c.nombre || '').replace(/^\s*\d+\s*-\s*/, '')); return w.length >= 2 && w.every((x) => t.has(x)); });
+      return hall.length === 1 ? hall[0] : null;
+    };
+    const cliDe = {}; clis.forEach((c) => { const k = digitos(c.numero_identificacion); if (k && !cliDe[k]) cliDe[k] = c; });
+    const pagadas = {}; pagos.forEach((p) => { const k = digitos(p.cedula); if (k) (pagadas[k] = pagadas[k] || []).push(p); });
+    const estadoDe = {}; casos.forEach((c) => { const k = digitos(c.numero_identificacion); if (!k) return; const e = estadoDe[k]; if (!e || c.estado_pipeline === 'Cliente') estadoDe[k] = c; });
+    const hoy = Date.now();
+    const cedEquiv = {}; // cédula de la carpeta ↔ cédula del caso cuando difieren
+
+    const sinSoporte = [];
+    casos.filter((c) => c.estado_pipeline === 'Cliente').forEach((c) => {
+      const k = digitos(c.numero_identificacion);
+      const nombre = c.nombre_cliente || (cliDe[k] && cliDe[k].nombre_cliente) || '';
+      let car = (k && carpetaDe[k]) || null, por = car ? 'cedula' : null;
+      if (!car) { car = carpetaPorNombre(nombre); if (car) por = 'nombre'; }
+      const cedCarpeta = car ? digitos(car.cedula) : '';
+      if (cedCarpeta && k && cedCarpeta !== k) { cedEquiv[cedCarpeta] = k; }
+      if ((k && pagadas[k]) || (cedCarpeta && pagadas[cedCarpeta])) return; // ya tiene pago (con su cédula o con la de su carpeta)
+      const cli = cliDe[k] || null;
+      const desde = (cli && cli.creado_en) || c.created_at || null;
+      sinSoporte.push({ caso_id: c.id, cliente_id: cli ? cli.id : null, nombre, cedula: k || '', telefono: digitos(c.telefono || (cli && cli.telefono) || '').slice(-10),
+        fuente: c.fuente || (cli && cli.fuente) || c.campana || '', convenio: convenioDe(c.fuente || (cli && cli.fuente) || c.campana), asesor: c.asesor || '', servicio: c.servicio_contratado || '',
+        cliente_desde: desde, dias: desde ? Math.floor((hoy - new Date(desde).getTime()) / 864e5) : null,
+        carpeta_id: car ? car.id : null, carpeta_link: car ? car.webUrl : null, carpeta: car ? car.nombre : null, carpeta_por: por,
+        cedula_carpeta: cedCarpeta && cedCarpeta !== k ? cedCarpeta : null });
+    });
+    sinSoporte.sort((a, b) => (b.dias || 0) - (a.dias || 0));
+
+    const pagoNoCliente = [];
+    Object.entries(pagadas).forEach(([k, lista]) => {
+      const caso = estadoDe[k] || estadoDe[cedEquiv[k]];
+      if (caso && caso.estado_pipeline === 'Cliente') return;
+      const p = lista.slice().sort((a, b) => String(b.fecha_pago).localeCompare(String(a.fecha_pago)))[0];
+      pagoNoCliente.push({ pago_id: p.id, nombre: p.nombre || (caso && caso.nombre_cliente) || '', cedula: k, telefono: p.telefono || digitos(caso && caso.telefono).slice(-10), convenio: p.convenio,
+        fuente: (caso && caso.fuente) || '', valor: lista.reduce((s2, x) => s2 + (Number(x.valor) || 0), 0), pagos: lista.length, fecha_pago: p.fecha_pago, link: p.link,
+        estado_embudo: caso ? (caso.estado_pipeline || 'Sin estado') : 'No está en el embudo', caso_id: caso ? caso.id : null, asesor: caso ? caso.asesor || '' : '',
+        carpeta_link: (carpetaDe[k] && carpetaDe[k].webUrl) || p.carpeta_link || null });
+    });
+    pagoNoCliente.sort((a, b) => String(b.fecha_pago).localeCompare(String(a.fecha_pago)));
+    return { sinSoporte, pagoNoCliente, carpetasLeidas: carpetas.length };
+  }
   app.get('/api/pagos/cruce', async (req, res) => {
     const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    try { res.json(await cruceDatos(sbServicio())); }
+    catch (e) { console.error('[recaudo] cruce:', e.message); res.status(500).json({ error: e.message }); }
+  });
+  // ---- Ajuste desde el panel, sin entrar a SharePoint ----
+  // Archivos de la carpeta del cliente
+  app.get('/api/pagos/archivos-carpeta', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    try {
+      const r = await sp.listarDocumentosDeCarpeta(String(req.query.carpeta_id || ''));
+      const { data: usados } = await sbServicio().from('pagos_honorarios').select('sp_item_id,estado,cedula,valor').in('sp_item_id', (r.archivos || []).map((a) => a.id).slice(0, 300));
+      const uso = {}; (usados || []).forEach((u) => { uso[u.sp_item_id] = u; });
+      res.json({ carpeta: r.carpeta, webUrl: r.webUrl, archivos: (r.archivos || []).map((a) => ({ id: a.id, nombre: a.nombre, tipo: a.tipo, modificado: a.modificado, subcarpeta: a.subcarpeta,
+        parece_pago: ES_PAGO.test(String(a.tipo || '') + ' ' + String(a.nombre || '')) && !/upme|bancaria/i.test(a.nombre || ''), registrado: uso[a.id] || null })) });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+  // Enlace temporal para ver un archivo
+  app.get('/api/pagos/ver-archivo', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    try { const e = await sp.enlaceDeArchivo(String(req.query.id || '')); res.json({ url: e.url, webUrl: e.webUrl, nombre: e.nombre }); }
+    catch (e) { res.status(500).json({ error: e.message }); }
+  });
+  // "Este es el pago": la IA lee ese archivo y lo registra a nombre del cliente del caso (con la cédula CORRECTA del caso).
+  // Si ese archivo ya estaba registrado (p. ej. con otra cédula o como "no es pago"), se corrige ese mismo registro.
+  app.post('/api/pagos/usar-archivo', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    const b = req.body || {};
+    const ced = digitos(b.cedula);
+    if (!b.sp_item_id || !ced) return res.status(400).json({ error: 'Faltan el archivo o la cédula del cliente.' });
     try {
       const sb = sbServicio();
-      const [casosR, clisR, pagosR] = await Promise.all([
-        todo(() => sb.from('Perfilamiento_y_ventas_GLA').select('*').order('id')),
-        todo(() => sb.from('BD_Cliente_GLA').select('*').order('id')),
-        todo(() => sb.from('pagos_honorarios').select('*').in('estado', ['por_revisar', 'confirmado']).order('id')),
-      ]);
-      if (pagosR.error) return res.status(500).json({ error: /does not exist|schema cache|relation/i.test(pagosR.error.message) ? 'Falta crear la tabla pagos_honorarios en Supabase.' : pagosR.error.message });
-      const casos = casosR.data || [], clis = clisR.data || [], pagos = pagosR.data || [];
-      let carpetas = [];
-      try { if (sp.configurado && sp.configurado()) carpetas = (await sp.listarCarpetasClientes()) || []; } catch (e) { console.error('[recaudo] carpetas:', e.message); }
-      const carpetaDe = {}; carpetas.forEach((c) => { const k = digitos(c.cedula); if (k && !carpetaDe[k]) carpetaDe[k] = c; });
-      const cliDe = {}; clis.forEach((c) => { const k = digitos(c.numero_identificacion); if (k && !cliDe[k]) cliDe[k] = c; });
-      const pagadas = {}; pagos.forEach((p) => { const k = digitos(p.cedula); if (k) (pagadas[k] = pagadas[k] || []).push(p); });
-      const estadoDe = {}; casos.forEach((c) => { const k = digitos(c.numero_identificacion); if (!k) return; const e = estadoDe[k]; if (!e || c.estado_pipeline === 'Cliente') estadoDe[k] = c; });
-      const hoy = Date.now();
+      const e = await sp.enlaceDeArchivo(String(b.sp_item_id));
+      const resp = await fetch(e.url); if (!resp.ok) throw new Error('No pude descargar el archivo (' + resp.status + ')');
+      const buf = Buffer.from(await resp.arrayBuffer());
+      let leido = null; try { leido = await leerSoporte(buf, e.mime, e.nombre, llamarClaude); } catch (er) { console.error('[recaudo] usar-archivo IA:', er.message); }
+      const cli = await datosCliente(sb, ced).catch(() => ({}));
+      const fila = {
+        sp_item_id: String(b.sp_item_id), cedula: ced, nombre: b.nombre || cli.nombre || null, telefono: cli.telefono || null, cliente_id: cli.cliente_id || null,
+        caso_id: b.caso_id ? String(b.caso_id) : (cli.caso_id || null), convenio: cli.convenio || 'Sin dato', fecha_creacion_cliente: cli.fecha_creacion_cliente || null, fecha_lead: cli.fecha_lead || null,
+        fecha_pago: leido && /^\d{4}-\d{2}-\d{2}$/.test(String(leido.fecha_pago || '')) ? leido.fecha_pago : fechaBog(),
+        valor: leido && Number(leido.valor) > 0 ? Math.round(Number(leido.valor)) : null,
+        medio: (leido && leido.medio) || null, referencia: leido && leido.referencia ? String(leido.referencia).slice(0, 80) : null,
+        archivo: e.nombre, link: e.webUrl || null, origen: 'Panel (elegido)', estado: 'confirmado',
+        nota: leido ? (leido.es_upme ? '⚠ La IA cree que es pago a la UPME: revisar' : null) : 'La IA no pudo leer el valor: ponlo a mano',
+        leido_ia: leido || null, revisado_por: ctx.email, revisado_en: new Date().toISOString(),
+      };
+      if (!fila.valor) fila.estado = 'por_revisar';
+      const { data: ya } = await sb.from('pagos_honorarios').select('id').eq('sp_item_id', fila.sp_item_id).maybeSingle();
+      const r = ya ? await sb.from('pagos_honorarios').update(fila).eq('id', ya.id).select().single() : await sb.from('pagos_honorarios').insert(fila).select().single();
+      if (r.error) throw new Error(r.error.message);
+      res.json({ ok: true, pago: r.data, corregido: !!ya });
+    } catch (er) { res.status(500).json({ error: er.message }); }
+  });
 
-      const sinSoporte = casos.filter((c) => c.estado_pipeline === 'Cliente').filter((c) => { const k = digitos(c.numero_identificacion); return !k || !pagadas[k]; }).map((c) => {
-        const k = digitos(c.numero_identificacion), cli = cliDe[k] || null, car = carpetaDe[k] || null;
-        const desde = (cli && cli.creado_en) || c.created_at || null;
-        return { caso_id: c.id, cliente_id: cli ? cli.id : null, nombre: c.nombre_cliente || (cli && cli.nombre_cliente) || '', cedula: k || '', telefono: digitos(c.telefono || (cli && cli.telefono) || '').slice(-10),
-          fuente: c.fuente || (cli && cli.fuente) || c.campana || '', convenio: convenioDe(c.fuente || (cli && cli.fuente) || c.campana), asesor: c.asesor || '', servicio: c.servicio_contratado || '',
-          cliente_desde: desde, dias: desde ? Math.floor((hoy - new Date(desde).getTime()) / 864e5) : null,
-          carpeta_link: car ? car.webUrl : null, carpeta: car ? car.nombre : null, carpeta_ubicacion: car ? car.ubicacion : null };
-      }).sort((a, b) => (b.dias || 0) - (a.dias || 0));
-
-      const pagoNoCliente = [];
-      Object.entries(pagadas).forEach(([k, lista]) => {
-        const caso = estadoDe[k];
-        if (caso && caso.estado_pipeline === 'Cliente') return;
-        const p = lista.slice().sort((a, b) => String(b.fecha_pago).localeCompare(String(a.fecha_pago)))[0];
-        pagoNoCliente.push({ pago_id: p.id, nombre: p.nombre || (caso && caso.nombre_cliente) || '', cedula: k, telefono: p.telefono || digitos(caso && caso.telefono).slice(-10), convenio: p.convenio,
-          fuente: (caso && caso.fuente) || '', valor: lista.reduce((s, x) => s + (Number(x.valor) || 0), 0), pagos: lista.length, fecha_pago: p.fecha_pago, link: p.link,
-          estado_embudo: caso ? (caso.estado_pipeline || 'Sin estado') : 'No está en el embudo', caso_id: caso ? caso.id : null, asesor: caso ? caso.asesor || '' : '',
-          carpeta_link: (carpetaDe[k] && carpetaDe[k].webUrl) || p.carpeta_link || null });
-      });
-      pagoNoCliente.sort((a, b) => String(b.fecha_pago).localeCompare(String(a.fecha_pago)));
-      res.json({ sinSoporte, pagoNoCliente, carpetasLeidas: carpetas.length });
-    } catch (e) { console.error('[recaudo] cruce:', e.message); res.status(500).json({ error: e.message }); }
+  // Busca el soporte SOLO en las carpetas de los clientes que salen "sin soporte" (todas las fechas).
+  app.post('/api/pagos/escanear-sin-soporte', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    if (estado.corriendo) return res.json(estado);
+    try {
+      const c = await cruceDatos(sbServicio());
+      const ids = [...new Set(c.sinSoporte.map((x) => x.carpeta_id).filter(Boolean))];
+      escanear('clientes', ids);
+      res.json(Object.assign({}, estado, { carpetas: ids.length }));
+    } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
   // Mientras el servidor esté despierto, revisa el mes actual cada 3 horas (así el registro se va llenando solo).

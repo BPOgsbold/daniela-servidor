@@ -29,6 +29,9 @@ function convenioDe(t) {
   return t ? 'Otros' : 'Sin dato';
 }
 
+// Supabase entrega máximo 1.000 filas por consulta: se trae por páginas.
+async function todo(hacer) { const out = []; for (let i = 0; i < 50; i++) { const { data, error } = await hacer().range(i * 1000, i * 1000 + 999); if (error) return { data: out, error }; out.push(...(data || [])); if (!data || data.length < 1000) break; } return { data: out, error: null }; }
+
 const PROMPT = `Eres auxiliar contable de Gómez Legal Abogados. Te muestro UN archivo de la carpeta de un cliente que parece un soporte de pago.
 Responde SOLO un JSON válido, sin texto extra:
 {"es_pago":true|false,"es_upme":true|false,"valor":numero_en_pesos_o_null,"fecha_pago":"AAAA-MM-DD" o null,"medio":"Bancolombia|Nequi|Daviplata|PSE|Davivienda|Efectivo|Otro" o null,"referencia":"número de comprobante/aprobación" o null,"pagador":"nombre de quien paga" o null,"destinatario":"a quién se pagó" o null,"observacion":"texto corto" o null}
@@ -68,11 +71,11 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     if (!cli) { const r = await sb.from('BD_Cliente_GLA').select('*').ilike('numero_identificacion', '%' + ced + '%').limit(1); cli = (r.data || [])[0]; }
     let caso = null;
     if (cli && cli.caso_id) { const r = await sb.from('Perfilamiento_y_ventas_GLA').select('*').eq('id', cli.caso_id).maybeSingle(); caso = r.data; }
-    if (!caso) { const r = await sb.from('Perfilamiento_y_ventas_GLA').select('*').ilike('cedula', '%' + ced + '%').limit(1); caso = (r.data || [])[0] || null; }
+    if (!caso) { const r = await sb.from('Perfilamiento_y_ventas_GLA').select('*').eq('numero_identificacion', ced).limit(1); caso = (r.data || [])[0] || null; }
     const fuente = (cli && cli.fuente) || (caso && caso.fuente) || (caso && caso.campana) || '';
     return {
       cliente_id: cli ? String(cli.id) : null, caso_id: caso ? String(caso.id) : (cli && cli.caso_id ? String(cli.caso_id) : null),
-      nombre: (cli && cli.nombre_cliente) || (caso && (caso.nombre_completo || caso.nombre)) || null,
+      nombre: (cli && cli.nombre_cliente) || (caso && (caso.nombre_cliente || caso.nombre)) || null,
       telefono: digitos((cli && cli.telefono) || (caso && (caso.telefono || caso.celular)) || '').slice(-10) || null,
       convenio: convenioDe(fuente),
       fecha_creacion_cliente: (cli && (cli.creado_en || cli.created_at)) || null,
@@ -91,7 +94,8 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
       if (!sp.configurado || !sp.configurado()) throw new Error('SharePoint no está configurado en el servidor');
       const carpetas = (await sp.listarCarpetasClientes()) || [];
       estado.carpetas = carpetas.length;
-      const { data: ya } = await sb.from('pagos_honorarios').select('sp_item_id').not('sp_item_id', 'is', null).limit(20000);
+      const { data: ya, error: errYa } = await todo(() => sb.from('pagos_honorarios').select('id,sp_item_id').not('sp_item_id', 'is', null).order('id'));
+      if (errYa && /does not exist|schema cache|relation/i.test(errYa.message)) throw new Error('Falta crear la tabla pagos_honorarios (ejecutar pagos_honorarios.sql en Supabase)');
       const vistos = new Set((ya || []).map((x) => x.sp_item_id));
       let i = 0;
       const trabajar = async () => {
@@ -168,10 +172,8 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     const ctx = await exigirEquipo(req, res); if (!ctx) return;
     const mes = mesValido(req.query.mes);
     const sb = sbServicio();
-    let q = sb.from('pagos_honorarios').select('*');
-    if (mes !== 'todo') q = q.gte('fecha_pago', mes + '-01').lte('fecha_pago', finDeMes(mes));
-    const { data, error } = await q.order('fecha_pago', { ascending: true }).limit(20000);
-    if (error) return res.status(500).json({ error: /does not exist|relation/i.test(error.message) ? 'Falta crear la tabla pagos_honorarios: ejecuta pagos_honorarios.sql en Supabase.' : error.message });
+    const { data, error } = await todo(() => { let q = sb.from('pagos_honorarios').select('*'); if (mes !== 'todo') q = q.gte('fecha_pago', mes + '-01').lte('fecha_pago', finDeMes(mes)); return q.order('fecha_pago', { ascending: true }).order('id'); });
+    if (error) return res.status(500).json({ error: /does not exist|schema cache|relation/i.test(error.message) ? 'Falta crear la tabla pagos_honorarios: ejecuta pagos_honorarios.sql en Supabase.' : error.message });
     res.json({ mes, pagos: data || [], escaneo: estado });
   });
 
@@ -206,6 +208,50 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     }).select().single();
     if (error) return res.status(500).json({ error: error.message });
     res.json({ ok: true, pago: data });
+  });
+
+  // CRUCE: clientes (estado Cliente) SIN soporte de pago, y pagos de personas que NO están en estado Cliente.
+  app.get('/api/pagos/cruce', async (req, res) => {
+    const ctx = await exigirEquipo(req, res); if (!ctx) return;
+    try {
+      const sb = sbServicio();
+      const [casosR, clisR, pagosR] = await Promise.all([
+        todo(() => sb.from('Perfilamiento_y_ventas_GLA').select('*').order('id')),
+        todo(() => sb.from('BD_Cliente_GLA').select('*').order('id')),
+        todo(() => sb.from('pagos_honorarios').select('*').in('estado', ['por_revisar', 'confirmado']).order('id')),
+      ]);
+      if (pagosR.error) return res.status(500).json({ error: /does not exist|schema cache|relation/i.test(pagosR.error.message) ? 'Falta crear la tabla pagos_honorarios en Supabase.' : pagosR.error.message });
+      const casos = casosR.data || [], clis = clisR.data || [], pagos = pagosR.data || [];
+      let carpetas = [];
+      try { if (sp.configurado && sp.configurado()) carpetas = (await sp.listarCarpetasClientes()) || []; } catch (e) { console.error('[recaudo] carpetas:', e.message); }
+      const carpetaDe = {}; carpetas.forEach((c) => { const k = digitos(c.cedula); if (k && !carpetaDe[k]) carpetaDe[k] = c; });
+      const cliDe = {}; clis.forEach((c) => { const k = digitos(c.numero_identificacion); if (k && !cliDe[k]) cliDe[k] = c; });
+      const pagadas = {}; pagos.forEach((p) => { const k = digitos(p.cedula); if (k) (pagadas[k] = pagadas[k] || []).push(p); });
+      const estadoDe = {}; casos.forEach((c) => { const k = digitos(c.numero_identificacion); if (!k) return; const e = estadoDe[k]; if (!e || c.estado_pipeline === 'Cliente') estadoDe[k] = c; });
+      const hoy = Date.now();
+
+      const sinSoporte = casos.filter((c) => c.estado_pipeline === 'Cliente').filter((c) => { const k = digitos(c.numero_identificacion); return !k || !pagadas[k]; }).map((c) => {
+        const k = digitos(c.numero_identificacion), cli = cliDe[k] || null, car = carpetaDe[k] || null;
+        const desde = (cli && cli.creado_en) || c.created_at || null;
+        return { caso_id: c.id, cliente_id: cli ? cli.id : null, nombre: c.nombre_cliente || (cli && cli.nombre_cliente) || '', cedula: k || '', telefono: digitos(c.telefono || (cli && cli.telefono) || '').slice(-10),
+          fuente: c.fuente || (cli && cli.fuente) || c.campana || '', convenio: convenioDe(c.fuente || (cli && cli.fuente) || c.campana), asesor: c.asesor || '', servicio: c.servicio_contratado || '',
+          cliente_desde: desde, dias: desde ? Math.floor((hoy - new Date(desde).getTime()) / 864e5) : null,
+          carpeta_link: car ? car.webUrl : null, carpeta: car ? car.nombre : null, carpeta_ubicacion: car ? car.ubicacion : null };
+      }).sort((a, b) => (b.dias || 0) - (a.dias || 0));
+
+      const pagoNoCliente = [];
+      Object.entries(pagadas).forEach(([k, lista]) => {
+        const caso = estadoDe[k];
+        if (caso && caso.estado_pipeline === 'Cliente') return;
+        const p = lista.slice().sort((a, b) => String(b.fecha_pago).localeCompare(String(a.fecha_pago)))[0];
+        pagoNoCliente.push({ pago_id: p.id, nombre: p.nombre || (caso && caso.nombre_cliente) || '', cedula: k, telefono: p.telefono || digitos(caso && caso.telefono).slice(-10), convenio: p.convenio,
+          fuente: (caso && caso.fuente) || '', valor: lista.reduce((s, x) => s + (Number(x.valor) || 0), 0), pagos: lista.length, fecha_pago: p.fecha_pago, link: p.link,
+          estado_embudo: caso ? (caso.estado_pipeline || 'Sin estado') : 'No está en el embudo', caso_id: caso ? caso.id : null, asesor: caso ? caso.asesor || '' : '',
+          carpeta_link: (carpetaDe[k] && carpetaDe[k].webUrl) || p.carpeta_link || null });
+      });
+      pagoNoCliente.sort((a, b) => String(b.fecha_pago).localeCompare(String(a.fecha_pago)));
+      res.json({ sinSoporte, pagoNoCliente, carpetasLeidas: carpetas.length });
+    } catch (e) { console.error('[recaudo] cruce:', e.message); res.status(500).json({ error: e.message }); }
   });
 
   // Mientras el servidor esté despierto, revisa el mes actual cada 3 horas (así el registro se va llenando solo).

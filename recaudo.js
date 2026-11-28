@@ -256,22 +256,39 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
     const hoy = Date.now();
     const cedEquiv = {}; // cédula de la carpeta ↔ cédula del caso cuando difieren
 
-    const sinSoporte = [];
-    casos.filter((c) => c.estado_pipeline === 'Cliente').forEach((c) => {
+    const sinSoporte = [], clientes = [];
+    // Un cliente puede tener 2 o 3 vehículos (un caso por vehículo, misma cédula) y pagar uno por cada uno.
+    const cliPorCaso = {}; clis.forEach((x) => { if (x.caso_id != null) cliPorCaso[String(x.caso_id)] = x; });
+    const casosCliente = casos.filter((c) => c.estado_pipeline === 'Cliente');
+    const vehPorCed = {}; casosCliente.forEach((c) => { const k = digitos(c.numero_identificacion); if (k) (vehPorCed[k] = vehPorCed[k] || []).push(c); });
+    Object.values(vehPorCed).forEach((l) => l.sort((a, b) => String(a.created_at || '').localeCompare(String(b.created_at || '')) || String(a.id).localeCompare(String(b.id))));
+    casosCliente.forEach((c) => {
       const k = digitos(c.numero_identificacion);
       const nombre = c.nombre_cliente || (cliDe[k] && cliDe[k].nombre_cliente) || '';
       let car = (k && carpetaDe[k]) || null, por = car ? 'cedula' : null;
       if (!car) { car = carpetaPorNombre(nombre); if (car) por = 'nombre'; }
       const cedCarpeta = car ? digitos(car.cedula) : '';
       if (cedCarpeta && k && cedCarpeta !== k) { cedEquiv[cedCarpeta] = k; }
-      if ((k && pagadas[k]) || (cedCarpeta && pagadas[cedCarpeta])) return; // ya tiene pago (con su cédula o con la de su carpeta)
-      const cli = cliDe[k] || null;
+      const cli = cliPorCaso[String(c.id)] || cliDe[k] || null;
       const desde = (cli && cli.creado_en) || c.created_at || null;
+      const grupo = (k && vehPorCed[k]) || [c], nVeh = grupo.length, idxVeh = Math.max(0, grupo.indexOf(c));
+      const placa = (cli && cli.placa) || c.placa || '';
+      // Ficha de TODOS los clientes (hoja "Clientes": cuadra el total con / sin soporte)
+      const susPagos = (k && pagadas[k]) || (cedCarpeta && pagadas[cedCarpeta]) || [];
+      const ult = susPagos.slice().sort((a, b) => String(b.fecha_pago).localeCompare(String(a.fecha_pago)))[0];
+      clientes.push({ caso_id: c.id, nombre, cedula: k || '', telefono: digitos(c.telefono || (cli && cli.telefono) || '').slice(-10),
+        fuente: c.fuente || (cli && cli.fuente) || c.campana || '', convenio: convenioDe(c.fuente || (cli && cli.fuente) || c.campana), asesor: c.asesor || '', servicio: c.servicio_contratado || '',
+        placa, vehiculos: nVeh, vehiculo_n: idxVeh + 1,
+        cliente_desde: desde, estado_pago: !susPagos.length ? 'sin_soporte' : susPagos.length < nVeh && idxVeh >= susPagos.length ? 'parcial' : susPagos.some((x) => x.estado === 'confirmado') ? 'confirmado' : 'por_revisar',
+        n_pagos: susPagos.length, valor: susPagos.reduce((a, x) => a + (Number(x.valor) || 0), 0), sin_valor: susPagos.some((x) => !x.valor), ultimo_pago: ult ? ult.fecha_pago : null,
+        carpeta_id: car ? car.id : null, carpeta_link: car ? car.webUrl : null, cedula_carpeta: cedCarpeta && cedCarpeta !== k ? cedCarpeta : null });
+      // Ya tiene pago (con su cédula o la de su carpeta). Con varios vehículos: falta pago si hay menos pagos que vehículos.
+      if (susPagos.length && (susPagos.length >= nVeh || idxVeh < susPagos.length)) return;
       sinSoporte.push({ caso_id: c.id, cliente_id: cli ? cli.id : null, nombre, cedula: k || '', telefono: digitos(c.telefono || (cli && cli.telefono) || '').slice(-10),
         fuente: c.fuente || (cli && cli.fuente) || c.campana || '', convenio: convenioDe(c.fuente || (cli && cli.fuente) || c.campana), asesor: c.asesor || '', servicio: c.servicio_contratado || '',
         cliente_desde: desde, dias: desde ? Math.floor((hoy - new Date(desde).getTime()) / 864e5) : null,
         carpeta_id: car ? car.id : null, carpeta_link: car ? car.webUrl : null, carpeta: car ? car.nombre : null, carpeta_por: por,
-        cedula_carpeta: cedCarpeta && cedCarpeta !== k ? cedCarpeta : null });
+        cedula_carpeta: cedCarpeta && cedCarpeta !== k ? cedCarpeta : null, placa, vehiculos: nVeh, vehiculo_n: idxVeh + 1, pagos_encontrados: susPagos.length });
     });
     sinSoporte.sort((a, b) => (b.dias || 0) - (a.dias || 0));
 
@@ -286,7 +303,8 @@ function montarRecaudo(app, { exigirEquipo, sbServicio }) {
         carpeta_link: (carpetaDe[k] && carpetaDe[k].webUrl) || p.carpeta_link || null });
     });
     pagoNoCliente.sort((a, b) => String(b.fecha_pago).localeCompare(String(a.fecha_pago)));
-    return { sinSoporte, pagoNoCliente, carpetasLeidas: carpetas.length };
+    clientes.sort((a, b) => String(a.nombre).localeCompare(String(b.nombre)));
+    return { sinSoporte, pagoNoCliente, clientes, carpetasLeidas: carpetas.length };
   }
   app.get('/api/pagos/cruce', async (req, res) => {
     const ctx = await exigirEquipo(req, res); if (!ctx) return;
